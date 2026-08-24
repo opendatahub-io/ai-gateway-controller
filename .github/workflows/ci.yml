@@ -106,4 +106,4 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # shellcheck ships preinstalled on the ubuntu-latest runner image.
       - name: shellcheck
-        run: shellcheck hack/scripts/*.sh hack/*.sh
+        run: find hack -name '*.sh' -print0 | xargs -0 -r shellcheck
