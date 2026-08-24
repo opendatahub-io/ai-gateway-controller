@@ -77,6 +77,10 @@ jobs:
           cache: true
 
       - name: Build manager binary
+        # strictfipsruntime is a Red Hat UBI go-toolset experiment; stock
+        # actions/setup-go does not support it.
+        env:
+          GO_STRICTFIPS: "false"
         run: make binary
 
   verify-manifests:
