@@ -1,0 +1,20 @@
+# Build artifacts
+/bin/
+/dist/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+
+# config/manifests/praxis-extproc/ is intentionally NOT ignored: it is
+# vendored by hack/scripts/get-manifests.sh at a pinned commit and committed.
+# Re-run "make get-manifests" after bumping the pinned commit and commit the
+# diff.
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/

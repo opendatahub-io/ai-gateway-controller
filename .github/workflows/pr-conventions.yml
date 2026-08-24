@@ -1,0 +1,83 @@
+name: PR Conventions
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-title:
+    name: Conventional commit PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: amannn/action-semantic-pull-request@e32d7e603df1aa1ba07e981f2a23455dee596825 # v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" didn't match the configured pattern: it must not start with a capital letter.
+
+  dco:
+    name: Signed-off-by on every commit (DCO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip/dco') }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Check every commit carries Signed-off-by
+        run: |
+          missing=0
+          for sha in $(git rev-list "origin/${{ github.event.pull_request.base.ref }}..HEAD"); do
+            if ! git log -1 --format='%B' "$sha" | grep -qE '^Signed-off-by: .+ <.+>$'; then
+              echo "::error::commit $sha is missing a Signed-off-by trailer (git commit -s)"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+  pr-size:
+    name: PR size cap (750 added production lines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip/pr-conventions') }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Count added production lines
+        run: |
+          # Excludes tests, docs, vendored manifests, and dependency lockfiles.
+          added=$(git diff --numstat "origin/${{ github.event.pull_request.base.ref }}...HEAD" -- \
+              . \
+              ':(exclude)*_test.go' \
+              ':(exclude)*.md' \
+              ':(exclude)go.sum' \
+              ':(exclude)config/manifests/**' \
+            | awk '{sum += $1} END {print sum+0}')
+          echo "Added production lines: $added"
+          if [ "$added" -gt 750 ]; then
+            echo "::error::$added added production lines exceeds the 750-line PR size cap. Split into a stack of smaller PRs, or apply the 'skip/pr-conventions' label if a maintainer approves an exception."
+            exit 1
+          fi
