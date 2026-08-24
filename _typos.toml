@@ -1,0 +1,4 @@
+[files]
+# Vendored from praxis-extproc (hack/scripts/get-manifests.sh). Includes an
+# intentional Istio <=1.25 filter name misspelling (extenstions).
+extend-exclude = ["config/manifests/**"]
