@@ -48,7 +48,11 @@ jobs:
       - name: Check every commit carries Signed-off-by
         run: |
           missing=0
-          for sha in $(git rev-list "origin/${{ github.event.pull_request.base.ref }}..HEAD"); do
+          # pull_request checkout is GitHub's merge commit of the PR into the
+          # base; that merge has no Signed-off-by. Skip merges and range from
+          # the PR base SHA, not origin/<ref>, which may not exist locally.
+          base="${{ github.event.pull_request.base.sha }}"
+          for sha in $(git rev-list --no-merges "${base}..HEAD"); do
             if ! git log -1 --format='%B' "$sha" | grep -qE '^Signed-off-by: .+ <.+>$'; then
               echo "::error::commit $sha is missing a Signed-off-by trailer (git commit -s)"
               missing=1

@@ -87,8 +87,8 @@ func TestApplyUsesServerSideApplyWithFieldOwnerAndForce(t *testing.T) {
 		haveForce      bool
 	)
 	for _, opt := range gotOpts {
-		if fo, ok := opt.(client.FieldOwner); ok {
-			haveFieldOwner = string(fo) == FieldOwner
+		if fieldOwner, ok := opt.(client.FieldOwner); ok {
+			haveFieldOwner = string(fieldOwner) == FieldOwner
 		}
 		if opt == client.ForceOwnership {
 			haveForce = true

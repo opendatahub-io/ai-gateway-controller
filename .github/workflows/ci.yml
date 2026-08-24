@@ -77,6 +77,10 @@ jobs:
           cache: true
 
       - name: Build manager binary
+        # strictfipsruntime is a Red Hat UBI go-toolset experiment; stock
+        # actions/setup-go does not support it.
+        env:
+          GO_STRICTFIPS: "false"
         run: make binary
 
   verify-manifests:
@@ -98,7 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: crate-ci/typos@6faa2a4f4f60ef8b8f24274ba4d8d9d5e3cd7a1e # v1.39.0
+      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -106,4 +110,4 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # shellcheck ships preinstalled on the ubuntu-latest runner image.
       - name: shellcheck
-        run: shellcheck hack/scripts/*.sh hack/*.sh
+        run: find hack -name '*.sh' -print0 | xargs -0 -r shellcheck
