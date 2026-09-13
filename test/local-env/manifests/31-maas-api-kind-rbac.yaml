@@ -1,0 +1,25 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maas-api-kind-configmaps
+  labels:
+    app.kubernetes.io/managed-by: local-env
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-api-kind-configmaps
+  labels:
+    app.kubernetes.io/managed-by: local-env
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maas-api-kind-configmaps
+subjects:
+  - kind: ServiceAccount
+    name: maas-api
+    namespace: maas-system

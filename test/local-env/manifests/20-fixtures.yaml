@@ -1,0 +1,41 @@
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: AITenant
+metadata:
+  name: models-as-a-service
+  namespace: ai-tenants
+  annotations:
+    maas.opendatahub.io/payload-processing-type: praxis
+spec:
+  gateway:
+    name: maas-default-gateway
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata: {name: provider-a, namespace: models-as-a-service}
+spec:
+  provider: openai
+  endpoint: provider-a.maas-system.svc.cluster.local
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata: {name: provider-b, namespace: models-as-a-service}
+spec:
+  provider: openai
+  endpoint: provider-b.maas-system.svc.cluster.local
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata: {name: demo-model, namespace: models-as-a-service}
+spec:
+  modelName: demo
+  externalProviderRefs:
+  - ref: {name: provider-a}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions
+  - ref: {name: provider-b}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions

@@ -180,10 +180,13 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			if len(known) > 0 && !known[r.Cluster] {
 				return Envelope{}, fmt.Errorf("%w: %s (model %s)", ErrUnknownCluster, r.Cluster, r.Model)
 			}
+			// Candidate names are the client-visible model identity.  This must
+			// match resolver.Route.ClientName and the HTTPRoute body/header
+			// matches; the ExternalModel object name is control-plane identity.
 			cand := Candidate{
 				Cluster: r.Cluster,
 				Kind:    "inference_model",
-				Name:    r.Model,
+				Name:    r.ClientName,
 				Site:    scope.LocalSite,
 				Fresh:   true,
 			}

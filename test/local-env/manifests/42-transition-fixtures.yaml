@@ -1,0 +1,59 @@
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: AITenant
+metadata:
+  name: transition
+  namespace: ai-tenants
+spec:
+  gateway:
+    name: maas-transition-gateway
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payload-processing-transition
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    maas.opendatahub.io/tenant-namespace: ai-tenant-transition
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: transition-provider-credentials
+  namespace: ai-tenant-transition
+type: Opaque
+stringData:
+  api-key: transition-provider-key
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: transition-provider
+  namespace: ai-tenant-transition
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+spec:
+  provider: openai
+  # IPP's legacy route uses the ExternalModel's HTTPS-shaped port 443. The
+  # local compatibility Service maps that port to Katan's HTTP :8000.
+  endpoint: provider-a-legacy.maas-system.svc.cluster.local
+  auth:
+    type: apikey
+    secretRef:
+      name: transition-provider-credentials
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: transition-model
+  namespace: ai-tenant-transition
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+spec:
+  modelName: transition
+  externalProviderRefs:
+    - ref:
+        name: transition-provider
+      targetModel: demo
+      apiFormat: openai-chat
+      path: /v1/chat/completions

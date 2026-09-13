@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: provider-credentials
+  namespace: models-as-a-service
+stringData:
+  api-key: kind-only-dummy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-a
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-a}
+  template:
+    metadata: {labels: {app: katan-a}}
+    spec:
+      containers:
+      - name: katan
+        image: llm-katan:e2e
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-a, namespace: maas-system}
+spec:
+  selector: {app: katan-a}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+# The legacy IPP ExternalModel reconciler exposes external providers through
+# an HTTPS-shaped Service port (443), even when this local backend speaks plain
+# HTTP. Keep this compatibility endpoint run-owned and separate from the
+# production-shaped Praxis endpoint above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-a-legacy
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    local-env.opendatahub.io/purpose: ipp-transition-backend
+spec:
+  selector: {app: katan-a}
+  ports: [{name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-b
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-b}
+  template:
+    metadata: {labels: {app: katan-b}}
+    spec:
+      containers:
+      - name: katan
+        image: llm-katan:e2e
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-b, namespace: maas-system}
+spec:
+  selector: {app: katan-b}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-a-tenant-b
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-a-tenant-b}
+  template:
+    metadata:
+      labels: {app: katan-a-tenant-b}
+    spec:
+      containers:
+      - name: katan
+        image: llm-katan:e2e
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-a-tenant-b, namespace: maas-system}
+spec:
+  selector: {app: katan-a-tenant-b}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-b-tenant-b
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-b-tenant-b}
+  template:
+    metadata:
+      labels: {app: katan-b-tenant-b}
+    spec:
+      containers:
+      - name: katan
+        image: llm-katan:e2e
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-b-tenant-b, namespace: maas-system}
+spec:
+  selector: {app: katan-b-tenant-b}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
