@@ -241,7 +241,7 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 func TestReconcileWaitsForResolvedTenantNamespace(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "gateway-ns")
-	delete(aitenant.Object["status"].(map[string]any), "tenantNamespace")
+	unstructured.RemoveNestedField(aitenant.Object, "status", "tenantNamespace")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 

@@ -196,6 +196,19 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the AITenant changes")
 		return ctrl.Result{}, nil
 	}
+	// The vendored ExtProc manifests intentionally carry no controller-specific
+	// ownership marker. Stamp the complete tenant render before the handoff
+	// check so resources successfully applied by this reconciler are recognized
+	// as ours on the next reconcile. This label is also the cleanup guard; the
+	// shared reader ClusterRole remains exempt from takeover/cleanup checks.
+	for i := range resources {
+		labels := resources[i].GetLabels()
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		labels[managedByLabel] = render.FieldOwner
+		resources[i].SetLabels(labels)
+	}
 	providerList := &unstructured.UnstructuredList{}
 	providerList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalProviderList"})
 	if err := r.Client.List(ctx, providerList, client.InNamespace(tenantNamespace)); err != nil {
