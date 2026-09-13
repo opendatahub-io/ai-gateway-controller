@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$ROOT"
+SUITE=${E2E_SUITE:-all}
+if [[ "${1:-}" == "--suite" ]]; then
+  SUITE=${2:?--suite requires routing, transition, or all}
+  shift 2
+fi
+case "$SUITE" in
+  routing|transition|all) ;;
+  *) echo "invalid suite: $SUITE (expected routing, transition, or all)" >&2; exit 2 ;;
+esac
+export E2E_SUITE="$SUITE"
 CLUSTER=${LOCAL_ENV_CLUSTER:-external-model-two-plane}
 NS=${LOCAL_ENV_NAMESPACE:-models-as-a-service}
 BNS=${LOCAL_ENV_TENANT_B_NAMESPACE:-ai-tenant-tenant-b}
@@ -15,6 +26,8 @@ BPORT=$((PORT + 2))
 TPORT=$((PORT + 3))
 mkdir -p "$EVIDENCE"
 exec > >(tee "$EVIDENCE/e2e.log") 2>&1
+RECOMPUTE_BIN="$EVIDENCE/recompute-digest"
+go build -o "$RECOMPUTE_BIN" "$ROOT/test/local-env/recompute_digest.go"
 
 QUALIFICATION_COMPLETE=false
 finish_on_exit() {
@@ -59,7 +72,7 @@ record() {
 import json, os, sys, tempfile
 p,n,name,status,http,body=sys.argv[1:]
 d=json.load(open(p))
-d["assertions"].append({"number":int(n),"name":name,"status":status,"http_status":None if http=="null" else int(http),"body":body})
+d["assertions"].append({"number":int(n),"name":name,"suite":os.environ.get("E2E_SUITE","all"),"status":status,"http_status":None if http=="null" else int(http),"body":body})
 fd, tmp = tempfile.mkstemp(prefix=".results.", dir=os.path.dirname(p))
 with os.fdopen(fd, "w") as f:
     json.dump(d, f, indent=2)
@@ -85,21 +98,58 @@ observe() {
 }
 
 wait_mounted_digest() {
-  local expected=$1 actual
+  local expected=$1 actual stable=0
   # ConfigMap projection is eventually consistent; allow a bounded window
   # longer than kubelet's normal sync period and verify the mounted bytes.
   for _ in $(seq 1 60); do
     "${KCTL[@]}" -n "$NS" exec deploy/praxis -- cat /etc/praxis/routing/routing-overlay.json >"$EVIDENCE/mounted-overlay.json" 2>/dev/null || true
-    actual=$(go run "$ROOT/test/local-env/recompute_digest.go" "$EVIDENCE/mounted-overlay.json" 2>/dev/null || true)
-    [[ "$actual" == "$expected" ]] && return 0
+    actual=$("$RECOMPUTE_BIN" "$EVIDENCE/mounted-overlay.json" 2>/dev/null || true)
+    if [[ "$actual" == "$expected" ]]; then
+      stable=$((stable + 1))
+      [[ $stable -ge 2 ]] && return 0
+    else
+      stable=0
+    fi
     sleep 2
+  done
+  return 1
+}
+
+wait_transport() {
+  local provider=$1
+  for _ in $(seq 1 60); do
+    if "${KCTL[@]}" -n "$NS" get \
+      "service/provider-provider-$provider" \
+      "serviceentry/provider-provider-$provider" \
+      "destinationrule/provider-provider-$provider" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+wait_stable_overlay() {
+  local first second
+  for _ in $(seq 1 60); do
+    first=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o json 2>/dev/null \
+      | jq -c '{data,annotations:{source:.metadata.annotations["inference.opendatahub.io/routing-overlay-source-generation"],digest:.metadata.annotations["inference.opendatahub.io/routing-overlay-content-digest"]}}' || true)
+    sleep 2
+    second=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o json 2>/dev/null \
+      | jq -c '{data,annotations:{source:.metadata.annotations["inference.opendatahub.io/routing-overlay-source-generation"],digest:.metadata.annotations["inference.opendatahub.io/routing-overlay-content-digest"]}}' || true)
+    [[ -n "$first" && "$first" == "$second" ]] && return 0
   done
   return 1
 }
 
 "${KCTL[@]}" cluster-info >"$EVIDENCE/cluster-info.txt" 2>&1 || exit 2
 "${KCTL[@]}" -n "$NS" delete externalmodel demo-model --ignore-not-found >/dev/null
-"${KCTL[@]}" apply -f "$ROOT/test/local-env/manifests/20-fixtures.yaml" >/dev/null
+# Remove only the controller-owned routing snapshot before recreating the
+# fixture. This prevents a prior run's projected bytes and metadata from being
+# mistaken for the new model's baseline during same-cluster repeats.
+if [[ "$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)" == ai-gateway-controller ]]; then
+  "${KCTL[@]}" -n "$NS" delete configmap routing-overlay --wait=true >/dev/null
+fi
 # MaaS may reconcile its generated IPP Deployments while the baseline model is
 # recreated. Re-assert the run-owned transition fixture after that event. Do
 # not delete legacy IPP routes here: their owner is the pinned IPP
@@ -130,6 +180,10 @@ if "${KCTL[@]}" -n "$API_NS" get deployment/payload-processing-tenant-b >/dev/nu
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-pre-processing >/dev/null 2>&1; then "${KCTL[@]}" -n "$API_NS" rollout status deployment/payload-pre-processing --timeout=120s; fi
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-pre-processing-tenant-b >/dev/null 2>&1; then "${KCTL[@]}" -n "$API_NS" rollout status deployment/payload-pre-processing-tenant-b --timeout=120s; fi
 "${KCTL[@]}" -n "$API_NS" rollout status deployment/payload-pre-processing-transition --timeout=120s
+# Recreate the Praxis tenant model only after its IPP writer has restarted with
+# external-model reconciliation disabled. This prevents a direct IPP route
+# from being created during qualification setup.
+"${KCTL[@]}" apply -f "$ROOT/test/local-env/manifests/20-fixtures.yaml" >/dev/null
 for _ in $(seq 1 30); do
   phase=$("${KCTL[@]}" -n "$NS" get externalmodel demo-model -o jsonpath='{.status.phase}' 2>/dev/null || true)
   [[ "$phase" == Ready ]] && break
@@ -141,15 +195,29 @@ done
 "${KCTL[@]}" -n "$NS" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-a"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]' >/dev/null
 for _ in $(seq 1 30); do
   candidates=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.data.routing-overlay\.json}' 2>/dev/null || true)
-  [[ "$candidates" == *'provider-provider-a'* && "$candidates" != *'provider-provider-b'* ]] && break
+  observed_model_gen=$("${KCTL[@]}" -n "$NS" get externalmodel demo-model -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)
+  model_gen=$("${KCTL[@]}" -n "$NS" get externalmodel demo-model -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
+  [[ "$candidates" == *'provider-provider-a'* && "$candidates" != *'provider-provider-b'* && "$observed_model_gen" == "$model_gen" ]] && break
   sleep 2
 done
+[[ "$candidates" == *'provider-provider-a'* && "$candidates" != *'provider-provider-b'* ]] || { echo "baseline provider-A overlay did not converge" >&2; exit 1; }
+wait_stable_overlay || { echo "baseline overlay did not stabilize" >&2; exit 1; }
 if "${KCTL[@]}" get crd externalmodels.inference.opendatahub.io externalproviders.inference.opendatahub.io >/dev/null 2>&1; then record 1 crds_ready PASS; else record 1 crds_ready FAIL; fi
 observe baseline
 base_generation=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-source-generation}' 2>/dev/null || echo 0)
-base_digest=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-content-digest}' 2>/dev/null || true)
-if [[ -n "$base_digest" ]]; then
-  wait_mounted_digest "$base_digest" || true
+base_digest=""
+baseline_recompute=""
+for _ in $(seq 1 60); do
+  base_digest=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-content-digest}' 2>/dev/null || true)
+  "${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.data.routing-overlay\.json}' >"$EVIDENCE/baseline-overlay.json" 2>/dev/null || true
+  baseline_recompute=$("$RECOMPUTE_BIN" "$EVIDENCE/baseline-overlay.json" 2>/dev/null || true)
+  [[ "$base_digest" =~ ^[0-9a-f]{64}$ && "$baseline_recompute" == "$base_digest" ]] && break
+  sleep 2
+done
+if [[ "$base_digest" =~ ^[0-9a-f]{64}$ && "$baseline_recompute" == "$base_digest" ]]; then
+  record 8 digest_and_revision PASS null "declared=$base_digest recomputed=$baseline_recompute"
+else
+  record 8 digest_and_revision FAIL null "declared=$base_digest recomputed=$baseline_recompute"
 fi
 if "${KCTL[@]}" -n "$NS" get externalmodel demo-model -o jsonpath='{.status.phase}' | rg -qx Ready; then record 2 real_cr_reconciliation PASS; else record 2 real_cr_reconciliation FAIL; fi
 if "${KCTL[@]}" -n "$NS" get httproute/external-model-demo-model serviceentries/provider-provider-a destinationrules/provider-provider-a >/dev/null 2>&1; then record 3 transport_resources PASS; else record 3 transport_resources FAIL; fi
@@ -228,8 +296,6 @@ known=$(request known "$MODEL_URL" -H 'content-type: application/json' -H "autho
 if [[ "$known" == 200 ]] && rg -q 'server: istio-envoy' "$EVIDENCE/request-known.headers" && rg -q 'via: 1.1 praxis' "$EVIDENCE/request-known.headers"; then record 6 envoy_kuadrant_extproc_praxis_chain PASS "$known" "$(cat "$EVIDENCE/request-known.body" 2>/dev/null || true)"; else record 6 envoy_kuadrant_extproc_praxis_chain FAIL "$known" "$(cat "$EVIDENCE/request-known.headers" 2>/dev/null || true)"; fi
 if [[ "$known" == 200 ]] && rg -q 'katan-a' "$EVIDENCE/request-known.body"; then record 7 backend_a PASS "$known"; else record 7 backend_a FAIL "$known"; fi
 "${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.data.routing-overlay\.json}' >"$EVIDENCE/baseline-overlay.json"
-recomputed=$(go run "$ROOT/test/local-env/recompute_digest.go" "$EVIDENCE/baseline-overlay.json" 2>/dev/null || true)
-if [[ -n "$base_digest" && "$recomputed" == "$base_digest" ]]; then record 8 digest_and_revision PASS; else record 8 digest_and_revision FAIL null "declared=$base_digest recomputed=$recomputed"; fi
 before_uid=$("${KCTL[@]}" -n "$NS" get pod -l app=praxis -o jsonpath='{.items[0].metadata.uid}')
 before_restarts=$("${KCTL[@]}" -n "$NS" get pod -l app=praxis -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
 "${KCTL[@]}" -n "$NS" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-b"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]'
@@ -244,9 +310,18 @@ changed_mounted=false
 if wait_mounted_digest "$changed_digest"; then
   changed_mounted=true
 fi
+transport_ready=false
+if wait_transport b; then
+  transport_ready=true
+fi
 cp "$EVIDENCE/mounted-overlay.json" "$EVIDENCE/last-known-good-overlay.json"
   changed=$(request changed "$MODEL_URL" -H 'content-type: application/json' -H "authorization: Bearer $key" --data '{"model":"demo","messages":[{"role":"user","content":"changed"}]}' )
-if [[ "$new_revision" == "$((base_generation + 1))" && "$changed_digest" =~ ^[0-9a-f]{64}$ && "$changed_mounted" == true && "$changed" == 200 ]] && rg -q 'katan-b' "$EVIDENCE/request-changed.body"; then record 9 generation_two_swap_backend_b PASS "$changed" "$(cat "$EVIDENCE/request-changed.body")"; else record 9 generation_two_swap_backend_b FAIL "$changed" "$(cat "$EVIDENCE/request-changed.body")"; fi
+changed_backend=$(rg -o 'katan-b-[A-Za-z0-9-]+' "$EVIDENCE/request-changed.body" | head -1 || true)
+if [[ "$new_revision" == "$((base_generation + 1))" && "$changed_digest" =~ ^[0-9a-f]{64}$ && "$changed_mounted" == true && "$transport_ready" == true && "$changed" == 200 && -n "$changed_backend" ]]; then
+  record 9 generation_two_swap_backend_b PASS "$changed" "generation=$new_revision digest=$changed_digest mounted=$changed_mounted transport=$transport_ready backend=$changed_backend"
+else
+  record 9 generation_two_swap_backend_b FAIL "$changed" "expected_generation=$((base_generation + 1)) observed_generation=$new_revision digest=$changed_digest mounted=$changed_mounted transport=$transport_ready backend=$changed_backend body=$(cat "$EVIDENCE/request-changed.body")"
+fi
 after_uid=$("${KCTL[@]}" -n "$NS" get pod -l app=praxis -o jsonpath='{.items[0].metadata.uid}')
 after_restarts=$("${KCTL[@]}" -n "$NS" get pod -l app=praxis -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
 if [[ "$before_uid" == "$after_uid" && "$before_restarts" == "$after_restarts" ]]; then record 10 no_restart_during_swap PASS; else record 10 no_restart_during_swap FAIL; fi
@@ -263,6 +338,16 @@ if [[ "$bad" == 200 ]] && rg -q 'katan-b' "$EVIDENCE/request-corrupted.body"; th
 # runs. The corrupted replacement was already observed above; restore exactly
 # the captured last-known-good bytes and retain the same revision annotations.
 "${KCTL[@]}" -n "$NS" get configmap routing-overlay -o json | jq --rawfile data "$EVIDENCE/last-known-good-overlay.json" '.data["routing-overlay.json"]=$data' | "${KCTL[@]}" apply -f - >/dev/null
+wait_stable_overlay || { record 12 invalid_replacement_preserves_last_good FAIL null "last-known-good overlay did not stabilize"; }
+# A manual last-known-good restore must be followed by controller convergence;
+# otherwise the restored data and metadata can describe different generations.
+for _ in $(seq 1 30); do
+  overlay_state=$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o json 2>/dev/null || echo '{}')
+  embedded_source=$(jq -r '.data["routing-overlay.json"] // "{}"' <<<"$overlay_state" | jq -r '.provenance.source_generation // ""' 2>/dev/null || true)
+  declared_source=$(jq -r '.metadata.annotations["inference.opendatahub.io/routing-overlay-source-generation"] // ""' <<<"$overlay_state")
+  [[ -n "$embedded_source" && "$embedded_source" == "$declared_source" ]] && break
+  sleep 2
+done
 observe changed
 "${KCTL[@]}" -n "$NS" get configmap routing-overlay -o json | jq '{data, annotations: {source: .metadata.annotations["inference.opendatahub.io/routing-overlay-source-generation"], digest: .metadata.annotations["inference.opendatahub.io/routing-overlay-content-digest"]}}' >"$EVIDENCE/noop-before.json"
 for resource in service/provider-provider-b serviceentry/provider-provider-b destinationrule/provider-provider-b httproute/external-model-demo-model; do
@@ -372,6 +457,26 @@ if [[ "$b_parent_ns" == "$GATEWAY_NS" && "$b_backend_name" == "$expected_b_backe
 else
   record 29 tenant_b_namespace_boundary_secret_isolation FAIL null "$(cat "$EVIDENCE/namespace-boundary-tenant-b-state.txt") parent=$b_parent_ns backend_name=$b_backend_name expected_backend=$expected_b_backend accepted=$b_accepted resolved_refs=$b_resolved"
 fi
+
+# The fixture provider workloads are deliberately outside both tenant
+# namespaces; the controller-created mesh transport remains tenant-local.
+backend_a_ns=$("${KCTL[@]}" -n "$API_NS" get service provider-a -o jsonpath='{.metadata.namespace}' 2>/dev/null || true)
+backend_b_ns=$("${KCTL[@]}" -n "$API_NS" get service provider-b -o jsonpath='{.metadata.namespace}' 2>/dev/null || true)
+if [[ "$backend_a_ns" == "$API_NS" && "$backend_b_ns" == "$API_NS" ]]; then
+  record 23 provider_backend_namespace_separation PASS null "backend_namespace=$API_NS tenant_a=$NS tenant_b=$BNS"
+else
+  record 23 provider_backend_namespace_separation FAIL null "backend_a_namespace=$backend_a_ns backend_b_namespace=$backend_b_ns expected=$API_NS"
+fi
+
+# ExtProc is a controller-owned Envoy processing workload; it is not a
+# standalone Praxis credential consumer and has no provider Secret mount.
+extproc_owner=$("${KCTL[@]}" -n "$API_NS" get deployment/payload-processing -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)
+extproc_secret_mounts=$("${KCTL[@]}" -n "$API_NS" get deployment/payload-processing -o json 2>/dev/null | jq '[.spec.template.spec.containers[].volumeMounts[]?.name | select(test("secret|credential";"i"))] | length' 2>/dev/null || echo 0)
+if [[ "$extproc_owner" == ai-gateway-controller && "$extproc_secret_mounts" == 0 ]]; then
+  record 27 controller_owned_extproc_without_provider_secret PASS null "managed_by=$extproc_owner provider_secret_mounts=0"
+else
+  record 27 controller_owned_extproc_without_provider_secret FAIL null "managed_by=$extproc_owner provider_secret_mounts=$extproc_secret_mounts"
+fi
 "${KCTL[@]}" -n "$API_NS" port-forward svc/maas-tenant-b-gateway "$BPORT:80" >"$EVIDENCE/tenant-b-port-forward.log" 2>&1 &
 BPF=$!
 for _ in $(seq 1 20); do
@@ -412,7 +517,33 @@ else
   record 22 tenant_b_survives_tenant_a_mutation FAIL "$b_survival" "cleanup_isolation=focused-controller-test; runtime_mutation_isolation=request_failed"
 fi
 
-# Separate transition tenant: absent annotation means MaaS owns legacy IPP.
+finalize_results() {
+  python3 - "$EVIDENCE/results.json" "$SUITE" <<'PY'
+import json, os, sys, tempfile
+p, suite = sys.argv[1:]
+d = json.load(open(p))
+d["suite"] = suite
+d["assertion_count"] = len(d["assertions"])
+d["functional_status"] = "PASS" if d["assertions"] and all(x["status"] == "PASS" for x in d["assertions"]) else "PARTIAL"
+d["status"] = d["functional_status"]
+fd, tmp = tempfile.mkstemp(prefix=".results.", dir=os.path.dirname(p))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2); f.flush(); os.fsync(f.fileno())
+os.replace(tmp, p)
+PY
+  QUALIFICATION_COMPLETE=true
+  cat "$EVIDENCE/results.json"
+}
+
+# Routing qualification never creates or mutates the transition fixture. The
+# transition suite is intentionally separate so its follow-up failures cannot
+# contaminate the routing result.
+if [[ "$SUITE" == routing ]]; then
+  finalize_results
+  exit 0
+fi
+
+# Separate transition tenant: absent annotation means MaaS owns the existing IPP path.
 TNS=ai-tenant-transition
 # The public path is derived from the ExternalModel resource name, as in the
 # IPP and controller contracts: /<namespace>/<external-model-name>/*. The
@@ -424,9 +555,9 @@ ipp_before=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment,servi
 kubectl --context "kind-$CLUSTER" get httproute -A -o yaml >"$EVIDENCE/transition-routes-before.yaml" 2>&1 || true
 kubectl --context "kind-$CLUSTER" -n "$TNS" get externalmodel,externalprovider -o yaml >"$EVIDENCE/transition-crs-before.yaml" 2>&1 || true
 if [[ -z "$transition_annotation" && "$ipp_before" == *"payload-processing-transition"* ]] && ! kubectl --context "kind-$CLUSTER" -n "$TNS" get configmap routing-overlay >/dev/null 2>&1; then
-  record 23 transition_legacy_ipp_owned PASS null "tenant_namespace=$TNS backend_namespace=$API_NS annotation=absent"
+  record 24 transition_existing_ipp_owned PASS null "tenant_namespace=$TNS backend_namespace=$API_NS annotation=absent"
 else
-  record 23 transition_legacy_ipp_owned FAIL null "tenant_namespace=$TNS annotation=absent-or-invalid"
+  record 24 transition_existing_ipp_owned FAIL null "tenant_namespace=$TNS annotation=absent-or-invalid"
 fi
 kubectl --context "kind-$CLUSTER" -n "$API_NS" port-forward svc/maas-transition-gateway "$TPORT:80" >"$EVIDENCE/transition-port-forward.log" 2>&1 &
 TPF=$!
@@ -485,7 +616,7 @@ ipp_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deploymen
 legacy_route_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute transition-model -o json 2>/dev/null || echo '{}')
 legacy_route_owner=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // "absent"' <<<"$legacy_route_after_cutover")
 if [[ "$cutover_ready" == true && "$ipp_after_cutover" != *"payload-processing-transition"* && "$legacy_route_owner" == "absent" ]]; then
-  record 25 transition_cutover_ownership PASS null "legacy_resources_removed=true praxis_resources=tenant-scoped"
+  record 25 transition_cutover_ownership PASS null "existing_ipp_resources_removed=true praxis_resources=tenant-scoped"
 else
   record 25 transition_cutover_ownership FAIL null "cutover_ready=$cutover_ready legacy_resources_present=$([[ "$ipp_after_cutover" == *"payload-processing-transition"* ]] && echo true || echo false) stale_ipp_route_owner=$legacy_route_owner"
 fi
@@ -496,12 +627,6 @@ if [[ -n "$transition_gateway_pod" ]]; then kubectl --context "kind-$CLUSTER" -n
 kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deployment/payload-processing-transition --all-containers --tail=200 >"$EVIDENCE/transition-ipp-processing-logs.txt" 2>&1 || true
 kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deployment/payload-pre-processing-transition --all-containers --tail=200 >"$EVIDENCE/transition-ipp-preprocessing-logs.txt" 2>&1 || true
 kubectl --context "kind-$CLUSTER" -n "$TNS" logs deployment/praxis --all-containers --tail=200 >"$EVIDENCE/transition-praxis-logs.txt" 2>&1 || true
-if [[ "$transition_praxis" == 200 ]] && rg -q 'via: 1.1 praxis' "$EVIDENCE/request-transition-praxis.headers"; then
-  record 26 transition_praxis_request PASS "$transition_praxis" "path=praxis"
-else
-  record 26 transition_praxis_request FAIL "$transition_praxis" "path=praxis"
-fi
-
 kubectl --context "kind-$CLUSTER" -n ai-tenants annotate aitenant transition maas.opendatahub.io/payload-processing-type- >/dev/null
 rollback_ready=false
 for _ in $(seq 1 60); do
@@ -513,14 +638,18 @@ for _ in $(seq 1 60); do
 done
 transition_rollback=$(request transition-rollback "$TRANSITION_IPP_URL" -H 'content-type: application/json' -H "authorization: Bearer $transition_key" --data '{"model":"transition-model","messages":[{"role":"user","content":"rollback"}]}' )
 if [[ "$rollback_ready" == true ]]; then
-  record 27 transition_rollback_ownership PASS "$transition_rollback" "praxis_cleanup=true ipp_restored=true"
+  if [[ "$transition_praxis" == 200 ]] && rg -q 'via: 1.1 praxis' "$EVIDENCE/request-transition-praxis.headers"; then
+    record 26 transition_praxis_and_rollback PASS "$transition_praxis" "path=praxis rollback_http=$transition_rollback praxis_cleanup=true ipp_restored=true"
+  else
+    record 26 transition_praxis_and_rollback FAIL "$transition_praxis" "path=praxis rollback_http=$transition_rollback"
+  fi
 else
-  record 27 transition_rollback_ownership FAIL "$transition_rollback" "praxis_cleanup_or_ipp_restore_failed=true"
+  record 26 transition_praxis_and_rollback FAIL "$transition_praxis" "path=praxis rollback_http=$transition_rollback praxis_cleanup_or_ipp_restore_failed=true"
 fi
 "${KCTL[@]}" get events -A --sort-by=.lastTimestamp >"$EVIDENCE/events.txt" 2>&1 || true
 python3 - "$EVIDENCE/results.json" <<'PY'
 import json, os, sys, tempfile
-p=sys.argv[1]; d=json.load(open(p)); d["status"]="PASS" if all(x["status"]=="PASS" for x in d["assertions"]) else "PARTIAL"
+p=sys.argv[1]; d=json.load(open(p)); d["status"]="PASS" if d["assertions"] and all(x["status"]=="PASS" for x in d["assertions"]) else "PARTIAL"; d["suite"]="all" if "all" == os.environ.get("E2E_SUITE") else os.environ.get("E2E_SUITE", "all"); d["assertion_count"]=len(d["assertions"]); d["functional_status"]=d["status"]
 fd, tmp = tempfile.mkstemp(prefix=".results.", dir=os.path.dirname(p))
 with os.fdopen(fd, "w") as f:
     json.dump(d, f, indent=2)

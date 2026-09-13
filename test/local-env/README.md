@@ -24,8 +24,10 @@ provide two Katan backends plus standalone Praxis. Istio, Kuadrant, and the
 MaaS platform remain explicit prerequisites for the full authenticated chain;
 the provisioner records a failure rather than silently substituting them.
 
-The executable qualification currently records 29 uniquely numbered entries.
-In addition to the
+The executable qualification records 29 uniquely numbered entries in `all`
+mode: 26 routing assertions and transition follow-up assertions 24-26. The
+`routing` mode records only the 26 in-scope routing assertions; `transition`
+records the separate transition fixture. In addition to the
 core transport, routing, hot-reload, digest, and last-known-good checks, it
 proves semantic no-op stability after a real provider watch event and provider
 status-gate loss/recovery. An

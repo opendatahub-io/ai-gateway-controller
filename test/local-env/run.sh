@@ -44,6 +44,41 @@ gateway_namespace=maas-system
 aitenant_namespace=ai-tenants
 controller_namespace=opendatahub
 EOF
+
+# Teardown is intentionally independent of build/provisioning prerequisites.
+# A machine with a missing tool (for example istioctl) must still be able to
+# remove the exact run-owned cluster and record cleanup evidence.
+if [[ "${1:---preflight}" == "--destroy" ]]; then
+  prior_evidence="$EVIDENCE"
+  if [[ -s "$EVIDENCE_ROOT/.active-run" ]]; then
+    prior_evidence=$(<"$EVIDENCE_ROOT/.active-run")
+  fi
+  if ! command -v kind >/dev/null 2>&1; then
+    fail "missing command: kind"
+  elif kind get clusters 2>/dev/null | rg -qx "$CLUSTER"; then
+    timeout 180s kind delete cluster --name "$CLUSTER" >"$EVIDENCE/destroy.log" 2>&1 || fail "run-owned cluster deletion failed"
+  else
+    echo "cluster_already_absent=true" >"$EVIDENCE/destroy.log"
+  fi
+  {
+    echo "cluster=kind-$CLUSTER"
+    echo "run_owned_prior_evidence=$prior_evidence"
+    echo "run_owned_ca_artifacts=$prior_evidence/maas-api-ca.crt,$prior_evidence/maas-api-serving.crt"
+    echo "cluster_certificate_secrets_removed=true"
+    echo "authorino_ca_configmap_removed=true"
+    if kind get clusters 2>/dev/null | rg -qx "$CLUSTER"; then
+      echo "cluster_removed=false"
+      fail "run-owned Kind cluster still exists after teardown"
+    else
+      echo "cluster_removed=true"
+    fi
+    echo "unrelated_kind_clusters_preserved=$(kind get clusters 2>/dev/null | tr '\n' ' ' || true)"
+  } >"$EVIDENCE/cleanup-inventory.txt"
+  echo "destroyed kind-$CLUSTER"
+  (( failures == 0 )) || exit 2
+  exit 0
+fi
+
 for cmd in docker kind kubectl helm kustomize go git openssl yq; do check_cmd "$cmd"; done
 check_cmd "$ISTIOCTL"
 check_repo MAAS_CONTROLLER_REPO "$MAAS_CONTROLLER_REPO"
@@ -118,29 +153,6 @@ done
 
 git -C "$KSERVE_REPO" rev-parse HEAD >"$EVIDENCE/kserve.sha"
 git -C "$KSERVE_REPO" diff --no-ext-diff | sha256sum >"$EVIDENCE/kserve.diff.sha256"
-
-if [[ "${1:---preflight}" == "--destroy" ]]; then
-  prior_evidence="$EVIDENCE"
-  if [[ -s "$EVIDENCE_ROOT/.active-run" ]]; then
-    prior_evidence=$(<"$EVIDENCE_ROOT/.active-run")
-  fi
-  kind delete cluster --name "$CLUSTER" >"$EVIDENCE/destroy.log" 2>&1 || true
-  {
-    echo "cluster=kind-$CLUSTER"
-    echo "run_owned_ca_artifacts=$prior_evidence/maas-api-ca.crt,$prior_evidence/maas-api-serving.crt"
-    echo "cluster_certificate_secrets_removed=true"
-    echo "authorino_ca_configmap_removed=true"
-    if kind get clusters 2>/dev/null | rg -qx "$CLUSTER"; then
-      echo "cluster_removed=false"
-      fail "run-owned Kind cluster still exists after teardown"
-    else
-      echo "cluster_removed=true"
-    fi
-    echo "unrelated_kind_clusters_preserved=$(kind get clusters 2>/dev/null | tr '\n' ' ' || true)"
-  } >"$EVIDENCE/cleanup-inventory.txt"
-  echo "destroyed kind-$CLUSTER"
-  exit 0
-fi
 
 if (( failures )); then
   printf '{\n  "status":"BLOCKED",\n  "failures":%d,\n  "cluster":"kind-%s",\n  "evidence":"%s"\n}\n' "$failures" "$CLUSTER" "$EVIDENCE" >"$EVIDENCE/result.json"
@@ -308,9 +320,73 @@ EOF
   # ExternalProvider references. Do not apply the former static tenant
   # Deployments here; doing so would create an unowned same-name object and
   # correctly block the controller's ownership handoff.
+  # Create the Praxis opt-in AITenants before their ExternalModels. This lets
+  # MaaS materialize its per-tenant IPP operands, then the handoff below can
+  # stop them before an IPP writer ever sees an ExternalModel and creates a
+  # competing direct-provider HTTPRoute.
+  for manifest in "$ROOT/test/local-env/manifests/20-fixtures.yaml" "$ROOT/test/local-env/manifests/21-fixtures-tenant-b.yaml"; do
+    yq eval 'select(.kind == "AITenant")' "$manifest" | "${KCTL[@]}" apply -f -
+  done
+  for tenant_id in "" tenant-b; do
+    deployment_name=payload-processing${tenant_id:+-$tenant_id}
+    pre_deployment_name=payload-pre-processing${tenant_id:+-$tenant_id}
+    if [[ -z "$tenant_id" ]]; then
+      tenant_namespace=models-as-a-service
+      gateway_name=maas-default-gateway
+    else
+      tenant_namespace=ai-tenant-tenant-b
+      gateway_name=maas-tenant-b-gateway
+    fi
+    for _ in $(seq 1 60); do
+      if "${KCTL[@]}" -n maas-system get deployment "$deployment_name" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    "${KCTL[@]}" -n maas-system get deployment "$deployment_name" >/dev/null 2>&1 || {
+      fail "MaaS did not materialize $deployment_name before Praxis handoff"
+      exit 2
+    }
+    if "${KCTL[@]}" -n maas-system get deployment "$deployment_name" >/dev/null 2>&1; then
+      "${KCTL[@]}" -n maas-system set env deployment/"$deployment_name" \
+        NAMESPACE="$tenant_namespace" \
+        GATEWAY_NAMESPACE=maas-system \
+        GATEWAY_NAME="$gateway_name" \
+        DISABLE_EXTERNAL_MODEL_CONTROLLER=true
+    fi
+    if "${KCTL[@]}" -n maas-system get deployment "$pre_deployment_name" >/dev/null 2>&1; then
+      "${KCTL[@]}" -n maas-system set env deployment/"$pre_deployment_name" \
+        NAMESPACE="$tenant_namespace" \
+        GATEWAY_NAMESPACE=maas-system \
+        GATEWAY_NAME="$gateway_name" \
+        DISABLE_EXTERNAL_MODEL_CONTROLLER=true
+    fi
+    # These exact, unowned bootstrap operands are the MaaS handoff boundary
+    # in the Kind fixture. They are removed only after the tenant writer is
+    # disabled; the controller then creates the complete labeled set.
+    for resource in \
+      "deployment/$deployment_name" "deployment/$pre_deployment_name" \
+      "service/$deployment_name" "service/$pre_deployment_name" \
+      "configmap/payload-processing-plugins${tenant_id:+-$tenant_id}" \
+      "serviceaccount/$deployment_name" "envoyfilter/$deployment_name" \
+      "networkpolicy/$deployment_name" "destinationrule/$deployment_name" \
+      "destinationrule/$pre_deployment_name" \
+      "clusterrolebinding/payload-processing-reader${tenant_id:+-$tenant_id}"; do
+      "${KCTL[@]}" -n maas-system delete "$resource" --ignore-not-found --wait=true >/dev/null
+    done
+    if "${KCTL[@]}" -n maas-system get deployment "$deployment_name" -o json 2>/dev/null \
+      | jq -e '.metadata.labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller"' >/dev/null; then
+      :
+    elif "${KCTL[@]}" -n maas-system get deployment "$deployment_name" >/dev/null 2>&1; then
+      fail "$deployment_name survived handoff without controller ownership"
+      exit 2
+    fi
+  done
+  # Apply the remaining fixtures after the writer handoff. In particular, do
+  # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/local-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      10-praxis.yaml|11-praxis-tenant-b.yaml|12-praxis-transition.yaml) continue ;;
+      10-praxis.yaml|11-praxis-tenant-b.yaml|12-praxis-transition.yaml|20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml) continue ;;
     esac
     "${KCTL[@]}" apply -f "$manifest"
   done
@@ -357,6 +433,16 @@ EOF
   if "${KCTL[@]}" -n maas-system get deployment/payload-pre-processing >/dev/null 2>&1; then "${KCTL[@]}" -n maas-system rollout status deployment/payload-pre-processing --timeout=120s; fi
   if "${KCTL[@]}" -n maas-system get deployment/payload-pre-processing-tenant-b >/dev/null 2>&1; then "${KCTL[@]}" -n maas-system rollout status deployment/payload-pre-processing-tenant-b --timeout=120s; fi
   "${KCTL[@]}" -n maas-system rollout status deployment/payload-pre-processing-transition --timeout=120s
+  # Apply Praxis-tenant MaaS model references only after their IPP writers have
+  # been disabled and rolled out. Otherwise the old IPP ExternalModel watcher
+  # can observe the reference first and create a competing direct-provider
+  # HTTPRoute before the controller handoff is complete.
+  for manifest in "$ROOT/test/local-env/manifests/40-maas-fixtures.yaml" "$ROOT/test/local-env/manifests/41-maas-fixtures-tenant-b.yaml"; do
+    "${KCTL[@]}" apply -f "$manifest"
+  done
+  for manifest in "$ROOT/test/local-env/manifests/20-fixtures.yaml" "$ROOT/test/local-env/manifests/21-fixtures-tenant-b.yaml"; do
+    yq eval 'select(.kind != "AITenant")' "$manifest" | "${KCTL[@]}" apply -f -
+  done
   # Do not delete legacy IPP HTTPRoutes here. Their owner is the pinned IPP
   # ExternalModel reconciler, and deleting them would hide an ownership or
   # cutover defect. The qualification records any such route explicitly.

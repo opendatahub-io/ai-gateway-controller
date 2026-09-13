@@ -48,6 +48,7 @@ fail_stage() {
   echo "RESULT"; echo "  Status                 FAIL"
   echo "  Failed boundary        $1"
   echo "  Diagnostics             $EVIDENCE"
+  atomic_results
   exit 1
 }
 wait_for() {
@@ -98,6 +99,10 @@ import json, os, sys, tempfile
 p=sys.argv[1]
 with open(p) as f: d=json.load(f)
 d["total_assertions"]=len(d["assertions"])
+statuses=[x["status"] for x in d["assertions"]]
+d["status"]="PASS" if all(s in ("PASS", "NOT_DEMONSTRATED") for s in statuses) else "FAIL"
+d["scope"]="routing_increment"
+d["not_demonstrated"]=[x["id"] for x in d["assertions"] if x["status"] == "NOT_DEMONSTRATED"]
 fd,t=tempfile.mkstemp(prefix=".results.",dir=os.path.dirname(p))
 with os.fdopen(fd,"w") as f: json.dump(d,f,indent=2); f.flush(); os.fsync(f.fileno())
 os.replace(t,p)
@@ -108,6 +113,20 @@ printf '{"status":"RUNNING","assertions":[],"total_assertions":0}\n' > "$EVIDENC
 
 if [[ "$RESET" == true ]]; then
   echo "RESET: restoring run-owned initial fixtures"
+  # Ensure the Praxis tenants' IPP writers have completed their disabled
+  # rollout before recreating ExternalModels. Otherwise an old writer can
+  # observe the fixture during reset and recreate a direct-provider route.
+  for ipp_deployment in payload-processing payload-processing-tenant-b payload-pre-processing payload-pre-processing-tenant-b; do
+    if kctl -n maas-system get deployment "$ipp_deployment" >/dev/null 2>&1; then
+      tenant_namespace=models-as-a-service
+      gateway_name=maas-default-gateway
+      [[ "$ipp_deployment" == *-tenant-b ]] && { tenant_namespace=ai-tenant-tenant-b; gateway_name=maas-tenant-b-gateway; }
+      mutate -n maas-system set env deployment/"$ipp_deployment" \
+        NAMESPACE="$tenant_namespace" GATEWAY_NAMESPACE=maas-system GATEWAY_NAME="$gateway_name" \
+        DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
+      mutate -n maas-system rollout status deployment/"$ipp_deployment" --timeout=120s >/dev/null
+    fi
+  done
   if [[ "$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)" == ai-gateway-controller ]]; then
     mutate -n "$TENANT" delete configmap routing-overlay --wait=true >/dev/null
   fi
