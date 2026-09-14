@@ -16,5 +16,7 @@ timeout_line=$(grep -n 'AITenant finalization timed out' "$script" | cut -d: -f1
 [[ -n "$timeout_line" ]] || { echo "finalization timeout guard is missing" >&2; exit 1; }
 grep -q 'default AITenant metadata restored' "$script" || { echo "default-tenant restoration path is missing" >&2; exit 1; }
 grep -q 'shared tenant and namespace retained' "$script" || { echo "shared default namespace protection is missing" >&2; exit 1; }
+grep -q 'shared Authorino identity changed; refusing volume restoration' "$script" || { echo "shared Authorino identity guard is missing" >&2; exit 1; }
+grep -q 'xmp-service-ca-' "$script" || { echo "run-owned Authorino CA cleanup is missing" >&2; exit 1; }
 
 echo "destroy ordering: PASS"

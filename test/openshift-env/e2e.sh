@@ -13,7 +13,7 @@ OC=(timeout --foreground 45s oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kub
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/e2e-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$OUT"
 RECOMPUTE_BIN="$OUT/recompute-digest"
-go build -o "$RECOMPUTE_BIN" "$ROOT/test/kind-env/recompute_digest.go"
+go build -o "$RECOMPUTE_BIN" "$ROOT/test/openshift-env/recompute_digest.go"
 AITENANT_NAME="${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}"
 RESULTS="$OUT/results.json"
 tmp="$RESULTS.tmp.$$"
@@ -21,10 +21,27 @@ printf '{"suite":"openshift-routing","functional":"RUNNING","assertions":[]}' >"
 mv "$tmp" "$RESULTS"
 CURRENT_ASSERTION="initialization"
 FINALIZED=false
+ADMIN=""
+KEY=""
+KEY_ID=""
+HOST=""
+CLIENT=""
+revoke_key() {
+  [[ -n "$ADMIN" && -n "$KEY_ID" && -n "$HOST" && -n "$CLIENT" ]] || return 0
+  local status
+  status=$(printf '%s\n' "$ADMIN" | "${OC[@]}" exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r token; curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 --cacert /etc/xmp/ca/ca.crt -X DELETE "https://'"$HOST"'/v1/api-keys/'"$KEY_ID"'" -H "Authorization: Bearer $token"' 2>/dev/null || true)
+  printf '%s\n' "$status" >"$OUT/key-revoke-status.txt"
+  [[ "$status" == 200 ]] || return 1
+  KEY_ID=""
+}
 finalize_on_exit() {
   local rc=${1:-$?} current final
   [[ "$FINALIZED" == true ]] && return "$rc"
   FINALIZED=true
+  if [[ -n "$KEY_ID" ]] && ! revoke_key; then
+    rc=1
+    CURRENT_ASSERTION="API-key revocation after failure"
+  fi
   [[ -f "$RESULTS" ]] || exit "$rc"
   current=$(jq -r '.functional // "UNKNOWN"' "$RESULTS" 2>/dev/null || printf 'UNKNOWN')
   if [[ "$current" == RUNNING ]]; then
@@ -101,6 +118,24 @@ request() {
   fi
   printf '%s\n%s' "$key" "$body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r key; curl --silent --show-error --output /tmp/xmp-request --write-out "%{http_code}" --max-time 30 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "Authorization: Bearer $key" -H "Content-Type: application/json" --data-binary @-' sh "$url"
 }
+wait_for_gateway_tls() {
+  local deadline=$((SECONDS + 180)) status
+  while (( SECONDS < deadline )); do
+    status=$(request none "$URL" "$request_body" 2>/dev/null || true)
+    if [[ "$status" == 401 ]]; then
+      return 0
+    fi
+    # A response is definitive. Only transport status 000 may be retried
+    # while the externally programmed load balancer becomes reachable.
+    if [[ "$status" != 000 ]]; then
+      printf 'Gateway readiness returned unexpected HTTP status %s\n' "$status" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  printf 'Gateway TLS endpoint did not become reachable before deadline\n' >&2
+  return 1
+}
 wait_for_praxis_overlay() {
   local expected_provider=$1 expected_generation=$2 expected_digest=$3
   local stable=0 previous="" observation config_content mounted_content static_config generation digest recomputed mounted_digest
@@ -141,12 +176,13 @@ wait_json "first endpoint controller reconciliation" "${OC[*]} get externalmodel
 wait_json "first endpoint ConfigMap" "${OC[*]} get configmap routing-overlay -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.data[\"routing-overlay.json\"] | contains(\"provider-provider-a\") and (contains(\"provider-provider-b\") | not)' >/dev/null" 180 || { record baseline "First endpoint baseline" FAIL cleanup "first endpoint ConfigMap did not converge"; exit 1; }
 wait_for_praxis_overlay a "" "" || { record baseline "First endpoint baseline" FAIL cleanup "Praxis projection did not converge"; exit 1; }
 request_body='{"model":"demo","messages":[{"role":"user","content":"qualification"}]}'
+wait_for_gateway_tls || { record 9 "Gateway TLS endpoint" FAIL authorization "TLS endpoint did not reach the expected unauthenticated response"; exit 1; }
 unauth=$(request none "$URL" "$request_body" 2>/dev/null || true)
 [[ "$unauth" == 401 ]] && record 9 "Unauthenticated request" PASS authorization "first test endpoint returned HTTP 401" || { record 9 "Unauthenticated request" FAIL authorization "expected 401, observed $unauth"; exit 1; }
 ADMIN=$(${OC[@]} whoami -t)
 SUB=$(${OC[@]} get maassubscription -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.items[0].metadata.name}')
 printf '%s\n%s' "$ADMIN" "{\"name\":\"xmp-$OPENSHIFT_E2E_RUN_ID\",\"subscription\":\"$SUB\"}" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r token; curl --silent --show-error --output /tmp/xmp-key --write-out "%{http_code}" --max-time 20 --cacert /etc/xmp/ca/ca.crt -X POST "https://'"$HOST"'/v1/api-keys" -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data-binary @-' >"$OUT/key-create-status.txt"
-key_json=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'cat /tmp/xmp-key'); KEY=$(printf '%s' "$key_json" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p'); KEY_ID=$(printf '%s' "$key_json" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+key_json=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'cat /tmp/xmp-key && : > /tmp/xmp-key'); KEY=$(printf '%s' "$key_json" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p'); KEY_ID=$(printf '%s' "$key_json" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
 [[ $(cat "$OUT/key-create-status.txt") == 201 && -n "$KEY" && -n "$KEY_ID" ]] || { record 10 "API-key creation" FAIL authorization "real MaaS key creation failed"; exit 1; }
 record 10 "API-key creation" PASS authorization "HTTP 201; key withheld"
 a_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); a_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
@@ -182,8 +218,7 @@ ${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --t
 wait_for_praxis_overlay a "" "" || { record 18 "Provider A reset" FAIL cleanup "baseline did not restore"; exit 1; }
 reset_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); reset_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$reset_status" == 200 && "$reset_body" == *provider-a* ]] && record 19 "Provider A reset request" PASS routing "HTTP 200; first test endpoint restored" || { record 19 "Provider A reset request" FAIL routing "expected HTTP 200 from first endpoint after reset"; exit 1; }
-printf '%s\n' "$ADMIN" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r token; curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 --cacert /etc/xmp/ca/ca.crt -X DELETE "https://'"$HOST"'/v1/api-keys/'"$KEY_ID"'" -H "Authorization: Bearer $token"' >"$OUT/key-revoke-status.txt"
-[[ $(cat "$OUT/key-revoke-status.txt") == 200 ]] && record 17 "API-key revocation" PASS authorization "HTTP 200" || { record 17 "API-key revocation" FAIL authorization "revocation failed"; exit 1; }
+revoke_key && record 17 "API-key revocation" PASS authorization "HTTP 200" || { record 17 "API-key revocation" FAIL authorization "revocation failed"; exit 1; }
 if rg -i 'authorization:|sk-oai-|Bearer[[:space:]]+sk-' "$OUT" >/dev/null 2>&1; then record 20 "Credential leak scan" FAIL security "sensitive pattern found"; else record 20 "Credential leak scan" PASS security "no credential patterns found"; fi
 jq '.functional=(if (([.assertions[] | select(.status=="FAIL")] | length) == 0 and ([.assertions[] | select(.status=="NOT_DEMONSTRATED")] | length) == 0) then "PASS" else "PARTIAL" end) | .note="Single-tenant routing; two-tenant MaaS authorization remains issue #23"' "$RESULTS" >"$tmp"
 mv "$tmp" "$RESULTS"

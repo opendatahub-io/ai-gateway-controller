@@ -99,9 +99,12 @@ if [[ "$(jq 'length' <<<"$EXISTING_ISTIOD")" -ne 0 ]]; then
     "${OC[@]}" delete namespace istio-system --ignore-not-found --wait=true --timeout=5m >>"$OUT/istio-recovery-uninstall.log" 2>&1
     EXISTING_ISTIOD='[]'
   fi
-  if [[ -z "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]] && [[ ! -f "$ISTIO_READY_MARKER" ]] && [[ "$(jq -r 'length == 1 and .[0].namespace == "istio-system" and .[0].name == "istiod" and .[0].runId == "'"$OPENSHIFT_E2E_RUN_ID"'"' <<<"$EXISTING_ISTIOD")" != true ]]; then
-    echo "refusing to install beside an unowned or foreign Istio control plane; see $OUT/preexisting-istiod.json" >&2
-    exit 1
+  if [[ -z "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]] && [[ ! -f "$ISTIO_READY_MARKER" ]]; then
+    if [[ "$(jq -r 'length == 1 and .[0].namespace == "istio-system" and .[0].name == "istiod"' <<<"$EXISTING_ISTIOD")" != true ]]; then
+      echo "refusing to install beside an unowned or foreign Istio control plane; see $OUT/preexisting-istiod.json" >&2
+      exit 1
+    fi
+    printf '%s\n' 'reusing the single shared istio-system/istiod control plane' >"$OUT/istio-reused.txt"
   fi
   if [[ -n "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]]; then
     ISTIO_ALREADY_INSTALLED=false

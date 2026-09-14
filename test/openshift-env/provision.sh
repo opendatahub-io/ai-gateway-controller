@@ -154,6 +154,7 @@ REGISTRY=${REGISTRY#https://}
 REGISTRY=${REGISTRY%/}
 IMAGE_PROJECT=${OPENSHIFT_E2E_IMAGE_PROJECT:-$OPENSHIFT_E2E_BACKEND_NAMESPACE}
 PULL_REGISTRY="image-registry.openshift-image-registry.svc:5000"
+PULL_SECRET="xmp-registry-pull-$OPENSHIFT_E2E_RUN_ID"
 CONTROLLER_IMAGE="${OPENSHIFT_E2E_CONTROLLER_IMAGE:-$PULL_REGISTRY/$IMAGE_PROJECT/ai-gateway-controller:$OPENSHIFT_E2E_RUN_ID}"
 PRAXIS_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/praxis-ai:$OPENSHIFT_E2E_RUN_ID"
 EXTPROC_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/praxis-extproc:$OPENSHIFT_E2E_RUN_ID"
@@ -171,18 +172,23 @@ printf '%s\n' "$TOKEN" | skopeo login --tls-verify=true --cert-dir "$REGISTRY_CE
 PULL_AUTHFILE=$(mktemp "$STATE/.pull-auth.XXXXXX")
 rm -f "$PULL_AUTHFILE"
 "${OC[@]}" registry login --registry="$PULL_REGISTRY" --to="$PULL_AUTHFILE" >"$OUT/registry-pull-login.txt" 2>&1
-for namespace in "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" "$OPENSHIFT_E2E_BACKEND_NAMESPACE" maas-system ai-tenants; do
-  "${OC[@]}" create secret generic xmp-registry-pull -n "$namespace" --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson="$PULL_AUTHFILE" --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/registry-pull-secret-$namespace.log" 2>&1
-  "${OC[@]}" patch serviceaccount default -n "$namespace" --type=merge -p '{"imagePullSecrets":[{"name":"xmp-registry-pull"}]}' >>"$OUT/registry-pull-secret-$namespace.log" 2>&1
+for namespace in "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" "$OPENSHIFT_E2E_BACKEND_NAMESPACE" maas-system; do
+  "${OC[@]}" create secret generic "$PULL_SECRET" -n "$namespace" --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson="$PULL_AUTHFILE" --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/registry-pull-secret-$namespace.log" 2>&1
+  "${OC[@]}" label secret "$PULL_SECRET" -n "$namespace" --overwrite \
+    "external-model-praxis.opendatahub.io/run-id=$OPENSHIFT_E2E_RUN_ID" \
+    app.kubernetes.io/managed-by=external-model-praxis-openshift-e2e >>"$OUT/registry-pull-secret-$namespace.log" 2>&1
 done
-attach_pull_secret_to_all_sas() {
-  local namespace=$1 sa
-  while IFS= read -r sa; do
-    [[ -n "$sa" ]] || continue
-    "${OC[@]}" patch serviceaccount "$sa" -n "$namespace" --type=merge -p '{"imagePullSecrets":[{"name":"xmp-registry-pull"}]}' >/dev/null
-  done < <("${OC[@]}" get serviceaccount -n "$namespace" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+attach_pull_secret_to_sa() {
+  local namespace=$1 sa=$2 current snapshot patch
+  current=$("${OC[@]}" get serviceaccount "$sa" -n "$namespace" -o json)
+  snapshot="$STATE/serviceaccount-original-${namespace}-${sa}.json"
+  if [[ ! -s "$snapshot" ]]; then
+    jq '{namespace:.metadata.namespace,name:.metadata.name,uid:.metadata.uid,imagePullSecrets:(.imagePullSecrets // null)}' <<<"$current" >"$snapshot"
+  fi
+  patch=$(jq -cn --arg name "$PULL_SECRET" --argjson current "$(jq '.imagePullSecrets // []' <<<"$current")" \
+    '{imagePullSecrets:($current + [{name:$name}] | unique_by(.name))}')
+  "${OC[@]}" patch serviceaccount "$sa" -n "$namespace" --type=merge -p "$patch" >/dev/null
 }
-attach_pull_secret_to_all_sas maas-system
 rm -f "$PULL_AUTHFILE"
 unset TOKEN
 BUILD_FLAGS=(--platform linux/amd64 --provenance=false --sbom=false)
@@ -310,7 +316,8 @@ EOF
 MAAS_RENDERED="$STATE/.maas-rendered.$$"
 kustomize build "$MAAS_OVERLAY" >"$MAAS_RENDERED"
 "${OC[@]}" apply -f "$MAAS_RENDERED" >"$OUT/deploy-maas.log" 2>&1
-attach_pull_secret_to_all_sas maas-system
+attach_pull_secret_to_sa maas-system maas-controller
+"${OC[@]}" rollout restart deployment/maas-controller -n maas-system >>"$OUT/deploy-maas.log" 2>&1
 KUBECONFIG="${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" NAMESPACE=maas-system INFRA_NAMESPACE=maas-system "$MAAS_CONTROLLER_REPO/scripts/setup-database.sh" >>"$OUT/deploy-maas.log" 2>&1
 rm -rf "$MAAS_OVERLAY" "$MAAS_RENDERED"
 {
@@ -365,9 +372,12 @@ fi
 if [[ "$AITENANT_NAME" == models-as-a-service && ! -s "$STATE/aitenant-original.json" ]]; then
   # The default tenant is shared MaaS state: retain its metadata before the
   # run applies Praxis opt-in so cleanup can restore, never delete, it.
-  "${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json |
+  if "${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json >"$OUT/default-tenant-existing.json" 2>/dev/null; then
     jq '{metadata:{labels:(.metadata.labels // {}),annotations:(.metadata.annotations // {})},spec:.spec}' \
-    >"$STATE/aitenant-original.json"
+      "$OUT/default-tenant-existing.json" >"$STATE/aitenant-original.json"
+  else
+    jq -n '{metadata:{labels:{},annotations:{}},spec:{}}' >"$STATE/aitenant-original.json"
+  fi
 fi
 "${OC[@]}" apply -f - <<EOF
 apiVersion: maas.opendatahub.io/v1alpha1
@@ -384,7 +394,11 @@ spec:
   gateway:
     name: $OPENSHIFT_E2E_GATEWAY_NAME
 EOF
-"${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json >"$OUT/aitenant-after-create.json"
+AITENANT_OBSERVE_DEADLINE=$((SECONDS + 60))
+while ! "${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json >"$OUT/aitenant-after-create.json" 2>/dev/null; do
+  (( SECONDS >= AITENANT_OBSERVE_DEADLINE )) && { echo "AITenant was not observable after successful admission/create" >&2; exit 1; }
+  sleep 2
+done
 API_DEADLINE=$(( $(date +%s) + 300 ))
 if [[ "$AITENANT_NAME" == models-as-a-service ]]; then
   API_DEPLOYMENT=maas-api
@@ -400,7 +414,9 @@ else
     sleep 2
   done
 fi
-attach_pull_secret_to_all_sas maas-system
+api_service_account=$("${OC[@]}" get deployment "$API_DEPLOYMENT" -n maas-system -o jsonpath='{.spec.template.spec.serviceAccountName}')
+[[ -n "$api_service_account" ]] || api_service_account=default
+attach_pull_secret_to_sa maas-system "$api_service_account"
 {
   "${OC[@]}" set image deployment/"$API_DEPLOYMENT" maas-api="$MAAS_API_IMAGE" -n maas-system
   "${OC[@]}" patch deployment "$API_DEPLOYMENT" -n maas-system --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
@@ -409,6 +425,19 @@ attach_pull_secret_to_all_sas maas-system
 "${OC[@]}" wait --for=condition=Ready "aitenant/$AITENANT_NAME" -n ai-tenants --timeout=10m >/dev/null
 OPENSHIFT_E2E_TENANT_NAMESPACE=$("${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o jsonpath='{.status.tenantNamespace}')
 [[ -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" ]] || { echo "MaaS did not report a resolved tenant namespace" >&2; exit 1; }
+# The resolved shared tenant may differ from the provisional ai-tenants
+# namespace. Create its pull Secret in the actual image-consuming namespace
+# before attaching it to the tenant ServiceAccount.
+RESOLVED_PULL_AUTHFILE=$(mktemp "$STATE/.resolved-pull-auth.XXXXXX")
+rm -f "$RESOLVED_PULL_AUTHFILE"
+"${OC[@]}" registry login --registry="$PULL_REGISTRY" --to="$RESOLVED_PULL_AUTHFILE" >"$OUT/registry-pull-login-resolved-tenant.log" 2>&1
+"${OC[@]}" create secret generic "$PULL_SECRET" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" \
+  --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson="$RESOLVED_PULL_AUTHFILE" \
+  --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/registry-pull-secret-resolved-tenant.log" 2>&1
+"${OC[@]}" label secret "$PULL_SECRET" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --overwrite \
+  "external-model-praxis.opendatahub.io/run-id=$OPENSHIFT_E2E_RUN_ID" \
+  app.kubernetes.io/managed-by=external-model-praxis-openshift-e2e >>"$OUT/registry-pull-secret-resolved-tenant.log" 2>&1
+rm -f "$RESOLVED_PULL_AUTHFILE"
 # Persist MaaS's resolved namespace for inspect/destroy and subsequent
 # commands. The preflight value is only a provisional name.
 run_env_tmp="$STATE/run.env.tmp.$$"
@@ -441,6 +470,10 @@ fi
 # request. The bundle contains only CA material; its value is never written
 # to evidence.
 AUTHORINO_TRUST_CONFIGMAP="xmp-service-ca-$OPENSHIFT_E2E_RUN_ID"
+if [[ ! -s "$STATE/authorino-original-volumes.json" ]]; then
+  "${OC[@]}" get authorino authorino -n kuadrant-system -o json |
+    jq '{uid:.metadata.uid,volumes:(.spec.volumes // null)}' >"$STATE/authorino-original-volumes.json"
+fi
 "${OC[@]}" apply -f - >"$OUT/authorino-service-ca-configmap.log" <<EOF
 apiVersion: v1
 kind: ConfigMap
@@ -541,7 +574,7 @@ spec:
         ports: [{name: health, containerPort: 8081}]
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}
 EOF
-attach_pull_secret_to_all_sas "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE"
+attach_pull_secret_to_sa "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" ai-gateway-controller
 "${OC[@]}" apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -740,7 +773,34 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 [[ -n "${praxis_sa:-}" ]] || { echo "controller did not create a tenant Praxis ServiceAccount" >&2; exit 1; }
-attach_pull_secret_to_all_sas "$OPENSHIFT_E2E_TENANT_NAMESPACE"
+attach_pull_secret_to_sa "$OPENSHIFT_E2E_TENANT_NAMESPACE" "$praxis_sa"
+"${OC[@]}" apply -f - >"$OUT/image-puller-resolved-tenant.log" <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: image-puller-resolved-tenant-$OPENSHIFT_E2E_RUN_ID
+  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
+  labels:
+    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:image-puller
+subjects:
+- kind: ServiceAccount
+  name: $praxis_sa
+  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
+EOF
+# The Praxis Deployment may have been created before the resolved-tenant
+# image-puller binding existed.  Restart it through its normal Deployment
+# lifecycle after the exact ServiceAccount authorization is in place; this is
+# required for an idempotent retry of an ImagePullBackOff, before qualification
+# records workload identity.
+if "${OC[@]}" get deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o name 2>/dev/null | grep -q .; then
+  "${OC[@]}" rollout restart deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis >"$OUT/praxis-rollout-retry.log"
+  "${OC[@]}" rollout status deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis --timeout=300s >>"$OUT/praxis-rollout-retry.log"
+fi
 "${OC[@]}" get deployment,service,externalmodel,externalprovider -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/tenant-after-fixtures.json"
 
 # Keep one run-owned in-cluster client for functional qualification.  Only the
@@ -764,7 +824,7 @@ spec:
   restartPolicy: Always
   containers:
   - name: client
-    image: curlimages/curl:8.10.1
+    image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
     command: ["/bin/sh", "-c", "sleep 86400"]
     securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}
     volumeMounts: [{name: gateway-ca, mountPath: /etc/xmp/ca, readOnly: true}]
