@@ -1,3 +1,17 @@
+# Purpose: Deploys the Katan provider backends and Services used by the
+# models-as-a-service and ai-tenant-tenant-b routing fixtures.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the maas-system namespace and the pinned public
+# llm-katan image loaded into Kind. The provider credentials Secret is tenant-local; these
+# backends serve the tenant-local Praxis instances through maas-system.
+#
+# Qualification role: Supplies independently addressable provider endpoints,
+# including the HTTPS-shaped transition compatibility Service, for routing,
+# attribution, and IPP-to-Praxis transition/rollback checks. Credentials here
+# are dummy test values and must never be treated as production secrets.
+
 apiVersion: v1
 kind: Secret
 metadata:
@@ -20,7 +34,7 @@ spec:
     spec:
       containers:
       - name: katan
-        image: llm-katan:e2e
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
         args: [--model, demo, --backend, echo, --providers, openai]
@@ -63,7 +77,7 @@ spec:
     spec:
       containers:
       - name: katan
-        image: llm-katan:e2e
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
         args: [--model, demo, --backend, echo, --providers, openai]
@@ -91,7 +105,7 @@ spec:
     spec:
       containers:
       - name: katan
-        image: llm-katan:e2e
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
         args: [--model, demo, --backend, echo, --providers, openai]
@@ -119,7 +133,7 @@ spec:
     spec:
       containers:
       - name: katan
-        image: llm-katan:e2e
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
         args: [--model, demo, --backend, echo, --providers, openai]

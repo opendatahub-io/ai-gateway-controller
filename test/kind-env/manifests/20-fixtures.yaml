@@ -1,3 +1,17 @@
+# Purpose: Configures tenant A (`models-as-a-service`) and its ExternalProvider
+# and ExternalModel resources for the main Praxis routing suite.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenants and models-as-a-service namespaces,
+# the maas-default-gateway from 30-gateway.yaml, and provider-credentials plus
+# provider-a/provider-b from 00-backends.yaml. The AITenant is applied first;
+# the remaining resources are applied after the MaaS handoff in run.sh.
+#
+# Qualification role: Defines the tenant-local provider topology that the
+# controller converts into transport resources, routing overlay, and Praxis
+# serving state.
+
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: AITenant
 metadata:

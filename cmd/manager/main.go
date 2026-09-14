@@ -63,9 +63,9 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
 	flag.StringVar(&image, "image", "quay.io/opendatahub/odh-praxis-extproc:odh-stable",
-		"Container image for the payload-processing and payload-pre-processing Deployments.")
+		"Container image for the payload-processing and payload-pre-processing Deployments. Release packaging should replace this default with an immutable digest.")
 	flag.StringVar(&praxisImage, "praxis-image", "quay.io/opendatahub/praxis-ai:odh-stable",
-		"Container image for the tenant-scoped standalone Praxis Deployment.")
+		"Container image for the tenant-scoped standalone Praxis Deployment. Release packaging should replace this default with an immutable digest.")
 	flag.StringVar(&praxisImagePullPolicy, "praxis-image-pull-policy", "IfNotPresent",
 		"Image pull policy for the tenant-scoped standalone Praxis Deployment.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/praxis-extproc/overlays/odh",

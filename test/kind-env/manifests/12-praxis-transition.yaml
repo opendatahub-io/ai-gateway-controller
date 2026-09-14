@@ -1,6 +1,24 @@
+# Purpose: Defines the standalone Praxis configuration, Deployment, and
+# Service for the separate IPP-to-Praxis transition/rollback tenant.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+# This fixture belongs to the transition/rollback qualification, not the main
+# routing suite.
+#
+# Dependencies: Requires the ai-tenant-transition namespace, transition
+# routing-overlay ConfigMap, transition-provider-credentials Secret, and the
+# provider-a-legacy compatibility Service in maas-system from 00-backends.yaml.
+#
+# Qualification role: Provides the Praxis side of the annotation-absent
+# transition path while IPP ownership and rollback are evaluated separately.
+# The credential is a dummy test value and must never be treated as a
+# production secret.
+
 apiVersion: v1
 kind: ConfigMap
-metadata: {name: praxis-config, namespace: models-as-a-service}
+metadata:
+  name: praxis-config
+  namespace: ai-tenant-transition
 data:
   config.yaml: |
     listeners:
@@ -19,27 +37,27 @@ data:
             reload: {enabled: true, debounce_ms: 500}
           - filter: credential_inject
             credentials:
-              - name: provider-credentials
-                namespace: models-as-a-service
+              - name: transition-provider-credentials
+                namespace: ai-tenant-transition
                 key: api-key
-                file: /etc/praxis/credentials/provider-credentials/api-key
+                file: /etc/praxis/credentials/transition-provider-credentials/api-key
           - filter: load_balancer
             clusters:
-              - name: provider-provider-a
+              - name: provider-transition-provider
                 endpoints: ["provider-a.maas-system.svc.cluster.local:8000"]
-              - name: provider-provider-b
-                endpoints: ["provider-b.maas-system.svc.cluster.local:8000"]
-    admin: {address: "127.0.0.1:9901"}
+    admin: {address: "127.0.0.1:9901}
     insecure_options: {allow_private_endpoints: true}
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: praxis, namespace: models-as-a-service}
+metadata:
+  name: praxis
+  namespace: ai-tenant-transition
 spec:
   replicas: 1
-  selector: {matchLabels: {app: praxis}}
+  selector: {matchLabels: {app: praxis-transition}}
   template:
-    metadata: {labels: {app: praxis}}
+    metadata: {labels: {app: praxis-transition}}
     spec:
       containers:
       - name: praxis
@@ -57,16 +75,18 @@ spec:
       - {name: routing, configMap: {name: routing-overlay}}
       - name: credentials
         secret:
-          secretName: provider-credentials
+          secretName: transition-provider-credentials
           items:
           - key: api-key
-            path: provider-credentials/api-key
+            path: transition-provider-credentials/api-key
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: praxis, namespace: models-as-a-service}
+metadata:
+  name: praxis
+  namespace: ai-tenant-transition
 spec:
-  selector: {app: praxis}
+  selector: {app: praxis-transition}
   ports:
   - {name: http, port: 8080, targetPort: http}
   - {name: admin, port: 9901, targetPort: admin}

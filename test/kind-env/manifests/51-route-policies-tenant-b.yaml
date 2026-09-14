@@ -1,3 +1,17 @@
+# Purpose: Attaches Kuadrant/Authorino authentication and token-rate-limit
+# policies to tenant B's generated ExternalModel HTTPRoute.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenant-tenant-b namespace, the MaaS API and
+# Authorino/Kuadrant controllers, and the tenant-B generated
+# external-model-demo-model HTTPRoute from 21-fixtures-tenant-b.yaml.
+#
+# Qualification role: Proves tenant-B authentication, authorization, and
+# rate-limit policy isolation at its generated HTTPRoute boundary. The API key
+# pattern is test-only; credentials must never be treated as production
+# secrets.
+
 apiVersion: kuadrant.io/v1
 kind: AuthPolicy
 metadata:

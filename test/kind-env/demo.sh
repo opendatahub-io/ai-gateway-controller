@@ -130,8 +130,8 @@ if [[ "$RESET" == true ]]; then
   if [[ "$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)" == ai-gateway-controller ]]; then
     mutate -n "$TENANT" delete configmap routing-overlay --wait=true >/dev/null
   fi
-  mutate apply -f "$ROOT/test/local-env/manifests/20-fixtures.yaml" >/dev/null
-  mutate apply -f "$ROOT/test/local-env/manifests/10-praxis.yaml" >/dev/null
+  mutate apply -f "$ROOT/test/kind-env/manifests/20-fixtures.yaml" >/dev/null
+  mutate apply -f "$ROOT/test/kind-env/manifests/10-praxis.yaml" >/dev/null
   mutate -n "$TENANT" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-a"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]' >/dev/null
   wait_for "tenant model Ready after reset" 120 kctl -n "$TENANT" get externalmodel demo-model -o jsonpath='{.status.phase}' || exit 1
   for _ in $(seq 1 60); do
@@ -305,4 +305,4 @@ echo "  Retained context       $CONTEXT"
 echo "  Evidence               $EVIDENCE"
 echo "  Inspect: kubectl --context $CONTEXT get pods -A"
 echo "  Inspect: kubectl --context $CONTEXT -n $TENANT get externalmodel,externalprovider,httproute,service,deployment,configmap"
-echo "  Reset:   ./test/local-env/demo.sh --context $CONTEXT --reset"
+echo "  Reset:   ./test/kind-env/demo.sh --context $CONTEXT --reset"

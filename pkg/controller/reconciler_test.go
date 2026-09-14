@@ -160,6 +160,57 @@ func TestTenantModelsMapsStatusNamespace(t *testing.T) {
 	}
 }
 
+func TestReconcileInactivePraxisTenantDoesNotPublish(t *testing.T) {
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalModelSpec{ModelName: "client-model"},
+	}
+	ait := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "AITenant",
+		"metadata": map[string]any{"name": "tenant", "namespace": "models-as-a-service", "annotations": map[string]any{tenant.AnnotationPayloadProcessingType: "praxis"}},
+		"status":   map[string]any{"tenantNamespace": "tenant-a", "phase": "Pending"},
+	}}
+	ait.SetGroupVersionKind(tenant.AITenantGVK)
+	r := controllerTestClient(t, model)
+	if err := r.Create(context.Background(), ait); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Fatalf("phase = %q, want Failed", got.Status.Phase)
+	}
+	var foundTenantNotReady bool
+	for _, condition := range got.Status.Conditions {
+		if condition.Reason == reasonTenantNotReady {
+			foundTenantNotReady = true
+		}
+	}
+	if !foundTenantNotReady {
+		t.Fatalf("conditions = %#v, want reason %q", got.Status.Conditions, reasonTenantNotReady)
+	}
+	for _, kind := range []string{"Service", "ServiceEntry", "DestinationRule", "HTTPRoute"} {
+		obj := &unstructured.Unstructured{}
+		groups := map[string]string{
+			"Service": "", "ServiceEntry": "networking.istio.io",
+			"DestinationRule": "networking.istio.io", "HTTPRoute": "gateway.networking.k8s.io",
+		}
+		obj.SetGroupVersionKind(schema.GroupVersionKind{Group: groups[kind], Version: "v1", Kind: kind})
+		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "external-model-model"}, obj); err == nil {
+			t.Fatalf("inactive tenant published %s", kind)
+		}
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("inactive tenant overlay lookup error = %v, want NotFound", err)
+	}
+}
+
 func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},

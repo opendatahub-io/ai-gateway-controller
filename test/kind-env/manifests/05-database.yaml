@@ -1,3 +1,16 @@
+# Purpose: Deploys the run-owned PostgreSQL database and connection Secret for
+# the MaaS API/controller fixture.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the maas-system namespace and is applied before the
+# Gateway, MaaS controller, and authenticated API resources.
+#
+# Qualification role: Provides the persistence boundary needed for MaaS API
+# key validation and subscription/authentication qualification. The database
+# credentials are dummy test values and must never be treated as production
+# secrets.
+
 apiVersion: v1
 kind: Secret
 metadata:

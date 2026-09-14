@@ -1,3 +1,17 @@
+# Purpose: Defines the tenant-B standalone Praxis configuration, Deployment,
+# and Service for ai-tenant-tenant-b.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenant-tenant-b namespace, its routing-overlay
+# ConfigMap and provider-credentials Secret, and the maas-system provider
+# Services from 00-backends.yaml. The main run may skip direct application
+# because the controller materializes the equivalent tenant-local resources.
+#
+# Qualification role: Proves tenant-B routing and credential state remain
+# isolated while tenant A is configured or mutated. Credentials are dummy
+# test values and must never be treated as production secrets.
+
 apiVersion: v1
 kind: ConfigMap
 metadata:

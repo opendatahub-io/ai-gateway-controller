@@ -1,3 +1,17 @@
+# Purpose: Configures tenant B (`ai-tenant-tenant-b`) and its isolated
+# ExternalProvider and ExternalModel resources for the tenant-B routing suite.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenants and ai-tenant-tenant-b namespaces, the
+# maas-tenant-b-gateway from 30-gateway.yaml, the tenant-B credential Secret,
+# and provider-a-tenant-b/provider-b-tenant-b from 00-backends.yaml. Its
+# AITenant is applied before the remaining resources during provisioning.
+#
+# Qualification role: Proves tenant-B model/provider discovery and routing are
+# isolated from tenant A. The credential is a dummy test value and must never
+# be treated as a production secret.
+
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: AITenant
 metadata:

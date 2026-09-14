@@ -139,7 +139,10 @@ func praxisConfig(namespace string, credentials []praxisCredential, providers []
 func praxisDeployment(namespace, tenantID, image, imagePullPolicy string, labels map[string]any, credentials []praxisCredential) map[string]any {
 	volumes := []any{
 		map[string]any{"name": "config", "configMap": map[string]any{"name": ResourceName(praxisConfigMapName, tenantID)}},
-		map[string]any{"name": "routing", "configMap": map[string]any{"name": praxisOverlayName}},
+		// The first tenant reconcile can precede the first valid model overlay.
+		// Kubelet must allow Praxis to start and report readiness while the
+		// routing reconciler publishes the first overlay.
+		map[string]any{"name": "routing", "configMap": map[string]any{"name": praxisOverlayName, "optional": true}},
 	}
 	if len(credentials) > 0 {
 		bySecret := map[string][]any{}
@@ -187,9 +190,11 @@ func praxisDeployment(namespace, tenantID, image, imagePullPolicy string, labels
 			"template": map[string]any{"metadata": map[string]any{"labels": labels}, "spec": map[string]any{
 				"serviceAccountName":           ResourceName(praxisServiceAccount, tenantID),
 				"automountServiceAccountToken": false,
-				"securityContext":              map[string]any{"runAsNonRoot": true, "runAsUser": int64(65532), "runAsGroup": int64(65532), "fsGroup": int64(65532)},
-				"containers":                   []any{container},
-				"volumes":                      volumes,
+				// Let the platform assign the namespace-compatible UID/GID (notably
+				// under OpenShift restricted-v2 SCC). The image remains non-root.
+				"securityContext": map[string]any{"runAsNonRoot": true},
+				"containers":      []any{container},
+				"volumes":         volumes,
 			}},
 		},
 	}

@@ -1,3 +1,16 @@
+# Purpose: Configures tenant-A MaaS model-reference, subscription, and
+# authentication-policy resources for `models-as-a-service`.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires 20-fixtures.yaml's demo-model, the models-as-a-service
+# namespace, the MaaS API/controller, and the generated HTTPRoute. The route
+# policy in 50-route-policies.yaml authenticates the resulting route.
+#
+# Qualification role: Proves tenant-A subscription, user authentication, and
+# token-rate-limit metadata are attached to the controller-generated model
+# route. `kind-user` and related values are test-only identities.
+
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
 metadata:

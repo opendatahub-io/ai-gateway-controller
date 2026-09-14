@@ -1,3 +1,16 @@
+# Purpose: Configures tenant-B MaaS model-reference, subscription, and
+# authentication-policy resources for `ai-tenant-tenant-b`.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires 21-fixtures-tenant-b.yaml's demo-model, the tenant-B
+# namespace, the MaaS API/controller, and its generated HTTPRoute. The route
+# policy in 51-route-policies-tenant-b.yaml authenticates the resulting route.
+#
+# Qualification role: Proves tenant-B subscription and authentication remain
+# isolated from tenant A while both use the shared Kind MaaS control plane.
+# `kind-user` is a test-only identity.
+
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
 metadata:

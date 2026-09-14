@@ -1,4 +1,4 @@
-# Local two-plane environment
+# Kind two-plane environment
 
 This directory is the bounded entrypoint for the local Kind environment
 described by ADR 0001. It creates and uses only the named Kind context,

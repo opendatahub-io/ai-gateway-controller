@@ -6,6 +6,9 @@ CLUSTER=${LOCAL_ENV_CLUSTER:-external-model-two-plane}
 WORKSPACE=$(cd "$ROOT/.." && pwd)
 DEPS_DIR=${LOCAL_ENV_DEPS_DIR:-"$WORKSPACE/deps"}
 LLM_KATAN_REPO=${LLM_KATAN_REPO:-"$DEPS_DIR/llm-katan"}
+KATAN_DEFAULT_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_IMAGE}
+if [[ "${BUILD_KATAN:-false}" == true ]]; then KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-llm-katan:e2e}; fi
 PRAXIS_REPO=${PRAXIS_REPO:-"$WORKSPACE/praxis-ai"}
 MAAS_CONTROLLER_REPO=${MAAS_CONTROLLER_REPO:-"$WORKSPACE/models-as-a-service"}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
@@ -94,7 +97,7 @@ fi
 
 df -P "$ROOT" >"$EVIDENCE/disk.txt" 2>&1 || fail "disk check failed"
 free -b >"$EVIDENCE/memory.txt" 2>&1 || fail "memory check failed"
-check_repo LLM_KATAN_REPO
+if [[ "${BUILD_KATAN:-false}" == true ]]; then check_repo LLM_KATAN_REPO; fi
 check_repo PRAXIS_REPO
 check_repo MAAS_CONTROLLER_REPO
 check_repo KUADRANT_OPERATOR_REPO
@@ -118,12 +121,16 @@ git -C "$ROOT" status --short >"$EVIDENCE/controller.status"
 
 for pair in \
   "controller|$ROOT|${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}|Dockerfile" \
-  "katan|$LLM_KATAN_REPO|${KATAN_IMAGE:-llm-katan:e2e}|Containerfile" \
+  "katan|$LLM_KATAN_REPO|$KATAN_EFFECTIVE_IMAGE|Containerfile" \
   "praxis|$PRAXIS_REPO|${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}|Containerfile" \
   "extproc|$PRAXIS_EXTPROC_REPO|${EXTPROC_IMAGE:-praxis-extproc:dev}|Containerfile" \
   "maas-api|$MAAS_CONTROLLER_REPO/maas-api|${MAAS_API_IMAGE:-maas-api:external-model-two-plane}|Dockerfile" \
   "maas-controller|$MAAS_CONTROLLER_REPO|${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}|maas-controller/Dockerfile"; do
   IFS='|' read -r label source image dockerfile <<<"$pair"
+  if [[ "$label" == katan && "${BUILD_KATAN:-false}" != true ]]; then
+    echo "published_image=$image source_commit=a5a47568ac6daf1d4bd8b356e7b350cce9ceca2a"
+    continue
+  fi
   source_sha=$(git -C "$source" rev-parse HEAD)
   source_diff=$(dirty_hash "$source")
   dockerfile_sha=$(sha256sum "$source/$dockerfile" | awk '{print $1}')
@@ -177,7 +184,7 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   # loaded image ID always matches the source-input cache record above.
   for image in \
     "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}" \
-    "${KATAN_IMAGE:-llm-katan:e2e}" \
+    "$KATAN_EFFECTIVE_IMAGE" \
     "${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}" \
     "${EXTPROC_IMAGE:-praxis-extproc:dev}" \
     "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" \
@@ -185,7 +192,8 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
     docker exec "${CLUSTER}-control-plane" crictl rmi "docker.io/library/$image" >/dev/null 2>&1 || true
   done
   kind load docker-image "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}" --name "$CLUSTER"
-  kind load docker-image "${KATAN_IMAGE:-llm-katan:e2e}" --name "$CLUSTER"
+  if [[ "${BUILD_KATAN:-false}" != true ]]; then docker pull "$KATAN_EFFECTIVE_IMAGE"; fi
+  kind load docker-image "$KATAN_EFFECTIVE_IMAGE" --name "$CLUSTER"
   kind load docker-image "${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}" --name "$CLUSTER"
   kind load docker-image "${EXTPROC_IMAGE:-praxis-extproc:dev}" --name "$CLUSTER"
   kind load docker-image "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" --name "$CLUSTER"
@@ -206,8 +214,8 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   "${KCTL[@]}" create namespace ai-tenant-transition --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" label namespace ai-tenant-tenant-b ai-gateway.opendatahub.io/tenant=true maas.opendatahub.io/managed-by-aitenant=true --overwrite
   "${KCTL[@]}" create namespace ai-tenants --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  "${KCTL[@]}" apply -f "$ROOT/test/local-env/manifests/05-database.yaml"
-  "${KCTL[@]}" apply -f "$ROOT/test/local-env/manifests/30-gateway.yaml"
+  "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/05-database.yaml"
+  "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/30-gateway.yaml"
   gateway_uid=$("${KCTL[@]}" -n maas-system get gateway maas-default-gateway -o jsonpath='{.metadata.uid}')
   "${KCTL[@]}" -n maas-system patch service maas-default-gateway --type=merge -p="{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"gateway.networking.k8s.io/v1\",\"kind\":\"Gateway\",\"name\":\"maas-default-gateway\",\"uid\":\"$gateway_uid\",\"controller\":false,\"blockOwnerDeletion\":false}]}}"
   tenant_b_gateway_uid=$("${KCTL[@]}" -n maas-system get gateway maas-tenant-b-gateway -o jsonpath='{.metadata.uid}')
@@ -223,8 +231,8 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   kustomize build "$MAAS_CONTROLLER_REPO/maas-api/deploy/overlays/xks" >"$EVIDENCE/maas-api-rendered-xks.yaml"
   kustomize build "$MAAS_CONTROLLER_REPO/maas-api/deploy/overlays/odh" >"$EVIDENCE/maas-api-rendered-odh.yaml" 2>"$EVIDENCE/maas-api-rendered-odh.err" || true
   sha256sum "$EVIDENCE/maas-api-rendered-xks.yaml" "$EVIDENCE/maas-api-rendered-odh.yaml" >"$EVIDENCE/maas-api-rendered.sha256" || true
-  cp "$ROOT/test/local-env/manifests/30-gateway.yaml" "$EVIDENCE/kind-patch-30-gateway.yaml"
-  cp "$ROOT/test/local-env/manifests/31-maas-api-kind-rbac.yaml" "$EVIDENCE/kind-patch-31-maas-api-rbac.yaml"
+  cp "$ROOT/test/kind-env/manifests/30-gateway.yaml" "$EVIDENCE/kind-patch-30-gateway.yaml"
+  cp "$ROOT/test/kind-env/manifests/31-maas-api-kind-rbac.yaml" "$EVIDENCE/kind-patch-31-maas-api-rbac.yaml"
   # Keep the MaaS controller/API HTTPS contract intact on Kind. Only the
   # namespace and local image substitutions are harness concerns; validation
   # URLs, secure ports, and TLS settings must remain those rendered upstream.
@@ -304,7 +312,7 @@ EOF
   "${KCTL[@]}" -n maas-system create secret tls maas-controller-webhook-cert --cert="$db_tmp/tls.crt" --key="$db_tmp/tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" -n maas-system create secret tls maas-controller-metrics-tls --cert="$db_tmp/tls.crt" --key="$db_tmp/tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-api/rbac" | sed 's#namespace: opendatahub#namespace: maas-system#g' | "${KCTL[@]}" apply -f -
-  "${KCTL[@]}" apply -f "$ROOT/test/local-env/manifests/31-maas-api-kind-rbac.yaml"
+  "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/31-maas-api-kind-rbac.yaml"
   # The webhook Secret is created after the OpenShift-only bundle is rendered;
   # restart so the projected certificate is present before manager startup.
   "${KCTL[@]}" -n maas-system rollout restart deployment/maas-controller
@@ -324,7 +332,7 @@ EOF
   # MaaS materialize its per-tenant IPP operands, then the handoff below can
   # stop them before an IPP writer ever sees an ExternalModel and creates a
   # competing direct-provider HTTPRoute.
-  for manifest in "$ROOT/test/local-env/manifests/20-fixtures.yaml" "$ROOT/test/local-env/manifests/21-fixtures-tenant-b.yaml"; do
+  for manifest in "$ROOT/test/kind-env/manifests/20-fixtures.yaml" "$ROOT/test/kind-env/manifests/21-fixtures-tenant-b.yaml"; do
     yq eval 'select(.kind == "AITenant")' "$manifest" | "${KCTL[@]}" apply -f -
   done
   for tenant_id in "" tenant-b; do
@@ -384,13 +392,17 @@ EOF
   done
   # Apply the remaining fixtures after the writer handoff. In particular, do
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
-  for manifest in "$ROOT/test/local-env/manifests"/*.yaml; do
+  for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
       10-praxis.yaml|11-praxis-tenant-b.yaml|12-praxis-transition.yaml|20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml) continue ;;
     esac
-    "${KCTL[@]}" apply -f "$manifest"
+    if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
+      sed "s#ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a#$KATAN_EFFECTIVE_IMAGE#g" "$manifest" | "${KCTL[@]}" apply -f -
+    else
+      "${KCTL[@]}" apply -f "$manifest"
+    fi
   done
-  # MaaS creates one legacy IPP deployment per tenant.  The upstream IPP
+  # MaaS creates one existing-IPP deployment per tenant. The upstream IPP
   # runner supports a namespace-scoped cache and explicit Gateway settings;
   # provide those only in this Kind fixture.  Keep IPP disabled for tenants
   # already owned by Praxis so it cannot create a competing direct-provider
@@ -399,7 +411,7 @@ EOF
   for _ in $(seq 1 60); do
     # Praxis tenants may already have had their MaaS IPP operands removed by
     # the ownership-gated transition. Only the annotation-absent transition
-    # tenant is required to retain a legacy IPP deployment at this stage.
+    # tenant is required to retain an existing-IPP deployment at this stage.
     if "${KCTL[@]}" -n maas-system get deployment payload-processing-transition >/dev/null 2>&1; then
       ipp_ready=true
       break
@@ -437,13 +449,13 @@ EOF
   # been disabled and rolled out. Otherwise the old IPP ExternalModel watcher
   # can observe the reference first and create a competing direct-provider
   # HTTPRoute before the controller handoff is complete.
-  for manifest in "$ROOT/test/local-env/manifests/40-maas-fixtures.yaml" "$ROOT/test/local-env/manifests/41-maas-fixtures-tenant-b.yaml"; do
+  for manifest in "$ROOT/test/kind-env/manifests/40-maas-fixtures.yaml" "$ROOT/test/kind-env/manifests/41-maas-fixtures-tenant-b.yaml"; do
     "${KCTL[@]}" apply -f "$manifest"
   done
-  for manifest in "$ROOT/test/local-env/manifests/20-fixtures.yaml" "$ROOT/test/local-env/manifests/21-fixtures-tenant-b.yaml"; do
+  for manifest in "$ROOT/test/kind-env/manifests/20-fixtures.yaml" "$ROOT/test/kind-env/manifests/21-fixtures-tenant-b.yaml"; do
     yq eval 'select(.kind != "AITenant")' "$manifest" | "${KCTL[@]}" apply -f -
   done
-  # Do not delete legacy IPP HTTPRoutes here. Their owner is the pinned IPP
+  # Do not delete existing IPP HTTPRoutes here. Their owner is the pinned IPP
   # ExternalModel reconciler, and deleting them would hide an ownership or
   # cutover defect. The qualification records any such route explicitly.
   "${KCTL[@]}" -n ai-tenants get aitenant models-as-a-service -o yaml >"$EVIDENCE/aitenant-after-fixtures.yaml" 2>&1 || true
@@ -478,7 +490,7 @@ EOF
     sleep 3
   done
   [[ "$transition_gateway_ready" == true ]] || { fail "Istio transition Gateway listener or endpoint did not become ready"; exit 2; }
-  # MaaS may reconcile the generated legacy deployments while the three
+  # MaaS may reconcile the generated existing-IPP deployments while the three
   # gateways are becoming ready. Re-apply the transition-only Kind wiring at
   # the settled point, then wait for the pods that read these values at
   # startup. This selects the transition Gateway for the real IPP fixture;

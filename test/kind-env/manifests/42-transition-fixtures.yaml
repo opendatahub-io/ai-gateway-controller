@@ -1,3 +1,20 @@
+# Purpose: Configures the separate IPP-to-Praxis transition/rollback tenant,
+# including its AITenant, service account, credential, ExternalProvider, and
+# ExternalModel resources.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+# This fixture belongs to the transition/rollback qualification, not the main
+# routing suite.
+#
+# Dependencies: Requires ai-tenant-transition, maas-transition-gateway from
+# 30-gateway.yaml, the transition backend compatibility Service from
+# 00-backends.yaml, and the MaaS controller/IPP handoff resources.
+#
+# Qualification role: Keeps the annotation-absent transition path explicit so
+# IPP ownership, Praxis cutover, and rollback can be tested independently.
+# The credential is a dummy test value and must never be treated as a
+# production secret.
+
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: AITenant
 metadata:

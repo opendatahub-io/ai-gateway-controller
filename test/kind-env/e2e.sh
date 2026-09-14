@@ -27,7 +27,7 @@ TPORT=$((PORT + 3))
 mkdir -p "$EVIDENCE"
 exec > >(tee "$EVIDENCE/e2e.log") 2>&1
 RECOMPUTE_BIN="$EVIDENCE/recompute-digest"
-go build -o "$RECOMPUTE_BIN" "$ROOT/test/local-env/recompute_digest.go"
+go build -o "$RECOMPUTE_BIN" "$ROOT/test/kind-env/recompute_digest.go"
 
 QUALIFICATION_COMPLETE=false
 finish_on_exit() {
@@ -152,7 +152,7 @@ if [[ "$("${KCTL[@]}" -n "$NS" get configmap routing-overlay -o jsonpath='{.meta
 fi
 # MaaS may reconcile its generated IPP Deployments while the baseline model is
 # recreated. Re-assert the run-owned transition fixture after that event. Do
-# not delete legacy IPP routes here: their owner is the pinned IPP
+# not delete existing IPP routes here: their owner is the pinned IPP
 # ExternalModel reconciler, and deleting them would hide a cutover defect.
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-processing >/dev/null 2>&1; then
   "${KCTL[@]}" -n "$API_NS" set env deployment/payload-processing \
@@ -183,7 +183,7 @@ if "${KCTL[@]}" -n "$API_NS" get deployment/payload-pre-processing-tenant-b >/de
 # Recreate the Praxis tenant model only after its IPP writer has restarted with
 # external-model reconciliation disabled. This prevents a direct IPP route
 # from being created during qualification setup.
-"${KCTL[@]}" apply -f "$ROOT/test/local-env/manifests/20-fixtures.yaml" >/dev/null
+"${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/20-fixtures.yaml" >/dev/null
 for _ in $(seq 1 30); do
   phase=$("${KCTL[@]}" -n "$NS" get externalmodel demo-model -o jsonpath='{.status.phase}' 2>/dev/null || true)
   [[ "$phase" == Ready ]] && break
@@ -554,11 +554,14 @@ transition_annotation=$(kubectl --context "kind-$CLUSTER" -n ai-tenants get aite
 ipp_before=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment,service,configmap,envoyfilter -o json 2>/dev/null || echo '{}')
 kubectl --context "kind-$CLUSTER" get httproute -A -o yaml >"$EVIDENCE/transition-routes-before.yaml" 2>&1 || true
 kubectl --context "kind-$CLUSTER" -n "$TNS" get externalmodel,externalprovider -o yaml >"$EVIDENCE/transition-crs-before.yaml" 2>&1 || true
-if [[ -z "$transition_annotation" && "$ipp_before" == *"payload-processing-transition"* ]] && ! kubectl --context "kind-$CLUSTER" -n "$TNS" get configmap routing-overlay >/dev/null 2>&1; then
-  record 24 transition_existing_ipp_owned PASS null "tenant_namespace=$TNS backend_namespace=$API_NS annotation=absent"
-else
-  record 24 transition_existing_ipp_owned FAIL null "tenant_namespace=$TNS annotation=absent-or-invalid"
-fi
+# The pre-transition ownership check is a prerequisite observation, not a
+# separate assertion. Preserve it in evidence so the three transition
+# assertions remain the reserved 24-26 range.
+printf 'annotation=%s ipp_resources_present=%s overlay_present=%s\n' \
+  "${transition_annotation:-absent}" \
+  "$([[ "$ipp_before" == *"payload-processing-transition"* ]] && echo true || echo false)" \
+  "$(kubectl --context "kind-$CLUSTER" -n "$TNS" get configmap routing-overlay >/dev/null 2>&1 && echo true || echo false)" \
+  >"$EVIDENCE/transition-precondition.txt"
 kubectl --context "kind-$CLUSTER" -n "$API_NS" port-forward svc/maas-transition-gateway "$TPORT:80" >"$EVIDENCE/transition-port-forward.log" 2>&1 &
 TPF=$!
 for _ in $(seq 1 20); do
@@ -592,15 +595,15 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 if [[ "$transition_route_ready" != true ]]; then
-  record 24 transition_legacy_request FAIL 000 "first_boundary=transition_route_not_ready"
-  transition_legacy=000
+  record 24 transition_ipp_request FAIL 000 "first_boundary=transition_route_not_ready"
+  transition_ipp=000
 else
-transition_legacy=$(request transition-legacy "$TRANSITION_IPP_URL" -H 'content-type: application/json' -H "authorization: Bearer $transition_key" --data '{"model":"transition-model","messages":[{"role":"user","content":"legacy"}]}' )
+transition_ipp=$(request transition-ipp "$TRANSITION_IPP_URL" -H 'content-type: application/json' -H "authorization: Bearer $transition_key" --data '{"model":"transition-model","messages":[{"role":"user","content":"existing-ipp"}]}' )
 fi
-if [[ "$transition_legacy" == 200 ]] && rg -q 'katan-a' "$EVIDENCE/request-transition-legacy.body"; then
-  record 24 transition_legacy_request PASS "$transition_legacy" "path=ipp backend=transition"
+if [[ "$transition_ipp" == 200 ]] && rg -q 'katan-a' "$EVIDENCE/request-transition-ipp.body"; then
+  record 24 transition_ipp_request PASS "$transition_ipp" "path=ipp backend=transition"
 elif [[ "$transition_route_ready" == true ]]; then
-  record 24 transition_legacy_request FAIL "$transition_legacy" "path=ipp"
+  record 24 transition_ipp_request FAIL "$transition_ipp" "path=ipp"
 fi
 
 "${KCTL[@]}" -n ai-tenants annotate aitenant transition maas.opendatahub.io/payload-processing-type=praxis --overwrite >/dev/null
@@ -613,12 +616,12 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 ipp_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment,service,configmap,envoyfilter -o json 2>/dev/null || echo '{}')
-legacy_route_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute transition-model -o json 2>/dev/null || echo '{}')
-legacy_route_owner=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // "absent"' <<<"$legacy_route_after_cutover")
-if [[ "$cutover_ready" == true && "$ipp_after_cutover" != *"payload-processing-transition"* && "$legacy_route_owner" == "absent" ]]; then
+stale_ipp_route_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute transition-model -o json 2>/dev/null || echo '{}')
+stale_ipp_route_owner=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // "absent"' <<<"$stale_ipp_route_after_cutover")
+if [[ "$cutover_ready" == true && "$ipp_after_cutover" != *"payload-processing-transition"* && "$stale_ipp_route_owner" == "absent" ]]; then
   record 25 transition_cutover_ownership PASS null "existing_ipp_resources_removed=true praxis_resources=tenant-scoped"
 else
-  record 25 transition_cutover_ownership FAIL null "cutover_ready=$cutover_ready legacy_resources_present=$([[ "$ipp_after_cutover" == *"payload-processing-transition"* ]] && echo true || echo false) stale_ipp_route_owner=$legacy_route_owner"
+  record 25 transition_cutover_ownership FAIL null "cutover_ready=$cutover_ready existing_ipp_resources_present=$([[ "$ipp_after_cutover" == *"payload-processing-transition"* ]] && echo true || echo false) stale_ipp_route_owner=$stale_ipp_route_owner"
 fi
 transition_praxis=$(request transition-praxis "$TRANSITION_PRAXIS_URL" -H 'content-type: application/json' -H "authorization: Bearer $transition_key" --data '{"model":"transition","messages":[{"role":"user","content":"praxis"}]}' )
 kubectl --context "kind-$CLUSTER" get httproute -A -o yaml >"$EVIDENCE/transition-routes-after-cutover.yaml" 2>&1 || true

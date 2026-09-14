@@ -267,7 +267,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 	if len(set.Routes()) == 0 {
-		_ = r.cleanupTransport(ctx, req.Namespace, nil)
+		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, nil); cleanupErr != nil {
+			return reconcile.Result{}, cleanupErr
+		}
+		if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
+			return reconcile.Result{}, cleanupErr
+		}
 		message := "no ExternalModel provider references resolved to a Ready provider"
 		if statusErr := r.updateModelStatus(ctx, &model, false, reasonNoRoutes, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr

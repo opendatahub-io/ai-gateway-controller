@@ -30,6 +30,23 @@ func TestStandalonePraxisResourcesProjectAndDeduplicateCredentials(t *testing.T)
 	if len(volumes) != 3 {
 		t.Fatalf("volume count = %d, want config/routing/credentials", len(volumes))
 	}
+	routingVolume, ok := volumes[1].(map[string]any)
+	if !ok {
+		t.Fatal("routing volume has unexpected type")
+	}
+	routingConfigMap, ok := routingVolume["configMap"].(map[string]any)
+	if !ok || routingConfigMap["optional"] != true {
+		t.Fatalf("routing ConfigMap must be optional during bootstrap: %#v", routingVolume["configMap"])
+	}
+	podSecurity, found, err := unstructured.NestedMap(deployment.Object, "spec", "template", "spec", "securityContext")
+	if err != nil || !found {
+		t.Fatalf("pod security context missing: found=%v err=%v", found, err)
+	}
+	for _, field := range []string{"runAsUser", "runAsGroup", "fsGroup"} {
+		if _, exists := podSecurity[field]; exists {
+			t.Errorf("pod security context must not pin %s for OpenShift SCC portability", field)
+		}
+	}
 	container, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
 	if err != nil || !found || len(container) != 1 {
 		t.Fatalf("Praxis container missing: found=%v err=%v", found, err)

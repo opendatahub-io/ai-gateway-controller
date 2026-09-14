@@ -46,8 +46,8 @@ credential injector.
 Run from the controller repository:
 
 ```bash
-./test/local-env/run.sh --preflight
-./test/local-env/run.sh --provision
+./test/kind-env/run.sh --preflight
+./test/kind-env/run.sh --provision
 ```
 
 The provisioner creates the dedicated `kind-external-model-two-plane` context,
@@ -56,19 +56,19 @@ builds/loads the pinned local images, and leaves the environment available.
 Run the interactive demo:
 
 ```bash
-./test/local-env/demo.sh --context kind-external-model-two-plane
+./test/kind-env/demo.sh --context kind-external-model-two-plane
 ```
 
 Run it without prompts:
 
 ```bash
-./test/local-env/demo.sh --context kind-external-model-two-plane --non-interactive
+./test/kind-env/demo.sh --context kind-external-model-two-plane --non-interactive
 ```
 
 Reset only the run-owned fixtures (without recreating the cluster):
 
 ```bash
-./test/local-env/demo.sh --context kind-external-model-two-plane --reset
+./test/kind-env/demo.sh --context kind-external-model-two-plane --reset
 ```
 
 Inspect the retained environment:
@@ -84,7 +84,7 @@ kubectl --context kind-external-model-two-plane -n maas-system \
 Destroy only the run-owned cluster when inspection is complete:
 
 ```bash
-./test/local-env/run.sh --destroy
+./test/kind-env/run.sh --destroy
 ```
 
 The demo does not use laptop port-forwards, repeated `kubectl run --rm`, host
