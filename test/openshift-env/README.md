@@ -46,11 +46,19 @@ The documented workflow is:
 export OPENSHIFT_E2E_STATE="$PWD/.openshift-state"
 export OPENSHIFT_KUBECONFIG="$OPENSHIFT_E2E_STATE/kubeconfig"
 ./test/openshift-env/preflight.sh
+./test/openshift-env/bootstrap.sh
 ./test/openshift-env/provision.sh
 ./test/openshift-env/e2e.sh
+./test/openshift-env/demo.sh
 ./test/openshift-env/inspect.sh
 ./test/openshift-env/destroy.sh
 ```
+
+`bootstrap.sh` is intentionally separate from `provision.sh`: it installs and
+validates platform dependencies, while provisioning creates the run-owned
+application fixtures. Run `demo.sh` only after `e2e.sh` has produced a final
+functional result. On a successful inspection run, reset to Provider A before
+choosing either scoped cleanup or intentional retention.
 
 For a source-qualified run, export the clean pinned checkout paths before
 `provision.sh`:
