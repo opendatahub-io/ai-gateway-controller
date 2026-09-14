@@ -49,6 +49,11 @@ func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy strin
 	if err != nil {
 		return nil, err
 	}
+	for _, provider := range providers {
+		if err := validatePraxisEndpoint(provider.Spec.Endpoint); err != nil {
+			return nil, fmt.Errorf("provider %s: %w", provider.Name, err)
+		}
+	}
 	labels := map[string]any{
 		"app":                          praxisDeploymentName,
 		"app.kubernetes.io/managed-by": "ai-gateway-controller",
@@ -78,6 +83,17 @@ func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy strin
 		}},
 		{Object: praxisDeployment(namespace, tenantID, image, imagePullPolicy, labels, credentials)},
 	}, nil
+}
+
+func validatePraxisEndpoint(endpoint string) error {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return errors.New("provider endpoint is required")
+	}
+	if strings.ContainsAny(endpoint, " /\t\r\n") || strings.Contains(endpoint, "://") {
+		return fmt.Errorf("provider endpoint %q must be a host or host:port", endpoint)
+	}
+	return nil
 }
 
 func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider) ([]praxisCredential, error) {
@@ -130,7 +146,16 @@ func praxisConfig(namespace string, credentials []praxisCredential, providers []
 		if provider.Name == "" || provider.Spec.Endpoint == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "          - name: provider-%s\n            endpoints: [\"provider-%s.%s.svc.cluster.local:443\"]\n", provider.Name, provider.Name, namespace)
+		// The ExternalProvider endpoint is authoritative.  In particular, a
+		// provider fixture may live in a separate backend namespace; deriving a
+		// Service name from the tenant namespace silently creates an endpoint
+		// that Praxis cannot resolve.  Keep the overlay reference-only and add
+		// the TLS port when the CRD endpoint omits it.
+		endpoint := strings.TrimSpace(provider.Spec.Endpoint)
+		if !strings.Contains(endpoint, ":") {
+			endpoint += ":443"
+		}
+		fmt.Fprintf(&b, "          - name: provider-%s\n            endpoints: [\"%s\"]\n", provider.Name, endpoint)
 	}
 	b.WriteString("admin: {address: \"127.0.0.1:9901\"}\ninsecure_options: {allow_private_endpoints: true}\n")
 	return b.String()

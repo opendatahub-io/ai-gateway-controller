@@ -82,12 +82,45 @@ func TestStandalonePraxisResourcesProjectAndDeduplicateCredentials(t *testing.T)
 	if strings.Contains(config, "secret-value") || !strings.Contains(config, "/etc/praxis/credentials/shared-") {
 		t.Fatalf("config contains unexpected credential material or path: %s", config)
 	}
+	if !strings.Contains(config, "provider-a\n            endpoints: [\"a.example.com:443\"]") ||
+		!strings.Contains(config, "provider-b\n            endpoints: [\"b.example.com:443\"]") {
+		t.Fatalf("Praxis config did not preserve declared provider endpoints: %s", config)
+	}
 }
 
 func TestStandalonePraxisResourcesRejectCrossNamespaceProvider(t *testing.T) {
 	providers := []v1alpha1.ExternalProvider{{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "other"}}}
 	if _, err := StandalonePraxisResources("tenant-a", "tenant-a", "praxis:test", "Never", providers); err == nil {
 		t.Fatal("expected cross-namespace provider rejection")
+	}
+}
+
+func TestStandalonePraxisResourcesUsesExternalProviderEndpoint(t *testing.T) {
+	providers := []v1alpha1.ExternalProvider{{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Endpoint: "provider-b.backend.svc.cluster.local", Auth: v1alpha1.AuthConfig{SecretRef: v1alpha1.NameReference{Name: "credentials"}}},
+	}}
+	resources, err := StandalonePraxisResources("tenant-a", "tenant-a", "praxis:test", "Never", providers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := findResource(resources, "ConfigMap", "praxis-config-tenant-a")
+	data, _, err := unstructured.NestedStringMap(config.Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(data["config.yaml"], `provider-b.backend.svc.cluster.local:443`) {
+		t.Fatalf("config did not use declared external endpoint: %s", data["config.yaml"])
+	}
+	if strings.Contains(data["config.yaml"], "provider-b.tenant-a.svc.cluster.local") {
+		t.Fatalf("config synthesized a tenant-local endpoint: %s", data["config.yaml"])
+	}
+}
+
+func TestStandalonePraxisResourcesRejectsMalformedEndpoint(t *testing.T) {
+	providers := []v1alpha1.ExternalProvider{{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{Endpoint: "https://provider.example"}}}
+	if _, err := StandalonePraxisResources("tenant-a", "tenant-a", "praxis:test", "Never", providers); err == nil {
+		t.Fatal("expected malformed endpoint rejection")
 	}
 }
 
