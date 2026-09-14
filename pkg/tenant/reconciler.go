@@ -275,7 +275,6 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
-
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
@@ -309,6 +308,13 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 				continue
 			}
 			return fmt.Errorf("inspect %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
+		}
+		// MaaS marks this specific plugin ConfigMap unmanaged when it hands
+		// a tenant to Praxis. That marker is the explicit ownership boundary:
+		// allow the Praxis controller to publish its complete config and claim
+		// the object, while all other unlabeled/foreign objects remain blocked.
+		if desired.GetKind() == "ConfigMap" && desired.GetName() == PayloadProcessingPluginsConfigMapName && current.GetAnnotations()["opendatahub.io/managed"] == "false" {
+			continue
 		}
 		if current.GetLabels()[managedByLabel] != render.FieldOwner {
 			return fmt.Errorf("%s %s/%s is managed by %q", desired.GetKind(), desired.GetNamespace(), desired.GetName(), current.GetLabels()[managedByLabel])

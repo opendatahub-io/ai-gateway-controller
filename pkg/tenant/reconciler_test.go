@@ -166,6 +166,52 @@ func TestWaitForForeignOwnershipDoesNotTakeOverExistingObject(t *testing.T) {
 	}
 }
 
+func TestWaitForForeignOwnershipAcceptsReleasedPluginConfigMap(t *testing.T) {
+	configMap := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      PayloadProcessingPluginsConfigMapName,
+			"namespace": "maas-system",
+			"annotations": map[string]any{
+				"opendatahub.io/managed": "false",
+			},
+		},
+	}}
+	configMap.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(configMap).Build()
+	r := &Reconciler{Client: fakeClient}
+	desired := configMap.DeepCopy()
+	desired.SetAnnotations(nil)
+	desired.SetLabels(map[string]string{"app.kubernetes.io/managed-by": render.FieldOwner})
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*desired}); err != nil {
+		t.Fatalf("waitForForeignOwnership rejected the explicitly released plugin ConfigMap: %v", err)
+	}
+}
+
+func TestWaitForForeignOwnershipDoesNotTreatOtherUnmanagedObjectsAsReleased(t *testing.T) {
+	configMap := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      "other-config",
+			"namespace": "maas-system",
+			"annotations": map[string]any{
+				"opendatahub.io/managed": "false",
+			},
+		},
+	}}
+	configMap.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(configMap).Build()
+	r := &Reconciler{Client: fakeClient}
+	desired := configMap.DeepCopy()
+	desired.SetAnnotations(nil)
+	desired.SetLabels(map[string]string{"app.kubernetes.io/managed-by": render.FieldOwner})
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*desired}); err == nil {
+		t.Fatal("waitForForeignOwnership accepted an unrelated unmanaged ConfigMap")
+	}
+}
+
 func TestReconcileSkipsWhenNotUsingPraxis(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", "", "", "", "")
