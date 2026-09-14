@@ -59,7 +59,7 @@ func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy strin
 		"app.kubernetes.io/managed-by": "ai-gateway-controller",
 		LabelTenantInstance:            ResourceName(praxisDeploymentName, tenantID),
 	}
-	config := praxisConfig(namespace, credentials, providers)
+	config := praxisConfig(credentials, providers)
 	return []unstructured.Unstructured{
 		{Object: map[string]any{
 			"apiVersion": "v1", "kind": "ServiceAccount",
@@ -124,7 +124,7 @@ func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider) 
 	return credentials, nil
 }
 
-func praxisConfig(namespace string, credentials []praxisCredential, providers []v1alpha1.ExternalProvider) string {
+func praxisConfig(credentials []praxisCredential, providers []v1alpha1.ExternalProvider) string {
 	var b strings.Builder
 	b.WriteString("listeners:\n")
 	b.WriteString("  - name: proxy\n    address: \"0.0.0.0:8080\"\n    filter_chains: [main]\n")
