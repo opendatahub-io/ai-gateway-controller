@@ -70,9 +70,11 @@ Required tools:
 - `openssl`
 - `jq`
 - `yq`
+- `gettext` (provides `envsubst`)
 - `curl`
 - `tar`
 - `sha256sum`
+- `timeout` (from GNU coreutils)
 - `go`
 - `make`
 - `git`
@@ -192,9 +194,67 @@ authorization fixtures.
 does not retry received HTTP responses, and atomically records failures,
 including the active assertion when interrupted.
 
-`demo.sh` presents the same validated behavior in a narrative format. It does
-not replace the executable qualification and must not convert an unproven stage
-into a pass.
+`demo.sh` presents the finalized machine-readable qualification as a
+human-readable narrative. It does not duplicate validation, and it never turns
+missing evidence into a pass. The displayed evidence path is relative to the
+run root; secrets, authorization headers, cookies, and kubeconfig contents are
+never displayed.
+
+The narrative follows the real request path:
+
+```text
+client -> Gateway/Envoy -> Kuadrant/Authorino -> Praxis ExtProc
+       -> tenant-local Praxis -> credential-enforcing provider fixture
+```
+
+Provider A and Provider B are controlled test endpoints used to demonstrate a
+declared routing update. They are not a load-balancing or automatic-failover
+qualification. Both run Katan with `--validate-keys`; the expected provider
+credential is configured by the fixture and is never written to evidence.
+
+The OpenShift E2E suite directly probes the selected provider without a
+credential and with a wrong credential (both must return HTTP 401). It also
+sends the valid MaaS caller key through stdin while adding a conflicting
+caller `x-api-key` header; that Gateway request must return HTTP 200 with the
+selected provider attribution. These checks prove backend credential
+enforcement and x-api-key resistance. The separate caller `Authorization`
+override is `NOT_DEMONSTRATED`: this fixture uses the sole `Authorization`
+header for MaaS caller authentication, so duplicate-header ordering would be
+ambiguous rather than a valid proof. It remains a follow-up until an
+independent supported caller-authentication mechanism exists. Credential
+rotation, OAuth2, and SigV4 are also out of scope.
+
+Run the live narrative after the qualification:
+
+```sh
+./test/openshift-env/demo.sh
+```
+
+For a clean capture without interactive behavior:
+
+```sh
+./test/openshift-env/demo.sh --non-interactive > OPENSHIFT-DEMO-OUTPUT.txt
+```
+
+To render an existing finalized run without contacting OpenShift:
+
+```sh
+./test/openshift-env/demo.sh --evidence "$OPENSHIFT_E2E_EVIDENCE_ROOT/e2e-<timestamp>-<pid>"
+```
+
+The renderer accepts a run directory or its `results.json`. It preserves the
+live qualification exit status, renders completed assertions after a failure,
+and reports credential rotation, two-tenant MaaS authorization, IPP transition
+and rollback, OAuth2/SigV4, and commercial-provider behavior as unproven unless
+separate evidence exists.
+
+The formatting regression test uses deterministic fixture evidence and checks
+PASS, FAIL, missing evidence, `NOT DEMONSTRATED`, required test titles, path
+redaction, and credential-shaped output:
+
+```sh
+./test/openshift-env/test-demo-format.sh
+```
 
 `inspect.sh` records the deployed state and relevant status without collecting
 credential values.
@@ -224,6 +284,57 @@ The automated install order is intentional:
 14. Wait for policies, routes, overlays, mounts, and workloads to converge.
 15. Run functional qualification and the narrative demo.
 16. Reset routing, inspect evidence, and perform ownership-checked cleanup.
+
+## Fixture manifests and rendering
+
+Stable run-owned fixtures are checked in under `test/openshift-env/manifests/`
+as numbered `*.yaml.tmpl` files. The numbering is the apply order for the
+fixture portion of provisioning: namespaces and image-puller binding, Gateway,
+controller, provider endpoints, model references, MaaS references, and the
+persistent client. The templates are independent of `test/kind-env`; similar
+resources remain separate when OpenShift needs different registry, SCC, TLS,
+or identity behavior.
+
+The renderer requires GNU gettext (`envsubst`); install the `gettext` package
+alongside the existing `yq` prerequisite. Provisioning validates each rendered
+fixture with `oc apply --dry-run=server` and saves the result before applying
+it. The static render test requires `yq` and performs client-side YAML
+validation without a cluster.
+
+For each rendered template, provisioning writes separate
+`server-dry-run-*.log` and `apply-*.log` files before and during application.
+The server dry run is bounded to 120 seconds and a failure prevents that
+template from being applied.
+
+`provision.sh` invokes `render-manifests.sh` with an explicit allowlist for
+each template and applies the rendered files from the current run's ignored
+evidence directory. It renders early templates with the provisional namespace,
+then renders tenant-dependent templates after MaaS reports the resolved tenant
+namespace. A normal run therefore remains:
+
+```sh
+./test/openshift-env/preflight.sh
+./test/openshift-env/bootstrap.sh
+./test/openshift-env/provision.sh
+./test/openshift-env/e2e.sh
+./test/openshift-env/demo.sh
+./test/openshift-env/inspect.sh
+./test/openshift-env/destroy.sh
+```
+
+To exercise the renderer without a cluster, run:
+
+```sh
+./test/openshift-env/test-render-manifests.sh
+```
+
+The renderer fails on unset variables, rejects unresolved placeholders, and
+never performs unrestricted substitution. Rendered YAML is deployment
+evidence under run state and must not be committed. Credential-bearing Secret
+creation, Gateway certificates, discovered ServiceAccount bindings, image
+publication, source-pinned platform manifests, and server-side readiness
+checks remain in shell because they require opaque values or live identities.
+Templates contain references only; they contain no credential data.
 
 ## Default MaaS API service
 
@@ -260,7 +371,8 @@ run-labeled Secret and RoleBinding after verifying their ownership.
 
 ## Provider fixture contract
 
-The provider fixtures run the pinned LLM-Katan image as credential-enforcing,
+The provider fixtures run the pinned LLM-Katan image with credential
+enforcement enabled,
 OpenAI-compatible test endpoints. They use a writable `/tmp` home directory to
 work under OpenShift's restricted security policy.
 

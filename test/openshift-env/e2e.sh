@@ -118,6 +118,10 @@ request() {
   fi
   printf '%s\n%s' "$key" "$body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r key; curl --silent --show-error --output /tmp/xmp-request --write-out "%{http_code}" --max-time 30 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "Authorization: Bearer $key" -H "Content-Type: application/json" --data-binary @-' sh "$url"
 }
+request_with_x_api_key_override() {
+  local key=$1 url=$2 body=$3
+  printf '%s\n%s' "$key" "$body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r key; printf "Authorization: Bearer %s\n" "$key" > /tmp/xmp-auth-header; curl --silent --show-error --output /tmp/xmp-request --write-out "%{http_code}" --max-time 30 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "x-api-key: client-override" -H @/tmp/xmp-auth-header -H "Content-Type: application/json" --data-binary @-; : > /tmp/xmp-auth-header' sh "$url"
+}
 wait_for_gateway_tls() {
   local deadline=$((SECONDS + 180)) status
   while (( SECONDS < deadline )); do
@@ -187,6 +191,31 @@ key_json=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c
 record 10 "API-key creation" PASS authorization "HTTP 201; key withheld"
 a_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); a_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$a_status" == 200 && "$a_body" == *provider-a* ]] && record 11 "First test endpoint" PASS routing "HTTP 200; Test Provider A attribution observed" || { record 11 "First test endpoint" FAIL routing "expected HTTP 200 from first endpoint"; exit 1; }
+provider_url="http://provider-a.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local:8000/v1/chat/completions"
+provider_probe() {
+  local mode=$1
+  case "$mode" in
+    missing) printf '%s' "$request_body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 -X POST "$1" -H "Content-Type: application/json" --data-binary @-' sh "$provider_url" ;;
+    wrong) printf '%s' "$request_body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 -X POST "$1" -H "Authorization: Bearer client-override" -H "Content-Type: application/json" --data-binary @-' sh "$provider_url" ;;
+  esac
+}
+provider_missing=$(provider_probe missing 2>/dev/null || true)
+printf '%s\n' "$provider_missing" >"$OUT/provider-missing-status.txt"
+[[ "$provider_missing" == 401 ]] && record 21 "provider_rejects_missing_credential" PASS provider "direct Provider A request returned HTTP 401" || { record 21 "provider_rejects_missing_credential" FAIL provider "expected HTTP 401, observed $provider_missing"; exit 1; }
+provider_wrong=$(provider_probe wrong 2>/dev/null || true)
+printf '%s\n' "$provider_wrong" >"$OUT/provider-wrong-status.txt"
+[[ "$provider_wrong" == 401 ]] && record 22 "provider_rejects_wrong_credential" PASS provider "direct Provider A request returned HTTP 401" || { record 22 "provider_rejects_wrong_credential" FAIL provider "expected HTTP 401, observed $provider_wrong"; exit 1; }
+printf '%s\n' 'OpenShift does not have an independent caller-authentication header in this fixture; duplicate Authorization headers are ambiguous and are not used as proof.' >"$OUT/authorization-override-not-demonstrated.txt"
+record 23 "client_authorization_cannot_override_provider_credential" NOT_DEMONSTRATED provider "single Authorization header serves MaaS caller authentication; duplicate-header ordering is not a valid override test"
+x_api_override=$(request_with_x_api_key_override "$KEY" "$URL" "$request_body" 2>/dev/null || true)
+x_api_override_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
+[[ "$x_api_override" == 200 && "$x_api_override_body" == *provider-a* ]] && record 24 "client_x_api_key_cannot_override_provider_credential" PASS provider "HTTP 200; Provider A attribution observed" || { record 24 "client_x_api_key_cannot_override_provider_credential" FAIL provider "expected attributed HTTP 200, observed $x_api_override"; exit 1; }
+if [[ "$a_status" == 200 && "$a_body" == *provider-a* && "$provider_missing" == 401 && "$provider_wrong" == 401 && "$x_api_override" == 200 ]]; then
+  record 25 "credential_enforcing_provider_chain" NOT_DEMONSTRATED provider "backend enforcement and x-api-key resistance passed; Authorization resistance is not provable with this caller-authentication contract"
+else
+  record 25 "credential_enforcing_provider_chain" FAIL provider "credential enforcement or x-api-key override resistance failed"
+  exit 1
+fi
 unknown=$(request "$KEY" "https://$HOST/$OPENSHIFT_E2E_TENANT_NAMESPACE/missing-model/v1/chat/completions" '{"model":"missing-model","messages":[{"role":"user","content":"qualification"}]}' 2>/dev/null || true)
 [[ "$unknown" == 404 ]] && record 12 "Unknown model" PASS routing "HTTP 404" || { record 12 "Unknown model" FAIL routing "expected HTTP 404, observed $unknown"; exit 1; }
 before=$(${OC[@]} get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o json | jq -r '.items[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv')

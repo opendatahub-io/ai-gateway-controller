@@ -16,6 +16,7 @@ need() { command -v "$1" >/dev/null || { echo "$1 is required" >&2; exit 1; }; }
 need docker
 need skopeo
 need sha256sum
+need envsubst
 [[ -n "${PRAXIS_REPO:-}" && -n "${PRAXIS_EXTPROC_REPO:-}" && -n "${MAAS_CONTROLLER_REPO:-}" && -n "${KSERVE_REPO:-}" && -n "${KUADRANT_OPERATOR_REPO:-}" ]] || {
   echo "PRAXIS_REPO, PRAXIS_EXTPROC_REPO, MAAS_CONTROLLER_REPO, KSERVE_REPO, and KUADRANT_OPERATOR_REPO must point to pinned clean checkouts" >&2
   exit 1
@@ -37,23 +38,13 @@ git -C "$MAAS_CONTROLLER_REPO" diff --cached --quiet || { echo "refusing staged 
   printf 'katan_source_commit a5a47568ac6daf1d4bd8b356e7b350cce9ceca2a\n'
 } >"$OUT/source-shas.txt"
 
-create_ns() {
+check_run_ns() {
   local ns=$1
   if "${OC[@]}" get namespace "$ns" >/dev/null 2>&1; then
     local owner
     owner=$("${OC[@]}" get namespace "$ns" -o jsonpath='{.metadata.labels.external-model-praxis\.opendatahub\.io/run-id}' 2>/dev/null || true)
     [[ "$owner" == "$OPENSHIFT_E2E_RUN_ID" ]] || { echo "refusing to reuse foreign namespace: $ns" >&2; exit 1; }
-    return 0
   fi
-  "${OC[@]}" apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $ns
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-EOF
 }
 ensure_shared_ns() {
   local ns=$1
@@ -61,62 +52,31 @@ ensure_shared_ns() {
     "${OC[@]}" create namespace "$ns" >/dev/null
   fi
 }
-create_ns "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE"
-create_ns "$OPENSHIFT_E2E_BACKEND_NAMESPACE"
+apply_rendered() {
+  local file=$1
+  local dry_run="$OUT/server-dry-run-${file%.yaml}.log"
+  local apply_log="$OUT/apply-${file%.yaml}.log"
+  timeout 120s "${OC[@]}" apply --dry-run=server --validate=true -f "$RENDER_DIR/$file" >"$dry_run" 2>&1
+  timeout 120s "${OC[@]}" apply -f "$RENDER_DIR/$file" >"$apply_log" 2>&1
+}
+check_run_ns "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE"
+check_run_ns "$OPENSHIFT_E2E_BACKEND_NAMESPACE"
 ensure_shared_ns maas-system
 ensure_shared_ns ai-tenants
+RENDER_DIR="$OUT/rendered-manifests"
+export OPENSHIFT_E2E_RUN_ID OPENSHIFT_E2E_CONTROLLER_NAMESPACE OPENSHIFT_E2E_BACKEND_NAMESPACE
+export OPENSHIFT_E2E_TENANT_NAMESPACE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE
+export OPENSHIFT_E2E_GATEWAY_TLS_SECRET
 # Install the controller's additive development/test CRD package before any
 # fixture is created.  The controller writes observedGeneration and overlay
 # attestations declared by these schemas; relying on a pre-existing CRD leaves
 # those writes silently pruned on clusters with an older schema.
 kustomize build "$ROOT/config/crd" | "${OC[@]}" apply --server-side -f - >"$OUT/controller-crds.log" 2>&1
-"${OC[@]}" apply -f - <<EOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: image-puller-controller
-  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: system:image-puller}
-subjects:
-- kind: Group
-  name: system:serviceaccounts:$OPENSHIFT_E2E_CONTROLLER_NAMESPACE
-- kind: Group
-  name: system:serviceaccounts:$OPENSHIFT_E2E_TENANT_NAMESPACE
-- kind: Group
-  name: system:serviceaccounts:$OPENSHIFT_E2E_BACKEND_NAMESPACE
-- kind: Group
-  name: system:serviceaccounts:openshift-ingress
-- kind: ServiceAccount
-  name: maas-api
-  namespace: maas-system
-EOF
-
-"${OC[@]}" apply -f - <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: $OPENSHIFT_E2E_GATEWAY_NAME
-  namespace: $OPENSHIFT_E2E_GATEWAY_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  gatewayClassName: istio
-  listeners:
-  - name: https
-    protocol: HTTPS
-    port: 443
-    tls:
-      mode: Terminate
-      certificateRefs:
-      - kind: Secret
-        name: $OPENSHIFT_E2E_GATEWAY_TLS_SECRET
-    allowedRoutes:
-      namespaces: {from: All}
-EOF
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" \
+  00-namespaces.yaml.tmpl 05-image-puller.yaml.tmpl 10-gateway.yaml.tmpl >"$OUT/render-manifests-initial.log"
+apply_rendered 00-namespaces.yaml
+apply_rendered 05-image-puller.yaml
+apply_rendered 10-gateway.yaml
 
 # The Gateway address is assigned by the real OpenShift load balancer. Create
 # a run-owned certificate for that address, then let Istio reprogram the
@@ -527,142 +487,13 @@ grep -q 'ssl_verify_result=0' "$OUT/authorino-to-maas-tls.txt" || { echo "Author
 
 ROLE_NAME="xmp-controller-role-$OPENSHIFT_E2E_RUN_ID"
 sed "0,/name: ai-gateway-controller-role/s//name: $ROLE_NAME/" "$ROOT/config/self/rbac/clusterrole.yaml" | sed "/^  name: $ROLE_NAME$/a\\  labels:\n    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID\n    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e" | "${OC[@]}" apply -f -
-"${OC[@]}" apply -f - <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ai-gateway-controller
-  namespace: $OPENSHIFT_E2E_CONTROLLER_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: xmp-controller-$OPENSHIFT_E2E_RUN_ID
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: $ROLE_NAME}
-subjects:
-- kind: ServiceAccount
-  name: ai-gateway-controller
-  namespace: $OPENSHIFT_E2E_CONTROLLER_NAMESPACE
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ai-gateway-controller
-  namespace: $OPENSHIFT_E2E_CONTROLLER_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  replicas: 1
-  selector: {matchLabels: {app: ai-gateway-controller, external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID}}
-  template:
-    metadata: {labels: {app: ai-gateway-controller, external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID}}
-    spec:
-      serviceAccountName: ai-gateway-controller
-      securityContext: {runAsNonRoot: true}
-      containers:
-      - name: manager
-        image: $CONTROLLER_IMAGE
-        imagePullPolicy: IfNotPresent
-        args: [--leader-elect=false, --image=$EXTPROC_IMAGE, --praxis-image=$PRAXIS_IMAGE, --praxis-image-pull-policy=IfNotPresent, --external-model-namespace=$OPENSHIFT_E2E_TENANT_NAMESPACE, --gateway-name=$OPENSHIFT_E2E_GATEWAY_NAME, --gateway-namespace=$OPENSHIFT_E2E_GATEWAY_NAMESPACE, --known-cluster=provider-provider-a, --known-cluster=provider-provider-b, --health-probe-bind-address=:8081]
-        ports: [{name: health, containerPort: 8081}]
-        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}
-EOF
+export ROLE_NAME CONTROLLER_IMAGE EXTPROC_IMAGE PRAXIS_IMAGE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 20-controller.yaml.tmpl >"$OUT/render-manifests-controller.log"
+apply_rendered 20-controller.yaml
 attach_pull_secret_to_sa "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" ai-gateway-controller
-"${OC[@]}" apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: provider-a
-  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  replicas: 1
-  selector: {matchLabels: {app: provider-a}}
-  template:
-    metadata: {labels: {app: provider-a}}
-    spec:
-      containers:
-      - name: provider
-        image: $KATAN_IMAGE
-        imagePullPolicy: IfNotPresent
-        command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai]
-        env:
-        - name: HOME
-          value: /tmp
-        ports: [{name: http, containerPort: 8000}]
-        volumeMounts:
-        - name: writable-home
-          mountPath: /tmp
-      volumes:
-      - name: writable-home
-        emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: provider-a
-  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  selector: {app: provider-a}
-  # The controller's production transport contract addresses provider
-  # ExternalName Services on HTTPS/443. The fixture terminates no TLS; this
-  # port preserves the contract while targeting the HTTP mock container.
-  ports:
-  - {name: http, port: 8000, targetPort: http}
-  - {name: https, port: 443, targetPort: http}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: provider-b
-  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  replicas: 1
-  selector: {matchLabels: {app: provider-b}}
-  template:
-    metadata: {labels: {app: provider-b}}
-    spec:
-      containers:
-      - name: provider
-        image: $KATAN_IMAGE
-        imagePullPolicy: IfNotPresent
-        command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai]
-        env: [{name: HOME, value: /tmp}]
-        ports: [{name: http, containerPort: 8000}]
-        volumeMounts: [{name: writable-home, mountPath: /tmp}]
-      volumes: [{name: writable-home, emptyDir: {}}]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: provider-b
-  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  selector: {app: provider-b}
-  ports:
-  - {name: http, port: 8000, targetPort: http}
-  - {name: https, port: 443, targetPort: http}
-EOF
+export KATAN_IMAGE
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 30-provider-fixtures.yaml.tmpl >"$OUT/render-manifests-providers.log"
+apply_rendered 30-provider-fixtures.yaml
 "${OC[@]}" apply -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -673,100 +504,16 @@ metadata:
     external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
     app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
 stringData:
-  api-key: openshift-e2e-provider-a
----
-apiVersion: inference.opendatahub.io/v1alpha1
-kind: ExternalProvider
-metadata:
-  name: provider-a
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  provider: openai
-  endpoint: provider-a.$OPENSHIFT_E2E_BACKEND_NAMESPACE.svc.cluster.local
-  auth: {type: apikey, secretRef: {name: provider-credentials}}
----
-apiVersion: inference.opendatahub.io/v1alpha1
-kind: ExternalProvider
-metadata:
-  name: provider-b
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  provider: openai
-  endpoint: provider-b.$OPENSHIFT_E2E_BACKEND_NAMESPACE.svc.cluster.local
-  auth: {type: apikey, secretRef: {name: provider-credentials}}
----
-apiVersion: inference.opendatahub.io/v1alpha1
-kind: ExternalModel
-metadata:
-  name: demo-model
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  modelName: demo
-  externalProviderRefs:
-  - ref: {name: provider-a}
-    targetModel: demo
-    apiFormat: openai-chat
-    path: /v1/chat/completions
-  - ref: {name: provider-b}
-    weight: 0
-    targetModel: demo
-    apiFormat: openai-chat
-    path: /v1/chat/completions
+  # Matches LLM-Katan's documented test-only OpenAI validation key. This
+  # fixture value is never copied into evidence or request arguments.
+  api-key: llm-katan-openai-key
 EOF
-"${OC[@]}" apply -f - <<EOF
-apiVersion: maas.opendatahub.io/v1alpha1
-kind: MaaSModelRef
-metadata:
-  name: demo
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-spec:
-  modelRef:
-    kind: ExternalModel
-    name: demo-model
----
-apiVersion: maas.opendatahub.io/v1alpha1
-kind: MaaSSubscription
-metadata:
-  name: openshift-e2e-subscription-$OPENSHIFT_E2E_RUN_ID
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-spec:
-  owner:
-    users: [$OPENSHIFT_E2E_USER]
-  modelRefs:
-  - name: demo
-    namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-    tokenRateLimits:
-    - limit: 10000
-      window: 1m
-  priority: 10
----
-apiVersion: maas.opendatahub.io/v1alpha1
-kind: MaaSAuthPolicy
-metadata:
-  name: openshift-e2e-access-$OPENSHIFT_E2E_RUN_ID
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-spec:
-  modelRefs:
-  - name: demo
-    namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  subjects:
-    users: [$OPENSHIFT_E2E_USER]
-EOF
+export OPENSHIFT_E2E_TENANT_NAMESPACE OPENSHIFT_E2E_BACKEND_NAMESPACE
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 40-model-fixtures.yaml.tmpl >"$OUT/render-manifests-models.log"
+apply_rendered 40-model-fixtures.yaml
+export OPENSHIFT_E2E_USER
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 50-maas-fixtures.yaml.tmpl >"$OUT/render-manifests-maas.log"
+apply_rendered 50-maas-fixtures.yaml
 for _ in $(seq 1 60); do
   praxis_sa=$("${OC[@]}" get serviceaccount -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
   [[ -n "$praxis_sa" ]] && break
@@ -811,26 +558,8 @@ CLIENT_CA_CONFIGMAP="xmp-gateway-ca-$OPENSHIFT_E2E_RUN_ID"
 "${OC[@]}" get secret "$OPENSHIFT_E2E_GATEWAY_TLS_SECRET" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o jsonpath='{.data.tls\.crt}' | base64 -d | \
   "${OC[@]}" create configmap "$CLIENT_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --from-file=ca.crt=/dev/stdin \
     --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/client-ca-configmap.log"
-"${OC[@]}" apply -f - >"$OUT/client-pod.log" <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: xmp-client-$OPENSHIFT_E2E_RUN_ID
-  namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
-  labels:
-    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
-    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
-spec:
-  restartPolicy: Always
-  containers:
-  - name: client
-    image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
-    command: ["/bin/sh", "-c", "sleep 86400"]
-    securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}
-    volumeMounts: [{name: gateway-ca, mountPath: /etc/xmp/ca, readOnly: true}]
-  volumes:
-  - name: gateway-ca
-    configMap: {name: $CLIENT_CA_CONFIGMAP}
-EOF
+export CLIENT_CA_CONFIGMAP
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 60-client.yaml.tmpl >"$OUT/render-manifests-client.log"
+apply_rendered 60-client.yaml
 "${OC[@]}" wait --for=condition=Ready pod/xmp-client-"$OPENSHIFT_E2E_RUN_ID" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --timeout=120s
 printf '%s\n' "$OUT"
