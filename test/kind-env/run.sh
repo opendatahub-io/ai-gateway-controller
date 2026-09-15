@@ -7,9 +7,16 @@ WORKSPACE=$(cd "$ROOT/.." && pwd)
 DEPS_DIR=${LOCAL_ENV_DEPS_DIR:-"$WORKSPACE/deps"}
 LLM_KATAN_REPO=${LLM_KATAN_REPO:-"$DEPS_DIR/llm-katan"}
 KATAN_DEFAULT_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+KATAN_DEFAULT_AMD64_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:a8bf18109e2db641ef4a63efe65f69d4d6554f1128a174053de89a8b81b4284d
 KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_IMAGE}
-if [[ "${BUILD_KATAN:-false}" == true ]]; then KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-llm-katan:e2e}; fi
+KATAN_KIND_IMAGE=${KATAN_IMAGE:-llm-katan:external-model-two-plane}
+if [[ "${BUILD_KATAN:-false}" == true ]]; then
+  KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-llm-katan:e2e}
+  KATAN_KIND_IMAGE=$KATAN_EFFECTIVE_IMAGE
+fi
+KATAN_PULL_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_AMD64_IMAGE}
 PRAXIS_REPO=${PRAXIS_REPO:-"$WORKSPACE/praxis-ai"}
+PRAXIS_EFFECTIVE_IMAGE=${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}
 MAAS_CONTROLLER_REPO=${MAAS_CONTROLLER_REPO:-"$WORKSPACE/models-as-a-service"}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
 KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
@@ -122,7 +129,7 @@ git -C "$ROOT" status --short >"$EVIDENCE/controller.status"
 for pair in \
   "controller|$ROOT|${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}|Dockerfile" \
   "katan|$LLM_KATAN_REPO|$KATAN_EFFECTIVE_IMAGE|Containerfile" \
-  "praxis|$PRAXIS_REPO|${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}|Containerfile" \
+  "praxis|$PRAXIS_REPO|$PRAXIS_EFFECTIVE_IMAGE|Containerfile" \
   "extproc|$PRAXIS_EXTPROC_REPO|${EXTPROC_IMAGE:-praxis-extproc:dev}|Containerfile" \
   "maas-api|$MAAS_CONTROLLER_REPO/maas-api|${MAAS_API_IMAGE:-maas-api:external-model-two-plane}|Dockerfile" \
   "maas-controller|$MAAS_CONTROLLER_REPO|${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}|maas-controller/Dockerfile"; do
@@ -146,7 +153,7 @@ for pair in \
     case "$label" in
       controller) timeout 900s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
       katan) timeout 900s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
-      praxis) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
+      praxis) timeout 3600s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
       extproc) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
       maas-api) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
       maas-controller) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
@@ -184,17 +191,23 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   # loaded image ID always matches the source-input cache record above.
   for image in \
     "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}" \
-    "$KATAN_EFFECTIVE_IMAGE" \
-    "${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}" \
+    "$KATAN_KIND_IMAGE" \
+    "$PRAXIS_EFFECTIVE_IMAGE" \
     "${EXTPROC_IMAGE:-praxis-extproc:dev}" \
     "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" \
     "${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}"; do
     docker exec "${CLUSTER}-control-plane" crictl rmi "docker.io/library/$image" >/dev/null 2>&1 || true
   done
   kind load docker-image "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}" --name "$CLUSTER"
-  if [[ "${BUILD_KATAN:-false}" != true ]]; then docker pull "$KATAN_EFFECTIVE_IMAGE"; fi
-  kind load docker-image "$KATAN_EFFECTIVE_IMAGE" --name "$CLUSTER"
-  kind load docker-image "${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}" --name "$CLUSTER"
+  if [[ "${BUILD_KATAN:-false}" != true ]]; then
+    # The published reference is a multi-architecture index. Pull only the
+    # node platform before loading Kind; importing the index with all
+    # platforms can fail when a registry omits one referenced child blob.
+    docker pull --platform linux/amd64 "$KATAN_PULL_IMAGE"
+    docker tag "$KATAN_PULL_IMAGE" "$KATAN_KIND_IMAGE"
+  fi
+  kind load docker-image "$KATAN_KIND_IMAGE" --name "$CLUSTER"
+  kind load docker-image "$PRAXIS_EFFECTIVE_IMAGE" --name "$CLUSTER"
   kind load docker-image "${EXTPROC_IMAGE:-praxis-extproc:dev}" --name "$CLUSTER"
   kind load docker-image "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" --name "$CLUSTER"
   kind load docker-image "${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}" --name "$CLUSTER"
@@ -323,7 +336,22 @@ EOF
   kustomize build "$ROOT/config/crd" | "${KCTL[@]}" apply --server-side -f -
   kustomize build "$ROOT/config/self/default" | "${KCTL[@]}" apply --server-side --force-conflicts -f -
   "${KCTL[@]}" -n opendatahub set image deployment/ai-gateway-controller manager="${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}"
-  "${KCTL[@]}" -n opendatahub patch deployment ai-gateway-controller --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"},{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--leader-elect","--health-probe-bind-address=:8081","--gateway-name=maas-default-gateway","--gateway-namespace=maas-system","--known-cluster=provider-provider-a","--known-cluster=provider-provider-b","--known-cluster=provider-transition-provider","--image=praxis-extproc:dev","--praxis-image=praxis-ai:overlay-e2e","--praxis-image-pull-policy=Never"]}]'
+  controller_patch=$(jq -cn --arg praxis_image "$PRAXIS_EFFECTIVE_IMAGE" --arg extproc_image "${EXTPROC_IMAGE:-praxis-extproc:dev}" '[
+    {op:"replace",path:"/spec/template/spec/containers/0/imagePullPolicy",value:"Never"},
+    {op:"replace",path:"/spec/template/spec/containers/0/args",value:[
+      "--leader-elect",
+      "--health-probe-bind-address=:8081",
+      "--gateway-name=maas-default-gateway",
+      "--gateway-namespace=maas-system",
+      "--known-cluster=provider-provider-a",
+      "--known-cluster=provider-provider-b",
+      "--known-cluster=provider-transition-provider",
+      ("--image=" + $extproc_image),
+      ("--praxis-image=" + $praxis_image),
+      "--praxis-image-pull-policy=Never"
+    ]}
+  ]')
+  "${KCTL[@]}" -n opendatahub patch deployment ai-gateway-controller --type=json -p="$controller_patch"
   # Standalone Praxis is now rendered and owned by ai-gateway-controller from
   # ExternalProvider references. Do not apply the former static tenant
   # Deployments here; doing so would create an unowned same-name object and
@@ -397,7 +425,11 @@ EOF
       10-praxis.yaml|11-praxis-tenant-b.yaml|12-praxis-transition.yaml|20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
-      sed "s#ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a#$KATAN_EFFECTIVE_IMAGE#g" "$manifest" | "${KCTL[@]}" apply -f -
+      # Kind runs the platform-pulled local image. The immutable public
+      # digest remains recorded in the provision evidence and is the source
+      # of the loaded image; the local name is only a registry-free transport
+      # reference understood by the Kind node.
+      sed "s#ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a#$KATAN_KIND_IMAGE#g" "$manifest" | "${KCTL[@]}" apply -f -
     else
       "${KCTL[@]}" apply -f "$manifest"
     fi
@@ -468,7 +500,7 @@ EOF
     endpoint_count=$("${KCTL[@]}" -n maas-system get endpoints maas-default-gateway -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
     # Kind's LoadBalancer address remains Pending even when Istio has fully
     # programmed the listener. Use the listener condition plus endpoints as
-    # the state-based readiness signal for the run-owned alias Service.
+    # the state-based readiness signal for the run-owned Gateway Service.
     if [[ "$listener_status" == "True" && -n "$endpoint_count" ]]; then
       gateway_ready=true
       break
@@ -502,7 +534,7 @@ EOF
   done
   "${KCTL[@]}" -n maas-system patch gateway maas-transition-gateway --subresource=status --type=merge -p='{"status":{"addresses":[{"type":"Hostname","value":"maas-transition-gateway.maas-system.svc.cluster.local"}]}}'
   # MaaS API validates the internal gateway service during startup. Restart it
-  # after Istio has programmed the gateway and populated the run-owned alias.
+  # after Istio has programmed the Gateway and populated its run-owned Service.
   # The tenant pipeline creates/reconciles one API Deployment per tenant.
   # Restart every run-owned API instance after replacing its serving Secret so
   # the process is definitely using the certificate signed by this run's CA.
@@ -529,13 +561,27 @@ EOF
   "${KCTL[@]}" -n maas-system get config default -o yaml >"$EVIDENCE/maas-config-generated.yaml" 2>&1 || true
   "${KCTL[@]}" -n maas-system get deployment maas-api -o yaml >"$EVIDENCE/maas-api-generated.yaml" 2>&1 || true
   "${KCTL[@]}" -n maas-system rollout status deployment/maas-api --timeout=180s
+  # The shared callback identity must terminate at exactly one real MaaS API
+  # target. This is an ownership/selector gate, not a synthetic response
+  # adapter: the selected pod is the source-built MaaS API deployment.
+  maas_api_service_json=$("${KCTL[@]}" -n maas-system get service maas-api -o json)
+  maas_api_selector=$(jq -r '.spec.selector | to_entries | map(.key + "=" + .value) | join(",")' <<<"$maas_api_service_json")
+  [[ -n "$maas_api_selector" ]] || { fail "shared maas-api Service has no selector"; exit 2; }
+  maas_api_targets=$("${KCTL[@]}" -n maas-system get pods -l "$maas_api_selector" -o json)
+  printf '%s\n' "$maas_api_service_json" | jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,labels:.metadata.labels,ownerReferences:.metadata.ownerReferences},spec:{selector:.spec.selector,ports:.spec.ports}}' >"$EVIDENCE/shared-maas-api-service.json"
+  printf '%s\n' "$maas_api_targets" | jq '[.items[] | {name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,ownerReferences:.metadata.ownerReferences,phase:.status.phase,ready:([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length == 1),restarts:([.status.containerStatuses[]?.restartCount] | add // 0)}]' >"$EVIDENCE/shared-maas-api-targets.json"
+  # A Deployment rollout can leave the old ReplicaSet pod terminating while
+  # the replacement is already Ready. It is not an eligible Service target;
+  # count only non-deleting pods, while retaining the full inventory above.
+  maas_api_target_count=$(jq '[.items[] | select(.metadata.deletionTimestamp == null)] | length' <<<"$maas_api_targets")
+  maas_api_ready_count=$(jq '[.items[] | select(.metadata.deletionTimestamp == null) | select([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length == 1)] | length' <<<"$maas_api_targets")
+  [[ "$maas_api_target_count" == 1 && "$maas_api_ready_count" == 1 ]] || { fail "shared maas-api Service target must be exactly one Ready real MaaS API pod (targets=$maas_api_target_count ready=$maas_api_ready_count selector=$maas_api_selector)"; exit 2; }
   "${KCTL[@]}" -n maas-system rollout status deployment/maas-controller --timeout=180s
   "${KCTL[@]}" -n opendatahub rollout status deployment/ai-gateway-controller --timeout=180s
   wait_for_deployment() {
     local namespace=$1 name=$2
     for _ in $(seq 1 60); do
       if "${KCTL[@]}" -n "$namespace" get deployment "$name" >/dev/null 2>&1; then
-        "${KCTL[@]}" -n "$namespace" rollout status "deployment/$name" --timeout=180s
         return 0
       fi
       sleep 2
@@ -543,12 +589,33 @@ EOF
     fail "controller did not create tenant Praxis deployment $namespace/$name"
     return 1
   }
+  patch_kind_praxis_identity() {
+    local namespace=$1 name=$2
+    # Kind's kubelet cannot verify a named image user when runAsNonRoot=true.
+    # This is a Kind-only admission compatibility transform. Production
+    # manifests deliberately leave UID/GID/fsGroup unset for OpenShift SCC to
+    # assign the namespace-safe identity.
+    "${KCTL[@]}" -n "$namespace" patch deployment "$name" --type=merge \
+      -p='{"spec":{"template":{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532}}}}}'
+  }
   wait_for_deployment models-as-a-service praxis
+  patch_kind_praxis_identity models-as-a-service praxis
+  "${KCTL[@]}" -n models-as-a-service rollout status deployment/praxis --timeout=180s
   wait_for_deployment ai-tenant-tenant-b praxis-tenant-b
+  patch_kind_praxis_identity ai-tenant-tenant-b praxis-tenant-b
+  "${KCTL[@]}" -n ai-tenant-tenant-b rollout status deployment/praxis-tenant-b --timeout=180s
+  for praxis_ref in models-as-a-service/praxis ai-tenant-tenant-b/praxis-tenant-b; do
+    praxis_namespace=${praxis_ref%/*}
+    praxis_name=${praxis_ref#*/}
+    deployed_image=$("${KCTL[@]}" -n "$praxis_namespace" get deployment "$praxis_name" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    [[ "$deployed_image" == "$PRAXIS_EFFECTIVE_IMAGE" ]] || { fail "Praxis image mismatch for $praxis_ref: requested=$PRAXIS_EFFECTIVE_IMAGE deployed=$deployed_image"; exit 2; }
+    "${KCTL[@]}" -n "$praxis_namespace" get pods -l app=praxis -o json | jq --arg requested "$PRAXIS_EFFECTIVE_IMAGE" --arg deployment "$praxis_name" '{requestedImage:$requested,deployment:$deployment,pods:[.items[]|{name:.metadata.name,uid:.metadata.uid,image:.spec.containers[0].image,imageID:.status.containerStatuses[0].imageID,ready:([.status.conditions[]?|select(.type=="Ready" and .status=="True")]|length==1)}]}' >"$EVIDENCE/praxis-image-${praxis_namespace}.json"
+  done
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-a-tenant-b --timeout=180s
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-b-tenant-b --timeout=180s
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-a --timeout=180s
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-b --timeout=180s
+  "${KCTL[@]}" -n maas-system rollout status deployment/katan-transition --timeout=180s
   "${KCTL[@]}" -n kuadrant-system rollout status deployment/authorino --timeout=180s
   # The MaaS tenant pipeline may reconcile the transition operand while the
   # other tenant resources are becoming ready. Apply the run-owned IPP
@@ -572,7 +639,12 @@ EOF
     fi
     sleep 2
   done
-  [[ "$transition_route_configured" == true ]] || { fail "transition IPP route did not converge to maas-system/maas-transition-gateway"; exit 2; }
+  if [[ "$transition_route_configured" != true ]]; then
+    # Transition assertions are a separate follow-up suite. Do not make
+    # routing-increment provisioning depend on an existing IPP route; retain
+    # the observed state for the transition report instead.
+    echo "transition_route_configured=false parent=${transition_parent:-unknown} accepted=${transition_accepted:-unknown} resolved_refs=${transition_refs:-unknown}" >"$EVIDENCE/transition-deferred.txt"
+  fi
   "${KCTL[@]}" -n kuadrant-system get deployment authorino -o yaml >"$EVIDENCE/authorino-deployment.yaml"
   authorino_pod=$("${KCTL[@]}" -n kuadrant-system get pods -l authorino-resource=authorino -o jsonpath='{.items[0].metadata.name}')
   "${KCTL[@]}" -n kuadrant-system exec "$authorino_pod" -- sha256sum /etc/ssl/certs/maas-api-serving-ca.crt >"$EVIDENCE/authorino-mounted-ca.sha256"

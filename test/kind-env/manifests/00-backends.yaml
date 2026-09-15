@@ -37,7 +37,7 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy]
         ports: [{name: http, containerPort: 8000}]
 ---
 apiVersion: v1
@@ -47,7 +47,7 @@ spec:
   selector: {app: katan-a}
   ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
 ---
-# The legacy IPP ExternalModel reconciler exposes external providers through
+# The existing IPP ExternalModel reconciler exposes external providers through
 # an HTTPS-shaped Service port (443), even when this local backend speaks plain
 # HTTP. Keep this compatibility endpoint run-owned and separate from the
 # production-shaped Praxis endpoint above.
@@ -60,8 +60,28 @@ metadata:
     app.kubernetes.io/managed-by: local-env
     local-env.opendatahub.io/purpose: ipp-transition-backend
 spec:
-  selector: {app: katan-a}
+  selector: {app: katan-transition}
   ports: [{name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-transition
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-transition}
+  template:
+    metadata: {labels: {app: katan-transition}}
+    spec:
+      containers:
+      - name: katan
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=transition-provider-key]
+        ports: [{name: http, containerPort: 8000}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -80,7 +100,7 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy]
         ports: [{name: http, containerPort: 8000}]
 ---
 apiVersion: v1
@@ -108,7 +128,7 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference]
         ports: [{name: http, containerPort: 8000}]
 ---
 apiVersion: v1
@@ -136,7 +156,7 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference]
         ports: [{name: http, containerPort: 8000}]
 ---
 apiVersion: v1

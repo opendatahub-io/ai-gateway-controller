@@ -45,6 +45,7 @@ pause() {
   read -r -p "  Press Enter to continue (or wait ${PAUSE_SECONDS}s): " _ </dev/tty || sleep "$PAUSE_SECONDS"
 }
 fail_stage() {
+  record "$STAGE" "stage_${STAGE}_failure" FAIL "failed_boundary=$1"
   echo "RESULT"; echo "  Status                 FAIL"
   echo "  Failed boundary        $1"
   echo "  Diagnostics             $EVIDENCE"
@@ -78,7 +79,7 @@ client_exec() { kctl -n "$CLIENT_NS" exec -i "$CLIENT" -- "$@" </dev/null; }
 request_status() {
   local gateway=$1 path=$2 body=$3
   local url="http://$gateway.$GATEWAY_NS.svc.cluster.local$path"
-  client_exec sh -c "key=\$(cat /tmp/demo-api-key); status=\$(curl --connect-timeout 5 --max-time 15 -sS -o /tmp/demo-response -w '%{http_code}' -H 'content-type: application/json' -H \"Authorization: Bearer \$key\" --data '$body' '$url' || printf 000); backend=\$(grep -o 'katan-[A-Za-z0-9-]*' /tmp/demo-response 2>/dev/null | head -1 || true); printf '%s|%s' \"\$status\" \"\$backend\""
+  client_exec sh -c "status=\$(curl --connect-timeout 5 --max-time 15 -sS -o /tmp/demo-response -w '%{http_code}' -H 'content-type: application/json' -H @/tmp/demo-auth-header --data '$body' '$url' || printf 000); backend=\$(grep -o 'katan-[A-Za-z0-9-]*' /tmp/demo-response 2>/dev/null | head -1 || true); printf '%s|%s' \"\$status\" \"\$backend\""
 }
 record() {
   local number=$1 id=$2 status=$3 observation=$4
@@ -130,8 +131,12 @@ if [[ "$RESET" == true ]]; then
   if [[ "$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)" == ai-gateway-controller ]]; then
     mutate -n "$TENANT" delete configmap routing-overlay --wait=true >/dev/null
   fi
+  praxis_image=$(kctl -n "$TENANT" get deployment praxis -o jsonpath='{.spec.template.spec.containers[?(@.name=="praxis")].image}')
+  [[ -n "$praxis_image" ]] || { echo "RESET: could not determine the active Praxis image"; exit 1; }
   mutate apply -f "$ROOT/test/kind-env/manifests/20-fixtures.yaml" >/dev/null
   mutate apply -f "$ROOT/test/kind-env/manifests/10-praxis.yaml" >/dev/null
+  mutate -n "$TENANT" set image deployment/praxis praxis="$praxis_image" >/dev/null
+  mutate -n "$TENANT" rollout status deployment/praxis --timeout=120s >/dev/null
   mutate -n "$TENANT" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-a"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]' >/dev/null
   wait_for "tenant model Ready after reset" 120 kctl -n "$TENANT" get externalmodel demo-model -o jsonpath='{.status.phase}' || exit 1
   for _ in $(seq 1 60); do
@@ -199,7 +204,7 @@ unauth=$(client_exec sh -c "curl --connect-timeout 5 --max-time 15 -sS -o /tmp/u
 echo "  unauthenticated request HTTP $unauth (expected 401/403)"
 [[ "$unauth" == 401 || "$unauth" == 403 ]] || fail_stage "Kuadrant authentication"
 # The key is stored only inside the client pod; it is not printed or recorded.
-client_exec sh -c "curl --cacert /etc/demo-ca/ca.crt -sS -H 'content-type: application/json' -H 'X-MaaS-Username: kind-user' -H 'X-MaaS-Group: [\"system:authenticated\"]' --data '{\"name\":\"narrative-demo\",\"ephemeral\":true,\"subscription\":\"kind-e2e-subscription\"}' 'https://maas-api.$GATEWAY_NS.svc.cluster.local:8443/v1/api-keys' | sed -n 's/.*\"key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p' > /tmp/demo-api-key"
+client_exec sh -c "curl --cacert /etc/demo-ca/ca.crt -sS -H 'content-type: application/json' -H 'X-MaaS-Username: kind-user' -H 'X-MaaS-Group: [\"system:authenticated\"]' --data '{\"name\":\"narrative-demo\",\"ephemeral\":true,\"subscription\":\"kind-e2e-subscription\"}' 'https://maas-api.$GATEWAY_NS.svc.cluster.local:8443/v1/api-keys' | sed -n 's/.*\"key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/Authorization: Bearer \\1/p' > /tmp/demo-auth-header && test -s /tmp/demo-auth-header && chmod 600 /tmp/demo-auth-header"
 auth=$(request_status maas-default-gateway "$path" '{"model":"demo","messages":[{"role":"user","content":"auth"}]}' 2>/dev/null || true)
 auth_status=$(printf '%s' "$auth" | cut -d'|' -f1); auth_backend=$(printf '%s' "$auth" | cut -d'|' -f2)
 echo "  authenticated request HTTP $auth_status; backend ${auth_backend:-unavailable}"
