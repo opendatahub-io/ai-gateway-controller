@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-processing
+  namespace: openshift-ingress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payload-processing
+  template:
+    metadata:
+      labels:
+        app: payload-processing
+    spec:
+      serviceAccountName: payload-processing
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: payload-processing
+          image: payload-processing
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          args:
+            - --config-file
+            - "/config/custom-ipp-config.yaml"
+            - --v=3
+            - --tracing=true
+          env:
+            - name: OTEL_TRACES_EXPORTER
+              value: otlp
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: http://data-science-collector-collector.opendatahub.svc:4317
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://data-science-collector-collector.opendatahub.svc:4317
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_traceidratio
+            - name: OTEL_SERVICE_NAME
+              value: payload-processing
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "1.0"
+          ports:
+            - containerPort: 9004
+              name: grpc
+              protocol: TCP
+            - containerPort: 9005
+              name: metrics
+              protocol: TCP
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: plugins-config-volume
+              mountPath: "/config"
+      volumes:
+        - name: plugins-config-volume
+          configMap:
+            name: payload-processing-plugins

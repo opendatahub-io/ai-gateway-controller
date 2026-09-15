@@ -1,0 +1,1981 @@
+"""
+API Keys Feature End-to-End Tests
+==================================
+
+Tests the complete API Keys lifecycle and model access:
+- CRUD operations (create, list, get, revoke)
+- Authorization (admin vs non-admin access)
+- Bulk operations (own keys and admin bulk revoke)
+- Model inference with API keys (success and failure scenarios)
+
+Prerequisites:
+- MaaS platform deployed with API Keys feature enabled
+- At least one model deployed with AuthPolicy and Subscription
+
+Environment Variables:
+- GATEWAY_HOST: Gateway hostname (e.g., maas.apps.cluster.example.com)
+- TOKEN: OpenShift token for regular user API management (or uses `oc whoami -t`)
+- ADMIN_OC_TOKEN: Admin token for admin-specific tests (optional, tests skip if not set)
+- MODEL_NAME: Override model name for inference tests (optional)
+- INFERENCE_MODEL_NAME: Model name for inference request body (optional)
+- E2E_SIMULATOR_SUBSCRIPTION: Bound on the session ``api_key`` fixture at mint (default: simulator-subscription)
+
+Admin Tests:
+Admin tests (TestAPIKeyAuthorization, admin bulk revoke) require ADMIN_OC_TOKEN.
+In Prow CI, this is automatically configured by prow_run_smoke_test.sh.
+For local testing:
+  1. Create admin SA: oc create sa tester-admin -n default
+  2. Grant admin: oc adm policy add-cluster-role-to-user cluster-admin system:serviceaccount:default:tester-admin
+  3. Get token: export ADMIN_OC_TOKEN=$(oc create token tester-admin -n default)
+"""
+
+import json
+import logging
+import os
+import subprocess
+import time
+from datetime import datetime
+
+import pytest
+import requests
+
+from conftest import TLS_VERIFY
+from test_helper import (
+    MODEL_NAME,
+    MODEL_NAMESPACE,
+    MODEL_REF,
+    SIMULATOR_SUBSCRIPTION,
+    TIMEOUT,
+    _apply_cr,
+    _create_api_key,
+    _create_api_key_raw,
+    _create_sa_token,
+    _create_test_auth_policy,
+    _create_test_subscription,
+    _delete_cr,
+    _delete_sa,
+    _get_cr,
+    _maas_api_url,
+    _ns,
+    _request_with_gateway_retry,
+    _sa_to_user,
+    _scale_controller_down,
+    _scale_controller_up,
+    _wait_for_gateway_auth_enforced,
+    _wait_for_maas_subscription_phase,
+    _wait_for_cr_absent,
+)
+
+log = logging.getLogger(__name__)
+
+pytestmark = pytest.mark.xdist_group("api_keys")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _warm_gateway(api_keys_base_url: str, headers: dict):
+    """Wait for gateway AuthPolicy enforcement before running API key tests.
+
+    MaaSAuthPolicy churn in earlier modules (or this session) can leave
+    maas-gateway-auth reconciling; empty 403s follow until Enforced=True and
+    Envoy loads the config.
+    """
+    _wait_for_gateway_auth_enforced()
+    r = _request_with_gateway_retry(
+        requests.post,
+        api_keys_base_url,
+        headers=headers,
+        json={"name": "e2e-gateway-warmup"},
+    )
+    log.info("Gateway warm-up completed: HTTP %d", r.status_code)
+
+
+@pytest.fixture
+def model_completions_url(model_v1: str) -> str:
+    """URL for completions endpoint."""
+    return f"{model_v1}/completions"
+
+
+@pytest.fixture
+def inference_model_name() -> str:
+    """Model name for inference requests. Override with INFERENCE_MODEL_NAME env var."""
+    return os.environ.get("INFERENCE_MODEL_NAME", MODEL_NAME)
+
+
+class TestAPIKeyCRUD:
+    """Tests 1-3: Create, list, and revoke API keys."""
+
+    def test_create_api_key(self, api_keys_base_url: str, headers: dict):
+        """Test 1: Create API key - verify format and show-once pattern."""
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={"name": "test-key-create"},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), f"Expected 200/201, got {r.status_code}: {r.text}"
+        data = r.json()
+
+        # Verify response structure
+        assert "id" in data and "key" in data and "name" in data
+        key = data["key"]
+        assert key.startswith("sk-oai-"), f"Expected sk-oai- prefix, got: {key[:20]}"
+        assert len(key) > len("sk-oai-"), "Key body should not be empty"
+        # Note: status field not included in create response (only in list/get)
+
+        print(f"[create] Created key id={data['id']}, key prefix={key[:15]}...")
+
+        # Verify plaintext key is NOT returned on subsequent GET
+        r_get = requests.get(f"{api_keys_base_url}/{data['id']}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r_get.status_code == 200
+        assert "key" not in r_get.json(), "Plaintext key should not be in GET (show-once pattern)"
+
+    def test_list_api_keys(self, api_keys_base_url: str, headers: dict):
+        """Test 2: List own keys - verify basic functionality."""
+        # Create two keys
+        r1 = requests.post(api_keys_base_url, headers=headers, json={"name": "test-key-list-1"}, timeout=30, verify=TLS_VERIFY)
+        assert r1.status_code in (200, 201)
+        key1_id = r1.json()["id"]
+
+        r2 = requests.post(api_keys_base_url, headers=headers, json={"name": "test-key-list-2"}, timeout=30, verify=TLS_VERIFY)
+        assert r2.status_code in (200, 201)
+        key2_id = r2.json()["id"]
+
+        # List keys using search endpoint
+        r = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={
+                "filters": {"status": ["active"]},
+                "sort": {"by": "created_at", "order": "desc"},
+                "pagination": {"limit": 50, "offset": 0}
+            },
+            timeout=30,
+            verify=TLS_VERIFY
+        )
+        assert r.status_code == 200
+        data = r.json()
+        items = data.get("items") or data.get("data") or []
+        assert len(items) >= 2
+
+        # Verify our keys are in the list
+        key_ids = [item["id"] for item in items]
+        assert key1_id in key_ids and key2_id in key_ids
+
+        # Verify no plaintext keys in list
+        for item in items:
+            assert "key" not in item
+
+        print(f"[list] Found {len(items)} keys")
+
+        # Test pagination
+        r_limit = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={
+                "filters": {"status": ["active"]},
+                "sort": {"by": "created_at", "order": "desc"},
+                "pagination": {"limit": 1, "offset": 0}
+            },
+            timeout=30,
+            verify=TLS_VERIFY
+        )
+        assert r_limit.status_code == 200
+        limited_items = (r_limit.json().get("items") or r_limit.json().get("data") or [])
+        assert len(limited_items) <= 1
+        print(f"[list] Pagination works: limit=1 returned {len(limited_items)} items")
+
+    def test_revoke_api_key(self, api_keys_base_url: str, headers: dict):
+        """Test 3: Revoke key - verify status change to 'revoked'."""
+        # Create a key
+        r_create = requests.post(api_keys_base_url, headers=headers, json={"name": "test-key-revoke"}, timeout=30, verify=TLS_VERIFY)
+        assert r_create.status_code in (200, 201)
+        key_id = r_create.json()["id"]
+
+        # Revoke it using DELETE
+        r = requests.delete(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r.status_code == 200
+        assert r.json().get("status") == "revoked"
+
+        # Verify GET shows revoked status
+        r_get = requests.get(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r_get.status_code == 200
+        assert r_get.json().get("status") == "revoked"
+        print(f"[revoke] Key {key_id} successfully revoked")
+
+
+class TestAPIKeyAuthorization:
+    """Tests 4-5: Admin and non-admin access control."""
+
+    def test_admin_manage_other_users_keys(self, api_keys_base_url: str, headers: dict, admin_headers: dict):
+        """Test 4: Admin can manage other user's keys - list and revoke."""
+        if not admin_headers:
+            pytest.skip("ADMIN_OC_TOKEN not set")
+
+        # Create key as regular user
+        r_create = requests.post(api_keys_base_url, headers=headers, json={"name": "regular-user-key"}, timeout=30, verify=TLS_VERIFY)
+        assert r_create.status_code in (200, 201)
+        user_key_id = r_create.json()["id"]
+
+        # Get username
+        r_get = requests.get(f"{api_keys_base_url}/{user_key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        username = r_get.json().get("username") or r_get.json().get("owner")
+        assert username
+
+        print(f"[admin] User '{username}' created key {user_key_id}")
+
+        # Admin lists keys filtered by username using search endpoint
+        r_admin = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=admin_headers,
+            json={
+                "filters": {"username": username, "status": ["active"]},
+                "sort": {"by": "created_at", "order": "desc"},
+                "pagination": {"limit": 50, "offset": 0}
+            },
+            timeout=30,
+            verify=TLS_VERIFY
+        )
+        assert r_admin.status_code == 200
+        items = r_admin.json().get("items") or r_admin.json().get("data") or []
+        key_ids = [item["id"] for item in items]
+        assert user_key_id in key_ids
+        print(f"[admin] Admin listed {len(items)} keys for '{username}'")
+
+        # Admin revokes user's key using DELETE
+        r_revoke = requests.delete(f"{api_keys_base_url}/{user_key_id}", headers=admin_headers, timeout=30, verify=TLS_VERIFY)
+        assert r_revoke.status_code == 200
+        assert r_revoke.json().get("status") == "revoked"
+        print(f"[admin] Admin successfully revoked user's key {user_key_id}")
+
+    def test_non_admin_cannot_access_other_users_keys(self, api_keys_base_url: str, headers: dict, admin_headers: dict):
+        """Test 5: Non-admin cannot access other user's keys - verify denial.
+        
+        Note: API returns 404 instead of 403 for IDOR protection (prevents key enumeration).
+        This is a security best practice - returning 403 would reveal the key exists.
+        """
+        if not admin_headers:
+            pytest.skip("ADMIN_OC_TOKEN not set")
+
+        # Admin creates a key
+        r_admin = requests.post(api_keys_base_url, headers=admin_headers, json={"name": "admin-only-key"}, timeout=30, verify=TLS_VERIFY)
+        assert r_admin.status_code in (200, 201)
+        admin_key_id = r_admin.json()["id"]
+
+        # Regular user tries to GET admin's key - returns 404 for IDOR protection
+        r_get = requests.get(f"{api_keys_base_url}/{admin_key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r_get.status_code == 404, f"Expected 404 (IDOR protection), got {r_get.status_code}"
+
+        # Regular user tries to revoke admin's key - returns 404 for IDOR protection
+        r_revoke = requests.delete(f"{api_keys_base_url}/{admin_key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r_revoke.status_code == 404, f"Expected 404 (IDOR protection), got {r_revoke.status_code}"
+        print("[authz] Non-admin correctly got 404 (IDOR protection) for admin's key")
+
+
+class TestAPIKeyBulkOperations:
+    """Tests for bulk operations like bulk-revoke."""
+
+    def test_bulk_revoke_own_keys(self, api_keys_base_url: str, headers: dict):
+        """Test 8: Bulk revoke - user can bulk revoke their own keys."""
+        # Create multiple keys
+        key_ids = []
+        for i in range(3):
+            r = requests.post(api_keys_base_url, headers=headers, json={"name": f"bulk-test-{i}"}, timeout=30, verify=TLS_VERIFY)
+            assert r.status_code in (200, 201)
+            key_ids.append(r.json()["id"])
+
+        # Get username from one of the keys
+        r_get = requests.get(f"{api_keys_base_url}/{key_ids[0]}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        username = r_get.json().get("username") or r_get.json().get("owner")
+        assert username
+
+        # Bulk revoke all keys for this user
+        r_bulk = requests.post(
+            f"{api_keys_base_url}/bulk-revoke",
+            headers=headers,
+            json={"username": username},
+            timeout=30,
+            verify=TLS_VERIFY
+        )
+        assert r_bulk.status_code == 200
+        data = r_bulk.json()
+        assert data.get("revokedCount") >= 3, f"Expected at least 3 revoked, got {data.get('revokedCount')}"
+        print(f"[bulk-revoke] Successfully revoked {data.get('revokedCount')} keys for user {username}")
+
+        # Verify keys are revoked
+        for key_id in key_ids:
+            r_check = requests.get(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+            assert r_check.status_code == 200, f"Failed to fetch key {key_id}: {r_check.status_code}"
+            assert r_check.json().get("status") == "revoked"
+
+    def test_bulk_revoke_other_user_forbidden(self, api_keys_base_url: str, headers: dict):
+        """Test 9: Bulk revoke - non-admin cannot bulk revoke other user's keys."""
+        # Try to bulk revoke another user's keys (should fail with 403)
+        r_bulk = requests.post(
+            f"{api_keys_base_url}/bulk-revoke",
+            headers=headers,
+            json={"username": "someotheruser"},
+            timeout=30,
+            verify=TLS_VERIFY
+        )
+        assert r_bulk.status_code == 403, f"Expected 403, got {r_bulk.status_code}: {r_bulk.text}"
+        print("[bulk-revoke] Non-admin correctly got 403 when trying to bulk revoke other user's keys")
+
+    def test_bulk_revoke_admin_can_revoke_any_user(self, api_keys_base_url: str, headers: dict, admin_headers: dict):
+        """Test 10: Bulk revoke - admin can bulk revoke any user's keys."""
+        if not admin_headers:
+            pytest.skip("ADMIN_OC_TOKEN not set")
+
+        # Create a key as regular user
+        r = requests.post(api_keys_base_url, headers=headers, json={"name": "admin-bulk-revoke-test"}, timeout=30, verify=TLS_VERIFY)
+        assert r.status_code in (200, 201)
+        key_id = r.json()["id"]
+
+        # Get username
+        r_get = requests.get(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        username = r_get.json().get("username") or r_get.json().get("owner")
+        assert username
+
+        # Admin bulk revokes user's keys
+        r_bulk = requests.post(
+            f"{api_keys_base_url}/bulk-revoke",
+            headers=admin_headers,
+            json={"username": username},
+            timeout=30,
+            verify=TLS_VERIFY
+        )
+        assert r_bulk.status_code == 200
+        data = r_bulk.json()
+        assert data.get("revokedCount") >= 1
+        print(f"[bulk-revoke] Admin successfully revoked {data.get('revokedCount')} keys for user {username}")
+
+    def test_bulk_revoke_by_subscription(self, api_keys_base_url: str, headers: dict, admin_headers: dict):
+        """Admin can bulk revoke all keys bound to a subscription."""
+        if not admin_headers:
+            pytest.skip("ADMIN_OC_TOKEN not set")
+
+        sub_name = f"e2e-bulk-sub-{os.urandom(4).hex()}"
+        ns = _ns()
+        sa_name = f"e2e-bulk-sa-{os.urandom(4).hex()}"
+
+        key_ids = []
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+            sa_headers = {"Authorization": f"Bearer {oc_token}", "Content-Type": "application/json"}
+
+            _create_test_auth_policy(f"{sub_name}-auth", MODEL_REF, users=[sa_user])
+            _create_test_subscription(sub_name, MODEL_REF, users=[sa_user])
+            _wait_for_maas_subscription_phase(sub_name, namespace=ns)
+
+            for i in range(3):
+                r = _request_with_gateway_retry(
+                    requests.post,
+                    api_keys_base_url, headers=sa_headers,
+                    json={"name": f"sub-bulk-{i}", "subscription": sub_name},
+                    timeout=TIMEOUT, verify=TLS_VERIFY,
+                )
+                assert r.status_code in (200, 201), f"Failed to create key: {r.text}"
+                key_ids.append(r.json()["id"])
+
+            r_bulk = requests.post(
+                f"{api_keys_base_url}/bulk-revoke",
+                headers=admin_headers,
+                json={"subscription": sub_name},
+                timeout=30, verify=TLS_VERIFY,
+            )
+            assert r_bulk.status_code == 200
+            data = r_bulk.json()
+            assert data["revokedCount"] == 3, (
+                f"Expected exactly 3 revoked, got {data.get('revokedCount')}"
+            )
+            print(f"[bulk-revoke] Admin revoked {data['revokedCount']} keys for subscription {sub_name}")
+
+            for key_id in key_ids:
+                r_check = requests.get(f"{api_keys_base_url}/{key_id}", headers=admin_headers, timeout=30, verify=TLS_VERIFY)
+                assert r_check.status_code == 200, f"Failed to fetch key {key_id}: {r_check.status_code}"
+                assert r_check.json().get("status") == "revoked"
+
+        finally:
+            for kid in key_ids:
+                requests.delete(f"{api_keys_base_url}/{kid}", headers=sa_headers, timeout=TIMEOUT, verify=TLS_VERIFY)
+            _delete_cr("maassubscription", sub_name, namespace=ns)
+            _delete_cr("maasauthpolicy", f"{sub_name}-auth", namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _wait_for_gateway_auth_enforced()
+
+    def test_bulk_revoke_by_subscription_forbidden_for_non_admin(self, api_keys_base_url: str, headers: dict):
+        """Non-admin cannot bulk revoke by subscription (requires admin)."""
+        r_bulk = requests.post(
+            f"{api_keys_base_url}/bulk-revoke",
+            headers=headers,
+            json={"subscription": SIMULATOR_SUBSCRIPTION},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_bulk.status_code == 403, (
+            f"Expected 403 for non-admin subscription revoke, got {r_bulk.status_code}: {r_bulk.text}"
+        )
+        print("[bulk-revoke] Non-admin correctly got 403 for subscription-scoped revoke")
+
+    def test_bulk_revoke_dry_run(self, api_keys_base_url: str, headers: dict):
+        """Dry-run returns count without actually revoking."""
+        key_ids = []
+        for i in range(2):
+            r = requests.post(
+                api_keys_base_url, headers=headers,
+                json={"name": f"dry-run-{i}"},
+                timeout=30, verify=TLS_VERIFY,
+            )
+            assert r.status_code in (200, 201)
+            key_ids.append(r.json()["id"])
+
+        r_get = requests.get(f"{api_keys_base_url}/{key_ids[0]}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        username = r_get.json().get("username") or r_get.json().get("owner")
+        assert username
+
+        r_dry = requests.post(
+            f"{api_keys_base_url}/bulk-revoke",
+            headers=headers,
+            json={"username": username, "dryRun": True},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_dry.status_code == 200
+        data = r_dry.json()
+        assert data.get("dryRun") is True, "Response should indicate dry-run"
+        assert data.get("revokedCount") >= 2, (
+            f"Expected at least 2 in dry-run, got {data.get('revokedCount')}"
+        )
+        assert "keyIds" not in data, "Dry-run should not expose key IDs"
+        print(f"[bulk-revoke] Dry-run reported {data.get('revokedCount')} keys would be revoked")
+
+        for key_id in key_ids:
+            r_check = requests.get(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+            assert r_check.status_code == 200
+            assert r_check.json().get("status") == "active", (
+                f"Key {key_id} should still be active after dry-run"
+            )
+        print("[bulk-revoke] Keys confirmed still active after dry-run")
+
+    def test_bulk_revoke_dry_run_by_subscription(self, api_keys_base_url: str, headers: dict, admin_headers: dict):
+        """Admin dry-run by subscription returns correct key count."""
+        if not admin_headers:
+            pytest.skip("ADMIN_OC_TOKEN not set")
+
+        sub_name = f"e2e-dry-sub-{os.urandom(4).hex()}"
+        ns = _ns()
+        sa_name = f"e2e-dry-sa-{os.urandom(4).hex()}"
+
+        key_ids = []
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+            sa_headers = {"Authorization": f"Bearer {oc_token}", "Content-Type": "application/json"}
+
+            _create_test_auth_policy(f"{sub_name}-auth", MODEL_REF, users=[sa_user])
+            _create_test_subscription(sub_name, MODEL_REF, users=[sa_user])
+            _wait_for_maas_subscription_phase(sub_name, namespace=ns)
+
+            for i in range(2):
+                r = _request_with_gateway_retry(
+                    requests.post,
+                    api_keys_base_url, headers=sa_headers,
+                    json={"name": f"dry-sub-{i}", "subscription": sub_name},
+                    timeout=TIMEOUT, verify=TLS_VERIFY,
+                )
+                assert r.status_code in (200, 201)
+                key_ids.append(r.json()["id"])
+
+            r_dry = requests.post(
+                f"{api_keys_base_url}/bulk-revoke",
+                headers=admin_headers,
+                json={"subscription": sub_name, "dryRun": True},
+                timeout=30, verify=TLS_VERIFY,
+            )
+            assert r_dry.status_code == 200
+            data = r_dry.json()
+            assert data.get("dryRun") is True
+            assert data["revokedCount"] == 2
+            assert "keyIds" not in data, "Dry-run should not expose key IDs"
+            print(f"[bulk-revoke] Admin dry-run by subscription: {data['revokedCount']} keys would be revoked")
+
+            for key_id in key_ids:
+                r_check = requests.get(f"{api_keys_base_url}/{key_id}", headers=sa_headers, timeout=30, verify=TLS_VERIFY)
+                assert r_check.status_code == 200, f"Failed to fetch key {key_id}: {r_check.status_code}"
+                assert r_check.json().get("status") == "active", "Key should remain active after dry-run"
+
+        finally:
+            for kid in key_ids:
+                requests.delete(f"{api_keys_base_url}/{kid}", headers=sa_headers, timeout=TIMEOUT, verify=TLS_VERIFY)
+            _delete_cr("maassubscription", sub_name, namespace=ns)
+            _delete_cr("maasauthpolicy", f"{sub_name}-auth", namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _wait_for_gateway_auth_enforced()
+
+    def test_bulk_revoke_combined_user_and_subscription(self, api_keys_base_url: str, headers: dict, admin_headers: dict):
+        """Admin can revoke keys for a specific user within a specific subscription.
+
+        Negative control: a second user's keys in the same subscription must remain active.
+        """
+        if not admin_headers:
+            pytest.skip("ADMIN_OC_TOKEN not set")
+
+        sub_name = f"e2e-combo-sub-{os.urandom(4).hex()}"
+        ns = _ns()
+        sa_name = f"e2e-combo-sa-{os.urandom(4).hex()}"
+        sa2_name = f"e2e-combo-sa2-{os.urandom(4).hex()}"
+
+        key_ids = []
+        key_ids_user2 = []
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+            sa_headers = {"Authorization": f"Bearer {oc_token}", "Content-Type": "application/json"}
+
+            oc_token2 = _create_sa_token(sa2_name, namespace=MODEL_NAMESPACE)
+            sa_user2 = _sa_to_user(sa2_name, namespace=MODEL_NAMESPACE)
+            sa2_headers = {"Authorization": f"Bearer {oc_token2}", "Content-Type": "application/json"}
+
+            _create_test_auth_policy(f"{sub_name}-auth", MODEL_REF, users=[sa_user, sa_user2])
+            _create_test_subscription(sub_name, MODEL_REF, users=[sa_user, sa_user2])
+            _wait_for_maas_subscription_phase(sub_name, namespace=ns)
+
+            for i in range(2):
+                r = _request_with_gateway_retry(
+                    requests.post,
+                    api_keys_base_url, headers=sa_headers,
+                    json={"name": f"combined-{i}", "subscription": sub_name},
+                    timeout=TIMEOUT, verify=TLS_VERIFY,
+                )
+                assert r.status_code in (200, 201)
+                key_ids.append(r.json()["id"])
+
+            r_u2 = _request_with_gateway_retry(
+                requests.post,
+                api_keys_base_url, headers=sa2_headers,
+                json={"name": "user2-key", "subscription": sub_name},
+                timeout=TIMEOUT, verify=TLS_VERIFY,
+            )
+            assert r_u2.status_code in (200, 201)
+            key_ids_user2.append(r_u2.json()["id"])
+
+            r_get = requests.get(f"{api_keys_base_url}/{key_ids[0]}", headers=sa_headers, timeout=30, verify=TLS_VERIFY)
+            username = r_get.json().get("username") or r_get.json().get("owner")
+            assert username
+
+            r_bulk = requests.post(
+                f"{api_keys_base_url}/bulk-revoke",
+                headers=admin_headers,
+                json={"username": username, "subscription": sub_name},
+                timeout=30, verify=TLS_VERIFY,
+            )
+            assert r_bulk.status_code == 200
+            data = r_bulk.json()
+            assert data["revokedCount"] == 2
+            print(f"[bulk-revoke] Admin revoked {data['revokedCount']} keys for {username} in {sub_name}")
+
+            # Negative control: second user's key must remain active
+            r_check = requests.get(
+                f"{api_keys_base_url}/{key_ids_user2[0]}", headers=admin_headers, timeout=30, verify=TLS_VERIFY,
+            )
+            assert r_check.status_code == 200, f"Failed to fetch user2 key: {r_check.status_code}"
+            assert r_check.json().get("status") == "active", "User2 key should remain active after combined-scope revoke"
+            print(f"[bulk-revoke] Negative control passed: user2 key {key_ids_user2[0]} still active")
+
+        finally:
+            for kid in key_ids + key_ids_user2:
+                requests.delete(f"{api_keys_base_url}/{kid}", headers=admin_headers, timeout=TIMEOUT, verify=TLS_VERIFY)
+            _delete_cr("maassubscription", sub_name, namespace=ns)
+            _delete_cr("maasauthpolicy", f"{sub_name}-auth", namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _delete_sa(sa2_name, namespace=MODEL_NAMESPACE)
+            _wait_for_gateway_auth_enforced()
+
+    def test_bulk_revoke_missing_scope_returns_400(self, api_keys_base_url: str, headers: dict):
+        """Bulk revoke with empty body returns 400."""
+        r_bulk = requests.post(
+            f"{api_keys_base_url}/bulk-revoke",
+            headers=headers,
+            json={},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_bulk.status_code == 400, (
+            f"Expected 400 for empty scope, got {r_bulk.status_code}: {r_bulk.text}"
+        )
+        print("[bulk-revoke] Empty scope correctly returns 400")
+
+
+class TestAPIKeyExpiration:
+    """Tests for API key expiration policy enforcement.
+    
+    These tests verify that the maxExpirationDays limit is enforced when creating API keys.
+    
+    Environment Variables:
+    - API_KEY_MAX_EXPIRATION_DAYS: The configured max expiration in days (set on maas-api deployment).
+      Must be explicitly set by the e2e test harness to match the maas-api deployment configuration.
+      Default is 90 days. Minimum is 1 day.
+    """
+
+    @pytest.fixture
+    def max_expiration_days(self) -> int:
+        """Get the configured max expiration days from environment.
+        
+        Defaults to 90 days if API_KEY_MAX_EXPIRATION_DAYS is not set,
+        matching the maas-api default (constant.DefaultAPIKeyMaxExpirationDays).
+        """
+        val = os.environ.get("API_KEY_MAX_EXPIRATION_DAYS", "90")
+        try:
+            return int(val)
+        except ValueError:
+            pytest.skip(
+                f"API_KEY_MAX_EXPIRATION_DAYS={val!r} is not a valid integer; "
+                "skipping expiration policy tests"
+            )
+
+    def test_create_key_within_expiration_limit(self, api_keys_base_url: str, headers: dict, max_expiration_days: int):
+        """Test: Creating API key with expiration within the limit should succeed."""
+
+        # Request expiration at half the limit (e.g., 15 days if limit is 30)
+        expires_in_hours = (max_expiration_days // 2) * 24
+        if expires_in_hours <= 0:
+            expires_in_hours = 24  # At least 1 day
+
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "test-within-limit",
+                "description": f"Test key with {expires_in_hours}h expiration",
+                "expiresIn": f"{expires_in_hours}h"
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), f"Expected 200/201, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert "key" in data, "Response should contain key"
+        assert "expiresAt" in data, "Response should contain expiresAt"
+        print(f"[expiration] Created key within limit: expires_in={expires_in_hours}h, expiresAt={data.get('expiresAt')}")
+
+    def test_create_key_at_expiration_limit(self, api_keys_base_url: str, headers: dict, max_expiration_days: int):
+        """Test: Creating API key with expiration exactly at the limit should succeed."""
+
+        # Request expiration exactly at the limit
+        expires_in_hours = max_expiration_days * 24
+
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "test-at-limit",
+                "description": f"Test key with exactly {max_expiration_days} days expiration",
+                "expiresIn": f"{expires_in_hours}h"
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), f"Expected 200/201, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert "key" in data, "Response should contain key"
+        assert "expiresAt" in data, "Response should contain expiresAt"
+        print(f"[expiration] Created key at limit: expires_in={expires_in_hours}h ({max_expiration_days} days)")
+
+    def test_create_key_exceeds_expiration_limit(self, api_keys_base_url: str, headers: dict, max_expiration_days: int):
+        """Test: Creating API key with expiration exceeding the limit should fail."""
+
+        # Request expiration exceeding the limit (e.g., 2x the limit)
+        exceeds_days = max_expiration_days * 2
+        expires_in_hours = exceeds_days * 24
+
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "test-exceeds-limit",
+                "description": f"Test key with {exceeds_days} days expiration (exceeds {max_expiration_days} day limit)",
+                "expiresIn": f"{expires_in_hours}h"
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code == 400, f"Expected 400 for exceeding limit, got {r.status_code}: {r.text}"
+        
+        # Verify error message mentions the limit
+        error_text = r.text.lower()
+        assert "exceed" in error_text or "maximum" in error_text, \
+            f"Error message should mention exceeding maximum: {r.text}"
+        print(f"[expiration] Correctly rejected key exceeding limit: {exceeds_days} days > {max_expiration_days} days")
+
+    def test_create_key_without_expiration(self, api_keys_base_url: str, headers: dict, max_expiration_days: int):
+        """Test: Creating API key without expiration should succeed (expiration is optional by default)."""
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "test-no-expiration",
+                "description": "Test key without expiration"
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), f"Expected 200/201, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert "key" in data, "Response should contain key"
+        # expiresAt should be absent or null for non-expiring keys
+        expires_at = data.get("expiresAt")
+        if expires_at:
+            print(f"[expiration] Key created with default expiration: {expires_at}")
+        else:
+            print("[expiration] Key created without expiration (never expires)")
+
+    def test_create_key_with_short_expiration(self, api_keys_base_url: str, headers: dict):
+        """Test: Creating API key with very short expiration (1 hour) should succeed."""
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "test-short-expiration",
+                "description": "Test key with 1 hour expiration",
+                "expiresIn": "1h"
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), f"Expected 200/201, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert "expiresAt" in data, "Response should contain expiresAt"
+        print(f"[expiration] Created key with 1h expiration: expiresAt={data.get('expiresAt')}")
+
+
+class TestAPIKeyModelInference:
+    """Tests 11-15: Using API keys for model inference via gateway."""
+
+    def test_api_key_model_access_success(
+        self,
+        model_completions_url: str,
+        api_key_headers: dict,
+        inference_model_name: str,
+    ):
+        """Test 11: Valid API key can access model endpoint - verify 200 response.
+
+        Subscription is bound on the key at mint (see conftest ``api_key`` fixture).
+        """
+        r = requests.post(
+            model_completions_url,
+            headers=api_key_headers,
+            json={
+                "model": inference_model_name,
+                "prompt": "Hello world",
+                "max_tokens": 10,
+            },
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
+        data = r.json()
+
+        # Verify response structure
+        assert "choices" in data, "Response should contain 'choices'"
+        assert len(data["choices"]) > 0, "Should have at least one choice"
+        assert "text" in data["choices"][0] or "message" in data["choices"][0], "Choice should have text or message"
+
+        print(f"[inference] Model access succeeded: {data.get('model')}, tokens={data.get('usage', {}).get('total_tokens')}")
+
+    def test_invalid_api_key_rejected(
+        self,
+        model_completions_url: str,
+        inference_model_name: str,
+    ):
+        """Test 12: Invalid API key should be rejected with 403."""
+        invalid_headers = {
+            "Authorization": "Bearer sk-oai-invalid-key-12345",
+            "Content-Type": "application/json",
+        }
+
+        r = requests.post(
+            model_completions_url,
+            headers=invalid_headers,
+            json={
+                "model": inference_model_name,
+                "prompt": "Test",
+                "max_tokens": 5,
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+
+        assert r.status_code == 403, f"Expected 403 for invalid key, got {r.status_code}: {r.text}"
+        print("[inference] Invalid API key correctly rejected with 403")
+
+    def test_no_auth_header_rejected(
+        self,
+        model_completions_url: str,
+        inference_model_name: str,
+    ):
+        """Test 13: Missing Authorization header should be rejected with 401."""
+        no_auth_headers = {"Content-Type": "application/json"}
+
+        r = requests.post(
+            model_completions_url,
+            headers=no_auth_headers,
+            json={
+                "model": inference_model_name,
+                "prompt": "Test",
+                "max_tokens": 5,
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+
+        assert r.status_code == 401, f"Expected 401 for missing auth, got {r.status_code}: {r.text}"
+        print("[inference] Missing auth header correctly rejected with 401")
+
+    def test_revoked_api_key_rejected(
+        self,
+        api_keys_base_url: str,
+        model_completions_url: str,
+        headers: dict,
+        inference_model_name: str,
+    ):
+        """Test 14: Revoked API key should be rejected with 403."""
+        # Create a new key
+        designated = SIMULATOR_SUBSCRIPTION
+        r_create = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={"name": "test-revoke-inference", "subscription": designated},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_create.status_code in (200, 201), f"Failed to create key: {r_create.text}"
+        data = r_create.json()
+        key = data["key"]
+        key_id = data["id"]
+
+        # Verify key works first
+        key_headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        r_test = requests.post(
+            model_completions_url,
+            headers=key_headers,
+            json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+        # Key should work (200) or might fail for other reasons - we just need to test revocation
+        initial_status = r_test.status_code
+        print(f"[inference] Key before revoke: HTTP {initial_status}")
+
+        # Revoke the key
+        r_revoke = requests.delete(
+            f"{api_keys_base_url}/{key_id}",
+            headers=headers,
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_revoke.status_code == 200, f"Failed to revoke: {r_revoke.text}"
+        assert r_revoke.json().get("status") == "revoked"
+
+        # Wait for revocation to propagate
+        time.sleep(2)
+
+        # Try to use revoked key
+        r_revoked = requests.post(
+            model_completions_url,
+            headers=key_headers,
+            json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+
+        assert r_revoked.status_code == 403, f"Expected 403 for revoked key, got {r_revoked.status_code}: {r_revoked.text}"
+        print("[inference] Revoked key correctly rejected with 403")
+
+    def test_api_key_chat_completions(
+        self,
+        model_v1: str,
+        api_key_headers: dict,
+        inference_model_name: str,
+    ):
+        """Test 15: API key can access chat/completions endpoint (if supported)."""
+        chat_url = f"{model_v1}/chat/completions"
+
+        r = requests.post(
+            chat_url,
+            headers=api_key_headers,
+            json={
+                "model": inference_model_name,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 10,
+            },
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+
+        # Chat completions may not be supported by all models
+        if r.status_code == 404:
+            pytest.skip("Chat completions endpoint not available for this model")
+
+        if r.status_code == 200:
+            data = r.json()
+            assert "choices" in data
+            print(f"[inference] Chat completions succeeded: {data.get('model')}")
+        else:
+            # Some models may return different errors
+            print(f"[inference] Chat completions returned {r.status_code}: {r.text[:200]}")
+            # Don't fail - chat may not be supported
+            pytest.skip(f"Chat completions returned {r.status_code}")
+
+
+class TestAPIKeyRevocationE2E:
+    """End-to-end revocation tests: double revoke, nonexistent key, bulk revoke propagation, remint after revoke."""
+
+    def test_double_revoke_returns_404(self, api_keys_base_url: str, headers: dict):
+        """Revoking the same key twice should return 404 on the second attempt."""
+        # Create a key
+        r_create = requests.post(
+            api_keys_base_url, headers=headers, json={"name": "test-double-revoke"}, timeout=30, verify=TLS_VERIFY
+        )
+        assert r_create.status_code in (200, 201), f"Failed to create key: {r_create.text}"
+        key_id = r_create.json()["id"]
+
+        # First revoke succeeds
+        r1 = requests.delete(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r1.status_code == 200
+        assert r1.json().get("status") == "revoked"
+
+        # Second revoke returns 404 (key is no longer active)
+        r2 = requests.delete(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r2.status_code == 404, f"Expected 404 on double revoke, got {r2.status_code}: {r2.text}"
+        print(f"[revoke] Double revoke correctly returns 404 for key {key_id}")
+
+    def test_revoke_nonexistent_key_returns_404(self, api_keys_base_url: str, headers: dict):
+        """Revoking a key ID that doesn't exist should return 404."""
+        r = requests.delete(
+            f"{api_keys_base_url}/nonexistent-uuid-12345", headers=headers, timeout=30, verify=TLS_VERIFY
+        )
+        assert r.status_code == 404, f"Expected 404 for nonexistent key, got {r.status_code}: {r.text}"
+        print("[revoke] Nonexistent key correctly returns 404")
+
+    def test_revoke_then_create_new_key_works(
+        self,
+        api_keys_base_url: str,
+        model_completions_url: str,
+        headers: dict,
+        inference_model_name: str,
+    ):
+        """After revoking a key, a newly created key should still work for inference."""
+        designated = SIMULATOR_SUBSCRIPTION
+
+        # Create key A
+        r_a = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={"name": "test-revoke-remint-a", "subscription": designated},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_a.status_code in (200, 201), f"Failed to create key A: {r_a.text}"
+        key_a = r_a.json()["key"]
+        key_a_id = r_a.json()["id"]
+
+        # Revoke key A
+        r_revoke = requests.delete(f"{api_keys_base_url}/{key_a_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r_revoke.status_code == 200
+
+        # Create key B (new key after revocation)
+        r_b = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={"name": "test-revoke-remint-b", "subscription": designated},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_b.status_code in (200, 201), f"Failed to create key B: {r_b.text}"
+        key_b = r_b.json()["key"]
+
+        # Poll until revoked key A is rejected (revocation may take time to propagate)
+        max_wait = 30
+        poll_interval = 0.5
+        deadline = time.monotonic() + max_wait
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            r_a_inf = requests.post(
+                model_completions_url,
+                headers={"Authorization": f"Bearer {key_a}", "Content-Type": "application/json"},
+                json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+                timeout=min(remaining, 10),
+                verify=TLS_VERIFY,
+            )
+            if r_a_inf.status_code == 403:
+                break
+            time.sleep(poll_interval)
+        assert r_a_inf.status_code == 403, (
+            f"Revoked key A should be rejected within {max_wait}s, got {r_a_inf.status_code}"
+        )
+
+        # Key B should work (200)
+        r_b_inf = requests.post(
+            model_completions_url,
+            headers={"Authorization": f"Bearer {key_b}", "Content-Type": "application/json"},
+            json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+        assert r_b_inf.status_code == 200, f"New key B should work, got {r_b_inf.status_code}: {r_b_inf.text}"
+        print("[revoke] Revoked key A rejected, new key B works — remint after revoke succeeds")
+
+    def test_individual_revoke_multiple_keys(self, api_keys_base_url: str, headers: dict):
+        """Create multiple keys and revoke each individually — verifies per-key DELETE returns 200."""
+        designated = SIMULATOR_SUBSCRIPTION
+
+        # Create 3 keys to revoke
+        key_ids = []
+        for i in range(3):
+            r = requests.post(
+                api_keys_base_url,
+                headers=headers,
+                json={"name": f"test-bulk-api-{i}", "subscription": designated},
+                timeout=30,
+                verify=TLS_VERIFY,
+            )
+            assert r.status_code in (200, 201), f"Failed to create key {i}: {r.text}"
+            key_ids.append(r.json()["id"])
+
+        # Individually revoke them so we don't nuke the session key
+        for kid in key_ids:
+            r = requests.delete(f"{api_keys_base_url}/{kid}", headers=headers, timeout=30, verify=TLS_VERIFY)
+            assert r.status_code == 200, f"Failed to revoke key {kid}: {r.text}"
+
+        print(f"[bulk-revoke] Individually revoked {len(key_ids)} keys")
+
+    def test_revoke_keys_rejected_at_gateway(
+        self,
+        api_keys_base_url: str,
+        model_completions_url: str,
+        headers: dict,
+        inference_model_name: str,
+    ):
+        """After individually revoking keys, they should be rejected at the gateway."""
+        designated = SIMULATOR_SUBSCRIPTION
+
+        # Create 3 keys, capturing plaintext and IDs
+        keys = []
+        for i in range(3):
+            r = requests.post(
+                api_keys_base_url,
+                headers=headers,
+                json={"name": f"test-revoke-gw-{i}", "subscription": designated},
+                timeout=30,
+                verify=TLS_VERIFY,
+            )
+            assert r.status_code in (200, 201), f"Failed to create key {i}: {r.text}"
+            keys.append({"id": r.json()["id"], "key": r.json()["key"]})
+
+        # Smoke-test: verify at least one key works before revocation
+        r_smoke = requests.post(
+            model_completions_url,
+            headers={"Authorization": f"Bearer {keys[0]['key']}", "Content-Type": "application/json"},
+            json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+        assert r_smoke.status_code == 200, (
+            f"Key should work before revoke, got {r_smoke.status_code}: {r_smoke.text}"
+        )
+
+        # Individually revoke all 3 keys (not bulk-revoke, to avoid nuking session key)
+        for k in keys:
+            r = requests.delete(f"{api_keys_base_url}/{k['id']}", headers=headers, timeout=30, verify=TLS_VERIFY)
+            assert r.status_code == 200, f"Failed to revoke key {k['id']}: {r.text}"
+
+        # Poll until all revoked keys are rejected at the gateway
+        max_wait = 30
+        poll_interval = 0.5
+        for i, k in enumerate(keys):
+            deadline = time.monotonic() + max_wait
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                r_inf = requests.post(
+                    model_completions_url,
+                    headers={"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"},
+                    json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+                    timeout=min(remaining, 10),
+                    verify=TLS_VERIFY,
+                )
+                if r_inf.status_code == 403:
+                    break
+                time.sleep(poll_interval)
+            assert r_inf.status_code == 403, (
+                f"Key {i} should be rejected within {max_wait}s after revoke, got {r_inf.status_code}: {r_inf.text}"
+            )
+        print("[revoke] All 3 keys correctly rejected at gateway after individual revocation")
+
+
+class TestEphemeralKeyCleanup:
+    """Tests for ephemeral API key cleanup (CronJob + internal endpoint).
+
+    Validates that:
+    - Ephemeral keys can be created with short expiration
+    - The cleanup CronJob exists and is correctly configured
+    - Triggering cleanup does not delete active (non-expired) ephemeral keys
+    - Cleanup returns a well-formed response with deletedCount
+
+    The cleanup endpoint (POST /internal/v1/api-keys/cleanup) is cluster-internal
+    and not exposed on the public Route. These tests trigger it via the CronJob
+    mechanism (kubectl create job --from=cronjob/maas-api-key-cleanup) or via
+    oc exec into the maas-api pod.
+
+    Environment Variables:
+    - E2E_MAAS_API_DEPLOYMENT_NAMESPACE: Namespace where maas-api is deployed (default: derived INFRA_NAMESPACE)
+    """
+
+    @pytest.fixture
+    def deployment_namespace(self) -> str:
+        """Return the namespace where maas-api is deployed.
+
+        Controlled by E2E_MAAS_API_DEPLOYMENT_NAMESPACE env var,
+        defaults to the derived INFRA_NAMESPACE.
+        """
+        from test_helper import MAAS_API_DEPLOYMENT_NAMESPACE
+        return MAAS_API_DEPLOYMENT_NAMESPACE
+
+    def test_cronjob_exists_and_configured(self, deployment_namespace: str):
+        """Verify the maas-api-key-cleanup CronJob exists with expected configuration."""
+        import subprocess as sp
+
+        result = sp.run(
+            ["oc", "get", "cronjob", "maas-api-key-cleanup",
+             "-n", deployment_namespace, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(
+                f"CronJob maas-api-key-cleanup not found in {deployment_namespace}: "
+                f"{result.stderr.strip()}"
+            )
+
+        import json as _json
+        cj = _json.loads(result.stdout)
+        spec = cj["spec"]
+
+        # Verify schedule (every 15 minutes)
+        assert spec["schedule"] == "*/15 * * * *", \
+            f"Expected schedule '*/15 * * * *', got '{spec['schedule']}'"
+
+        # Verify concurrency policy
+        assert spec["concurrencyPolicy"] == "Forbid", \
+            "CronJob should use Forbid concurrency policy"
+
+        # Verify the curl command targets the internal cleanup endpoint
+        containers = spec["jobTemplate"]["spec"]["template"]["spec"]["containers"]
+        assert len(containers) >= 1
+        container_spec = containers[0]
+        # Command is in the 'command' field (shell script via /bin/sh -c)
+        cmd_parts = container_spec.get("command", [])
+        cmd_str = " ".join(cmd_parts)
+        assert "/internal/v1/api-keys/cleanup" in cmd_str, \
+            f"CronJob command should target cleanup endpoint, got: {cmd_str}"
+
+        # Verify security context (non-root, read-only fs)
+        sec_ctx = container_spec.get("securityContext", {})
+        assert sec_ctx.get("runAsNonRoot", False) is True, \
+            "Cleanup container should run as non-root"
+        assert sec_ctx.get("readOnlyRootFilesystem", False) is True, \
+            "Cleanup container should have read-only root filesystem"
+
+        print(f"[cleanup] CronJob validated: schedule={spec['schedule']}, "
+              f"concurrency={spec['concurrencyPolicy']}")
+
+    def test_cleanup_networkpolicy_exists(self, deployment_namespace: str):
+        """Verify the cleanup NetworkPolicy exists and restricts cleanup pod access."""
+        import subprocess as sp
+
+        result = sp.run(
+            ["oc", "get", "networkpolicy", "maas-api-cleanup-restrict",
+             "-n", deployment_namespace, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(
+                f"NetworkPolicy maas-api-cleanup-restrict not found in "
+                f"{deployment_namespace}: {result.stderr.strip()}"
+            )
+
+        import json as _json
+        np = _json.loads(result.stdout)
+        spec = np["spec"]
+
+        # Verify it targets cleanup pods
+        selector = spec.get("podSelector", {}).get("matchLabels", {})
+        assert selector.get("app") == "maas-api-cleanup", \
+            f"NetworkPolicy should target app=maas-api-cleanup, got: {selector}"
+
+        # Verify policy types include both Egress and Ingress
+        policy_types = spec.get("policyTypes", [])
+        assert "Egress" in policy_types, "NetworkPolicy should control egress"
+        assert "Ingress" in policy_types, "NetworkPolicy should control ingress"
+
+        # Verify ingress is blocked (empty list)
+        assert spec.get("ingress") == [] or spec.get("ingress") is None, \
+            "Cleanup pods should have no inbound traffic"
+
+        print("[cleanup] NetworkPolicy validated: cleanup pods restricted to maas-api egress only")
+
+    def test_create_ephemeral_key(self, api_keys_base_url: str, headers: dict):
+        """Create an ephemeral key and verify it appears in search with includeEphemeral."""
+        # Create ephemeral key with short expiration (30 minutes)
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "e2e-ephemeral-cleanup-test",
+                "ephemeral": True,
+                "expiresIn": "30m",
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), \
+            f"Expected 200/201 creating ephemeral key, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert data.get("ephemeral") is True, "Key should be marked as ephemeral"
+        key_id = data["id"]
+        print(f"[cleanup] Created ephemeral key: id={key_id}, expiresAt={data.get('expiresAt')}")
+
+        # Verify ephemeral key appears in search with includeEphemeral filter
+        r_search = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={
+                "filters": {"status": ["active"], "includeEphemeral": True},
+                "pagination": {"limit": 50, "offset": 0},
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_search.status_code == 200
+        items = r_search.json().get("items") or r_search.json().get("data") or []
+        found_ids = [item["id"] for item in items]
+        assert key_id in found_ids, \
+            f"Ephemeral key {key_id} should appear in search with includeEphemeral=true"
+
+        # Verify ephemeral key is excluded from default search (without includeEphemeral)
+        r_default = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={
+                "filters": {"status": ["active"]},
+                "pagination": {"limit": 50, "offset": 0},
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_default.status_code == 200
+        default_items = r_default.json().get("items") or r_default.json().get("data") or []
+        default_ids = [item["id"] for item in default_items]
+        assert key_id not in default_ids, \
+            "Ephemeral key should be excluded from default search (includeEphemeral defaults to false)"
+
+        print(f"[cleanup] Ephemeral key visibility verified: visible with filter, hidden by default")
+
+    def test_trigger_cleanup_preserves_active_keys(
+        self, api_keys_base_url: str, headers: dict, deployment_namespace: str,
+    ):
+        """Trigger cleanup and verify active ephemeral keys are NOT deleted.
+
+        Creates an ephemeral key, triggers cleanup via oc exec into maas-api pod,
+        and asserts the active key survives cleanup (only expired keys beyond the
+        30-minute grace period are deleted).
+        """
+        import subprocess as sp
+
+        # Create an ephemeral key with 1 hour expiration (won't expire during test)
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "e2e-cleanup-survival-test",
+                "ephemeral": True,
+                "expiresIn": "1h",
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), \
+            f"Expected 200/201, got {r.status_code}: {r.text}"
+        key_id = r.json()["id"]
+        print(f"[cleanup] Created ephemeral key for survival test: id={key_id}")
+
+        # Trigger cleanup via oc exec into maas-api pod
+        # This calls the internal endpoint directly, same as the CronJob does
+        get_pod = sp.run(
+            ["oc", "get", "pods", "-n", deployment_namespace,
+             "-l", "app.kubernetes.io/name=maas-api",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True, text=True,
+        )
+        if get_pod.returncode != 0 or not get_pod.stdout.strip():
+            pytest.skip(
+                f"Cannot find maas-api pod in {deployment_namespace}: "
+                f"{get_pod.stderr.strip()}"
+            )
+
+        pod_name = get_pod.stdout.strip()
+        print(f"[cleanup] Triggering cleanup via oc exec into {pod_name}")
+
+        cleanup_result = sp.run(
+            ["oc", "exec", pod_name, "-n", deployment_namespace, "--",
+             "curl", "-skf", "-X", "POST",
+             "https://localhost:8443/internal/v1/api-keys/cleanup"],
+            capture_output=True, text=True, timeout=30,
+        )
+
+        if cleanup_result.returncode != 0:
+            # curl may not be available in the maas-api container; try wget
+            cleanup_result = sp.run(
+                ["oc", "exec", pod_name, "-n", deployment_namespace, "--",
+                 "wget", "-q", "--no-check-certificate", "-O-", "--post-data=",
+                 "https://localhost:8443/internal/v1/api-keys/cleanup"],
+                capture_output=True, text=True, timeout=30,
+            )
+
+        if cleanup_result.returncode != 0:
+            pytest.skip(
+                f"Cannot exec into maas-api pod to trigger cleanup "
+                f"(neither curl nor wget available): {cleanup_result.stderr.strip()}"
+            )
+
+        import json as _json
+        cleanup_resp = _json.loads(cleanup_result.stdout)
+        deleted_count = cleanup_resp.get("deletedCount", -1)
+        assert deleted_count >= 0, \
+            f"Cleanup response should have non-negative deletedCount, got: {cleanup_resp}"
+        print(f"[cleanup] Cleanup completed: deletedCount={deleted_count}, "
+              f"message={cleanup_resp.get('message')}")
+
+        # Verify our active ephemeral key survived cleanup
+        r_get = requests.get(
+            f"{api_keys_base_url}/{key_id}",
+            headers=headers,
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_get.status_code == 200, \
+            f"Active ephemeral key {key_id} should survive cleanup, got {r_get.status_code}"
+        assert r_get.json().get("status") == "active", \
+            f"Key should still be active after cleanup, got: {r_get.json().get('status')}"
+        print(f"[cleanup] Active ephemeral key {key_id} survived cleanup (correct behavior)")
+
+
+class TestAPIKeySubscriptionPhases:
+    """
+    Test API key creation with subscriptions in different phases.
+
+    Tests verify that API keys can be created for any reconciled subscription
+    phase (Active, Degraded, Failed, Pending), but not for unreconciled subscriptions.
+
+    Note: Inference behavior is tested separately in test_subscription.py::TestDegradedSubscriptionFiltering
+    """
+
+    def test_create_key_for_active_subscription(self):
+        """API key creation succeeds for Active subscription."""
+        ns = _ns()
+        subscription_name = "e2e-apikey-active-sub"
+        auth_name = "e2e-apikey-active-auth"
+        sa_name = "e2e-apikey-active-sa"
+
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+
+            _create_test_auth_policy(auth_name, MODEL_REF, users=[sa_user])
+            _create_test_subscription(subscription_name, MODEL_REF, users=[sa_user])
+            _wait_for_maas_subscription_phase(subscription_name, namespace=ns)
+
+            cr = _get_cr("maassubscription", subscription_name, namespace=ns)
+            phase = cr.get("status", {}).get("phase")
+            assert phase == "Active", f"Expected Active, got {phase}"
+
+            # Create API key (should succeed)
+            api_key = _create_api_key(
+                oc_token,
+                name="active-sub-test",
+                subscription=subscription_name
+            )
+            assert api_key is not None and api_key.startswith("sk-"), \
+                f"Expected valid API key, got: {api_key[:20] if api_key else None}"
+            log.info("✅ API key created successfully for Active subscription")
+
+        finally:
+            _delete_cr("maassubscription", subscription_name, namespace=ns)
+            _delete_cr("maasauthpolicy", auth_name, namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _wait_for_cr_absent("maassubscription", subscription_name, namespace=ns)
+            _wait_for_cr_absent("maasauthpolicy", auth_name, namespace=ns)
+
+    def test_create_key_for_degraded_subscription(self):
+        """API key creation succeeds for Degraded subscription."""
+        ns = _ns()
+        subscription_name = "e2e-apikey-degraded-sub"
+        auth_name = "e2e-apikey-degraded-auth"
+        sa_name = "e2e-apikey-degraded-sa"
+        missing_model = "nonexistent-model-apikey"
+
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+
+            _create_test_auth_policy(auth_name, MODEL_REF, users=[sa_user])
+            # Create with valid + missing model to trigger Degraded phase
+            _create_test_subscription(
+                subscription_name,
+                [MODEL_REF, missing_model],
+                users=[sa_user]
+            )
+            _wait_for_maas_subscription_phase(subscription_name, expected_phase="Degraded", namespace=ns)
+
+            cr = _get_cr("maassubscription", subscription_name, namespace=ns)
+            phase = cr.get("status", {}).get("phase")
+            assert phase == "Degraded", f"Expected Degraded, got {phase}"
+
+            # Create API key (should succeed)
+            api_key = _create_api_key(
+                oc_token,
+                name="degraded-sub-test",
+                subscription=subscription_name
+            )
+            assert api_key is not None and api_key.startswith("sk-"), \
+                f"Expected valid API key, got: {api_key[:20] if api_key else None}"
+            log.info("✅ API key created successfully for Degraded subscription")
+
+        finally:
+            _delete_cr("maassubscription", subscription_name, namespace=ns)
+            _delete_cr("maasauthpolicy", auth_name, namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _wait_for_cr_absent("maassubscription", subscription_name, namespace=ns)
+            _wait_for_cr_absent("maasauthpolicy", auth_name, namespace=ns)
+
+    def test_create_key_for_failed_subscription(self):
+        """API key creation is rejected for Failed subscription to prevent key spam."""
+        ns = _ns()
+        subscription_name = "e2e-apikey-failed-sub"
+        auth_name = "e2e-apikey-failed-auth"
+        sa_name = "e2e-apikey-failed-sa"
+        nonexistent_model = "nonexistent-model-apikey-failed"
+
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+
+            _create_test_auth_policy(auth_name, MODEL_REF, users=[sa_user])
+            # Reference only a nonexistent model so the controller naturally
+            # computes Failed (all model refs invalid in deriveFinalPhase).
+            _create_test_subscription(subscription_name, nonexistent_model, users=[sa_user])
+            _wait_for_maas_subscription_phase(
+                subscription_name, expected_phase="Failed", namespace=ns
+            )
+
+            cr = _get_cr("maassubscription", subscription_name, namespace=ns)
+            phase = cr.get("status", {}).get("phase")
+            assert phase == "Failed", f"Expected Failed, got {phase}"
+
+            # Create API key (should be rejected for Failed subscriptions)
+            resp = _create_api_key_raw(
+                oc_token,
+                name="failed-sub-test",
+                subscription=subscription_name
+            )
+            assert resp.status_code == 403, \
+                f"Expected 403 Forbidden for Failed subscription, got {resp.status_code}: {resp.text}"
+            log.info("✅ API key creation rejected for Failed subscription (prevents key spam)")
+
+        finally:
+            _delete_cr("maassubscription", subscription_name, namespace=ns)
+            _delete_cr("maasauthpolicy", auth_name, namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _wait_for_cr_absent("maassubscription", subscription_name, namespace=ns)
+            _wait_for_cr_absent("maasauthpolicy", auth_name, namespace=ns)
+
+    @pytest.mark.serial
+    def test_create_key_for_pending_subscription(self):
+        """API key creation succeeds for Pending subscription."""
+        ns = _ns()
+        subscription_name = "e2e-apikey-pending-sub"
+        auth_name = "e2e-apikey-pending-auth"
+        sa_name = "e2e-apikey-pending-sa"
+
+        try:
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+
+            _create_test_auth_policy(auth_name, MODEL_REF, users=[sa_user])
+            _create_test_subscription(subscription_name, MODEL_REF, users=[sa_user])
+            _wait_for_maas_subscription_phase(subscription_name, namespace=ns)
+
+            # The controller never naturally produces Pending for
+            # subscriptions (deriveFinalPhase returns Active/Degraded/Failed),
+            # so a status patch is still necessary.  Scale the controller down
+            # first to eliminate the race that caused flakiness.
+            _scale_controller_down()
+
+            patch_data = {
+                "status": {
+                    "phase": "Pending",
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "Pending",
+                        "message": "Reconciliation in progress",
+                        "lastTransitionTime": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }],
+                }
+            }
+
+            cmd = [
+                "kubectl", "patch", "maassubscription", subscription_name,
+                "-n", ns, "--type=merge", "--subresource=status",
+                "-p", json.dumps(patch_data)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            assert result.returncode == 0, f"Failed to patch: {result.stderr}"
+
+            cr = _get_cr("maassubscription", subscription_name, namespace=ns)
+            phase = cr.get("status", {}).get("phase")
+            assert phase == "Pending", f"Expected Pending, got {phase}"
+
+            # Create API key (should succeed)
+            api_key = _create_api_key(
+                oc_token,
+                name="pending-sub-test",
+                subscription=subscription_name
+            )
+            assert api_key is not None and api_key.startswith("sk-"), \
+                f"Expected valid API key, got: {api_key[:20] if api_key else None}"
+            log.info("✅ API key created successfully for Pending subscription")
+
+        finally:
+            _delete_cr("maassubscription", subscription_name, namespace=ns)
+            _delete_cr("maasauthpolicy", auth_name, namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            try:
+                _scale_controller_up()
+            except Exception:
+                log.exception("Best-effort controller scale-up failed")
+            _wait_for_cr_absent("maassubscription", subscription_name, namespace=ns)
+            _wait_for_cr_absent("maasauthpolicy", auth_name, namespace=ns)
+
+    @pytest.mark.serial
+    def test_reject_key_for_unreconciled_subscription(self):
+        """
+        API key creation is rejected for unreconciled subscription (empty phase).
+
+        Note: Temporarily sets webhook failurePolicy to Ignore to allow creating
+        resources while controller is down, then restores to Fail.
+        """
+        ns = _ns()
+        subscription_name = "e2e-apikey-unreconciled-sub"
+        auth_name = "e2e-apikey-unreconciled-auth"
+        sa_name = "e2e-apikey-unreconciled-sa"
+        webhook_name = "maas-validating-webhook-configuration"
+
+        try:
+            # Create service account and get token
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+
+            # Temporarily set webhook failurePolicy to Ignore
+            # This allows creates to succeed when controller/webhook is unavailable
+            # Find webhook indices dynamically by name to avoid brittleness
+            result = subprocess.run(
+                ["oc", "get", "validatingwebhookconfiguration", webhook_name, "-o", "json"],
+                capture_output=True, text=True, check=True
+            )
+            webhook_config = json.loads(result.stdout)
+            patch_ops = []
+            for idx, webhook in enumerate(webhook_config.get("webhooks", [])):
+                if webhook.get("name") in ["vmaassubscription.kb.io", "vmaasauthpolicy.kb.io"]:
+                    patch_ops.append({"op": "replace", "path": f"/webhooks/{idx}/failurePolicy", "value": "Ignore"})
+
+            subprocess.run(
+                ["oc", "patch", "validatingwebhookconfiguration", webhook_name,
+                 "--type=json", "-p", json.dumps(patch_ops)],
+                capture_output=True, text=True, check=True
+            )
+
+            # Scale down controller to prevent reconciliation
+            _scale_controller_down()
+
+            # Create resources (webhook unavailable but Ignore policy allows creates)
+            _create_test_auth_policy(auth_name, MODEL_REF, users=[sa_user])
+            _create_test_subscription(subscription_name, MODEL_REF, users=[sa_user])
+
+            # Verify subscription is unreconciled (empty phase)
+            cr = _get_cr("maassubscription", subscription_name, namespace=ns)
+            phase = cr.get("status", {}).get("phase", "")
+            assert phase == "", f"Expected empty phase, got: {phase}"
+            log.info("✅ Subscription is unreconciled (empty phase)")
+
+            # Try to create API key (should fail with 400)
+            response = requests.post(
+                f"{_maas_api_url()}/v1/api-keys",
+                headers={
+                    "Authorization": f"Bearer {oc_token}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "name": "unreconciled-sub-test",
+                    "subscription": subscription_name
+                },
+                timeout=TIMEOUT,
+                verify=TLS_VERIFY,
+            )
+
+            assert response.status_code == 400, \
+                f"Expected 400 for unreconciled subscription, got {response.status_code}: {response.text}"
+            response_data = response.json()
+            assert "code" in response_data and response_data["code"] == "subscription_not_ready", \
+                f"Expected subscription_not_ready error code, got: {response_data}"
+            log.info("✅ API key creation rejected for unreconciled subscription")
+
+        finally:
+            # Restore webhook failurePolicy to Fail
+            # Wrap in try/except to guarantee controller scale-up and cleanup happen
+            webhook_restore_error = None
+            try:
+                result = subprocess.run(
+                    ["oc", "get", "validatingwebhookconfiguration", webhook_name, "-o", "json"],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to get webhook configuration {webhook_name} for restoration: {result.stderr}"
+                    )
+
+                webhook_config = json.loads(result.stdout)
+                patch_ops = []
+                for idx, webhook in enumerate(webhook_config.get("webhooks", [])):
+                    if webhook.get("name") in ["vmaassubscription.kb.io", "vmaasauthpolicy.kb.io"]:
+                        patch_ops.append({"op": "replace", "path": f"/webhooks/{idx}/failurePolicy", "value": "Fail"})
+
+                if not patch_ops:
+                    raise RuntimeError(
+                        f"No matching webhooks found to restore in {webhook_name}. "
+                        f"Expected vmaassubscription.kb.io and vmaasauthpolicy.kb.io. "
+                        f"Found: {[w.get('name') for w in webhook_config.get('webhooks', [])]}"
+                    )
+
+                restore_result = subprocess.run(
+                    ["oc", "patch", "validatingwebhookconfiguration", webhook_name,
+                     "--type=json", "-p", json.dumps(patch_ops)],
+                    capture_output=True, text=True
+                )
+                if restore_result.returncode != 0:
+                    raise RuntimeError(
+                        f"Webhook left in Ignore state! Failed to restore webhook {webhook_name} "
+                        f"with patch_ops {patch_ops}: {restore_result.stderr}"
+                    )
+            except Exception as e:
+                webhook_restore_error = e
+                log.error(f"Exception during webhook restoration: {e}")
+
+            # Always scale controller back up and cleanup, even if webhook restore failed
+            _scale_controller_up()
+
+            _delete_cr("maassubscription", subscription_name, namespace=ns)
+            _delete_cr("maasauthpolicy", auth_name, namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            _wait_for_cr_absent("maassubscription", subscription_name, namespace=ns)
+            _wait_for_cr_absent("maasauthpolicy", auth_name, namespace=ns)
+
+            # Only raise webhook restore error after cleanup is complete
+            if webhook_restore_error:
+                raise webhook_restore_error
+
+
+class TestAPIKeySubscriptionFilter:
+    """Tests for POST /api-keys/search subscription filter.
+
+    Verifies that the subscription filter scopes search results to keys
+    bound to a specific subscription, and that omitting it returns all keys.
+    """
+
+    def test_search_filters_by_subscription(self, api_keys_base_url: str, headers: dict):
+        """Search with subscription filter returns only keys bound to that subscription."""
+        sub_a = f"e2e-filter-sub-a-{os.urandom(4).hex()}"
+        sub_b = f"e2e-filter-sub-b-{os.urandom(4).hex()}"
+        ns = _ns()
+        sa_name = f"e2e-filter-sa-{os.urandom(4).hex()}"
+
+        key_ids_a = []
+        key_ids_b = []
+        try:
+            # Create one SA authorized for both subscriptions so that
+            # exclusion in search results is attributable to the subscription
+            # filter, not user-scoping.
+            oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
+            sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
+            sa_headers = {"Authorization": f"Bearer {oc_token}", "Content-Type": "application/json"}
+
+            _create_test_auth_policy(f"{sub_a}-auth", MODEL_REF, users=[sa_user])
+            _create_test_subscription(sub_a, MODEL_REF, users=[sa_user])
+            _wait_for_maas_subscription_phase(sub_a, namespace=ns)
+
+            _create_test_auth_policy(f"{sub_b}-auth", MODEL_REF, users=[sa_user])
+            _create_test_subscription(sub_b, MODEL_REF, users=[sa_user])
+            _wait_for_maas_subscription_phase(sub_b, namespace=ns)
+
+            # Create 2 keys bound to sub_a
+            for i in range(2):
+                r = _request_with_gateway_retry(
+                    requests.post,
+                    api_keys_base_url,
+                    headers=sa_headers,
+                    json={"name": f"e2e-filter-a-{i}", "subscription": sub_a},
+                    timeout=TIMEOUT,
+                    verify=TLS_VERIFY,
+                )
+                assert r.status_code in (200, 201), f"Failed to create key for {sub_a}: {r.text}"
+                key_ids_a.append(r.json()["id"])
+
+            # Create 1 key bound to sub_b
+            r_b = _request_with_gateway_retry(
+                requests.post,
+                api_keys_base_url,
+                headers=sa_headers,
+                json={"name": "e2e-filter-b-0", "subscription": sub_b},
+                timeout=TIMEOUT,
+                verify=TLS_VERIFY,
+            )
+            assert r_b.status_code in (200, 201), f"Failed to create key for {sub_b}: {r_b.text}"
+            key_ids_b.append(r_b.json()["id"])
+
+            # Search with subscription filter for sub_b — same principal
+            r_search = requests.post(
+                f"{api_keys_base_url}/search",
+                headers=sa_headers,
+                json={
+                    "filters": {"status": ["active"], "subscription": sub_b},
+                    "pagination": {"limit": 50, "offset": 0},
+                },
+                timeout=TIMEOUT,
+                verify=TLS_VERIFY,
+            )
+            assert r_search.status_code == 200, f"Search failed: {r_search.status_code} {r_search.text}"
+            items = r_search.json().get("items") or r_search.json().get("data") or []
+            result_ids = [item["id"] for item in items]
+
+            # sub_b key should be present
+            for kid in key_ids_b:
+                assert kid in result_ids, (
+                    f"Key {kid} (subscription={sub_b}) should appear in filtered results"
+                )
+
+            # sub_a keys should NOT be present — since the same user owns
+            # both, exclusion proves the subscription filter works.
+            for kid in key_ids_a:
+                assert kid not in result_ids, (
+                    f"Key {kid} (subscription={sub_a}) should NOT appear when filtering by {sub_b}"
+                )
+
+            log.info("subscription filter correctly scoped search results")
+
+        finally:
+            for kid in key_ids_a + key_ids_b:
+                requests.delete(f"{api_keys_base_url}/{kid}", headers=sa_headers, timeout=TIMEOUT, verify=TLS_VERIFY)
+            _delete_cr("maassubscription", sub_b, namespace=ns)
+            _delete_cr("maasauthpolicy", f"{sub_b}-auth", namespace=ns)
+            _delete_cr("maassubscription", sub_a, namespace=ns)
+            _delete_cr("maasauthpolicy", f"{sub_a}-auth", namespace=ns)
+            _delete_sa(sa_name, namespace=MODEL_NAMESPACE)
+            # Deleting MaaSAuthPolicies rewrites maas-gateway-auth; wait until
+            # Kuadrant reports Enforced again before the next test hits maas-api.
+            _wait_for_gateway_auth_enforced()
+
+    def test_search_without_subscription_returns_all(self, api_keys_base_url: str, headers: dict):
+        """Search without subscription filter returns keys across all subscriptions."""
+        # Prior tests may have just mutated MaaSAuthPolicies; ensure gateway auth
+        # is Enforced before minting keys (avoids empty 403 flakes).
+        _wait_for_gateway_auth_enforced()
+        key_ids = []
+        try:
+            # Create keys with explicit subscription binding
+            for i in range(2):
+                r = _request_with_gateway_retry(
+                    requests.post,
+                    api_keys_base_url,
+                    headers=headers,
+                    json={"name": f"e2e-nofilter-{i}", "subscription": SIMULATOR_SUBSCRIPTION},
+                    timeout=TIMEOUT,
+                    verify=TLS_VERIFY,
+                )
+                assert r.status_code in (200, 201), (
+                    f"Failed to create key: {r.status_code} "
+                    f"{r.text.strip() or '(empty body — gateway AuthPolicy not ready)'}"
+                )
+                key_ids.append(r.json()["id"])
+
+            # Search without subscription filter
+            r_search = _request_with_gateway_retry(
+                requests.post,
+                f"{api_keys_base_url}/search",
+                headers=headers,
+                json={
+                    "filters": {"status": ["active"]},
+                    "pagination": {"limit": 50, "offset": 0},
+                },
+                timeout=TIMEOUT,
+                verify=TLS_VERIFY,
+            )
+            assert r_search.status_code == 200, (
+                f"Search failed: {r_search.status_code} "
+                f"{r_search.text.strip() or '(empty body — gateway AuthPolicy not ready)'}"
+            )
+            items = r_search.json().get("items") or r_search.json().get("data") or []
+            result_ids = [item["id"] for item in items]
+
+            for kid in key_ids:
+                assert kid in result_ids, (
+                    f"Key {kid} should appear in unfiltered search results"
+                )
+
+            log.info("unfiltered search returns all keys (no regression)")
+
+        finally:
+            for kid in key_ids:
+                requests.delete(f"{api_keys_base_url}/{kid}", headers=headers, timeout=TIMEOUT, verify=TLS_VERIFY)
+
+
+class TestAPIKeyLabels:
+    """Tests for API key label creation, search, validation, and backward compatibility."""
+
+    def test_create_api_key_with_labels(self, api_keys_base_url: str, headers: dict):
+        """Create an API key with labels and verify they're returned and persisted."""
+        labels = {
+            "cmdb_id": "AST123456",
+            "cost_center": "CC-DATA-001",
+            "environment": "production",
+            "project_code": "PROJ-ML-2024",
+        }
+
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "e2e-label-create",
+                "description": "E2E label round-trip test",
+                "labels": labels,
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), f"Expected 200/201, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert "key" in data and "id" in data
+        assert data.get("labels") == labels, "Labels in create response don't match request"
+
+        r_get = requests.get(
+            f"{api_keys_base_url}/{data['id']}",
+            headers=headers,
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_get.status_code == 200
+        assert r_get.json().get("labels") == labels, "Labels from GET don't match original"
+
+    def test_search_api_keys_by_labels(self, api_keys_base_url: str, headers: dict):
+        """Create keys with different labels and verify search filtering."""
+        labels1 = {"cmdb_id": "AST111", "env": "prod"}
+        labels2 = {"cmdb_id": "AST222", "env": "dev"}
+        labels3 = {"cost_center": "CC-999"}
+
+        r1 = requests.post(api_keys_base_url, headers=headers,
+                           json={"name": "e2e-label-search-1", "labels": labels1},
+                           timeout=30, verify=TLS_VERIFY)
+        assert r1.status_code in (200, 201)
+        key1_id = r1.json()["id"]
+
+        r2 = requests.post(api_keys_base_url, headers=headers,
+                           json={"name": "e2e-label-search-2", "labels": labels2},
+                           timeout=30, verify=TLS_VERIFY)
+        assert r2.status_code in (200, 201)
+        key2_id = r2.json()["id"]
+
+        r3 = requests.post(api_keys_base_url, headers=headers,
+                           json={"name": "e2e-label-search-3", "labels": labels3},
+                           timeout=30, verify=TLS_VERIFY)
+        assert r3.status_code in (200, 201)
+
+        # Search by CMDB ID — should find key1 only
+        r_search = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={"filters": {"labelsContain": {"cmdb_id": "AST111"}}},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_search.status_code == 200
+        items = r_search.json().get("items") or r_search.json().get("data") or []
+        found_ids = [k["id"] for k in items]
+        assert key1_id in found_ids, "Should find key with cmdb_id AST111"
+
+        found_key = next(k for k in items if k["id"] == key1_id)
+        assert found_key["labels"]["cmdb_id"] == "AST111"
+
+        # Search by env=prod — should find key1, not key2
+        r_search = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={"filters": {"labelsContain": {"env": "prod"}}},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_search.status_code == 200
+        items = r_search.json().get("items") or r_search.json().get("data") or []
+        found_ids = [k["id"] for k in items]
+        assert key1_id in found_ids
+        assert key2_id not in found_ids, "Should not find dev key when searching for prod"
+
+    def test_labels_validation_errors(self, api_keys_base_url: str, headers: dict):
+        """Verify invalid labels are rejected with 400 and clear error messages."""
+        # Too many labels (>50)
+        large_labels = {f"key{i}": f"value{i}" for i in range(51)}
+        r = requests.post(api_keys_base_url, headers=headers,
+                          json={"name": "e2e-label-too-many", "labels": large_labels},
+                          timeout=30, verify=TLS_VERIFY)
+        assert r.status_code == 400
+        assert "50" in r.json().get("error", "")
+
+        # Key too long (>128 chars)
+        r = requests.post(api_keys_base_url, headers=headers,
+                          json={"name": "e2e-label-long-key", "labels": {"a" * 129: "value"}},
+                          timeout=30, verify=TLS_VERIFY)
+        assert r.status_code == 400
+        assert "128" in r.json().get("error", "")
+
+        # Invalid characters in key
+        r = requests.post(api_keys_base_url, headers=headers,
+                          json={"name": "e2e-label-bad-chars", "labels": {"invalid key!": "value"}},
+                          timeout=30, verify=TLS_VERIFY)
+        assert r.status_code == 400
+
+    def test_backward_compatibility_no_labels(self, api_keys_base_url: str, headers: dict):
+        """Keys created without labels still work (backward compatibility)."""
+        r = requests.post(api_keys_base_url, headers=headers,
+                          json={"name": "e2e-label-none", "description": "No labels"},
+                          timeout=30, verify=TLS_VERIFY)
+        assert r.status_code in (200, 201)
+        data = r.json()
+        key_id = data["id"]
+        assert data.get("labels") is None or data.get("labels") == {}
+
+        r_get = requests.get(f"{api_keys_base_url}/{key_id}", headers=headers,
+                             timeout=30, verify=TLS_VERIFY)
+        assert r_get.status_code == 200
+        assert r_get.json().get("labels") is None or r_get.json().get("labels") == {}

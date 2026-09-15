@@ -1,0 +1,2093 @@
+#!/bin/bash
+
+# Deployment Helper Functions
+# This file contains reusable helper functions for MaaS platform deployment scripts
+
+# ============================================================================
+# JWT Decoding Functions
+# ============================================================================
+
+# _base64_decode
+#   Cross-platform base64 decode wrapper.
+#   Linux uses 'base64 -d', macOS (BSD) uses 'base64 -D'.
+#   Reads from stdin and writes decoded output to stdout.
+_base64_decode() {
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    base64 -D 2>/dev/null
+  else
+    base64 -d 2>/dev/null
+  fi
+}
+
+# decode_jwt_payload <jwt_token>
+#   Decodes the payload (second part) of a JWT token.
+#   Handles base64url to standard base64 conversion and padding.
+#   Returns the decoded JSON payload.
+#   Works on both Linux and macOS.
+#
+# Usage:
+#   PAYLOAD=$(decode_jwt_payload "$TOKEN")
+#   echo "$PAYLOAD" | jq -r '.sub'
+#
+# Example:
+#   TOKEN="<header>.<payload>.<signature>"  # Your JWT token
+#   decode_jwt_payload "$TOKEN"  # Returns decoded JSON payload
+decode_jwt_payload() {
+  local jwt_token="$1"
+
+  if [ -z "$jwt_token" ]; then
+    echo ""
+    return 1
+  fi
+
+  # Extract the payload (second part of JWT, separated by dots)
+  local payload_b64url
+  payload_b64url=$(echo "$jwt_token" | cut -d. -f2)
+
+  if [ -z "$payload_b64url" ]; then
+    echo ""
+    return 1
+  fi
+
+  # Convert base64url to standard base64:
+  # - Replace '-' with '+' and '_' with '/'
+  # - Add padding (base64 must be multiple of 4 chars)
+  local payload_b64
+  payload_b64=$(echo "$payload_b64url" | tr '_-' '/+' | awk '{while(length($0)%4)$0=$0"=";print}')
+
+  # Decode base64 to JSON (cross-platform)
+  echo "$payload_b64" | _base64_decode
+}
+
+# get_jwt_claim <jwt_token> <claim_name>
+#   Extracts a specific claim from a JWT token payload.
+#   Returns the claim value or empty string if not found.
+#
+# Usage:
+#   SUB=$(get_jwt_claim "$TOKEN" "sub")
+#   AUD=$(get_jwt_claim "$TOKEN" "aud[0]")
+#
+# Example:
+#   get_jwt_claim "$TOKEN" "sub"  # Returns: system:serviceaccount:...
+get_jwt_claim() {
+  local jwt_token="$1"
+  local claim="$2"
+
+  local payload
+  payload=$(decode_jwt_payload "$jwt_token")
+
+  if [ -z "$payload" ]; then
+    echo ""
+    return 1
+  fi
+
+  echo "$payload" | jq -r ".$claim // empty" 2>/dev/null
+}
+
+# get_cluster_audience
+#   Retrieves the default audience from the current Kubernetes cluster.
+#   Creates a temporary token and extracts the audience claim.
+#
+# Usage:
+#   AUD=$(get_cluster_audience)
+#   echo "Cluster audience: $AUD"
+get_cluster_audience() {
+  local temp_token
+  temp_token=$(kubectl create token default --duration=10m 2>/dev/null)
+
+  if [ -z "$temp_token" ]; then
+    echo ""
+    return 1
+  fi
+
+  get_jwt_claim "$temp_token" "aud[0]"
+}
+
+# ============================================================================
+# Constants and Configuration
+# ============================================================================
+
+# Timeout values (seconds) - can be overridden via environment variables
+# These provide sensible defaults but allow customization for slow/fast clusters
+readonly CUSTOM_RESOURCE_TIMEOUT="${CUSTOM_RESOURCE_TIMEOUT:-600}"  # DataScienceCluster wait
+readonly NAMESPACE_TIMEOUT="${NAMESPACE_TIMEOUT:-300}"              # Namespace creation/ready
+readonly RESOURCE_TIMEOUT="${RESOURCE_TIMEOUT:-300}"                # Generic resource wait
+readonly CRD_TIMEOUT="${CRD_TIMEOUT:-180}"                          # CRD establishment
+readonly CSV_TIMEOUT="${CSV_TIMEOUT:-180}"                          # CSV installation
+readonly SUBSCRIPTION_TIMEOUT="${SUBSCRIPTION_TIMEOUT:-300}"        # Subscription install
+readonly POD_TIMEOUT="${POD_TIMEOUT:-120}"                          # Pod ready wait
+readonly WEBHOOK_TIMEOUT="${WEBHOOK_TIMEOUT:-60}"                   # Webhook ready
+readonly CUSTOM_CHECK_TIMEOUT="${CUSTOM_CHECK_TIMEOUT:-120}"        # Generic check
+readonly AUTHORINO_TIMEOUT="${AUTHORINO_TIMEOUT:-120}"              # Authorino ready
+readonly ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-120}"                  # kubectl rollout status
+readonly KUBECONFIG_WAIT_TIMEOUT="${KUBECONFIG_WAIT_TIMEOUT:-60}"   # Kubeconfig operations
+readonly CATALOGSOURCE_TIMEOUT="${CATALOGSOURCE_TIMEOUT:-120}"      # CatalogSource ready
+readonly LLMIS_TIMEOUT="${LLMIS_TIMEOUT:-300}"                      # LLMInferenceService ready
+readonly MAASMODELREF_TIMEOUT="${MAASMODELREF_TIMEOUT:-300}"        # MaaSModelRef ready
+readonly AUTHPOLICY_TIMEOUT="${AUTHPOLICY_TIMEOUT:-180}"            # AuthPolicy enforced
+
+# Validate timeout values - must be positive integers within a sane range
+readonly _MAX_TIMEOUT=86400  # 24 hours - upper bound to catch misconfigurations
+_validate_timeout() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || [[ "$value" -le 0 ]]; then
+    echo "ERROR: Invalid timeout value for $name: '$value'" >&2
+    echo "       Timeout values must be positive integers (seconds)" >&2
+    echo "       Example: export $name=300" >&2
+    exit 1
+  fi
+  if [[ "$value" -gt $_MAX_TIMEOUT ]]; then
+    echo "ERROR: Timeout value for $name exceeds maximum (${value}s > ${_MAX_TIMEOUT}s)" >&2
+    echo "       Maximum allowed timeout is ${_MAX_TIMEOUT}s (24 hours)" >&2
+    exit 1
+  fi
+}
+
+_validate_timeout "CUSTOM_RESOURCE_TIMEOUT" "$CUSTOM_RESOURCE_TIMEOUT"
+_validate_timeout "NAMESPACE_TIMEOUT" "$NAMESPACE_TIMEOUT"
+_validate_timeout "RESOURCE_TIMEOUT" "$RESOURCE_TIMEOUT"
+_validate_timeout "CRD_TIMEOUT" "$CRD_TIMEOUT"
+_validate_timeout "CSV_TIMEOUT" "$CSV_TIMEOUT"
+_validate_timeout "SUBSCRIPTION_TIMEOUT" "$SUBSCRIPTION_TIMEOUT"
+_validate_timeout "POD_TIMEOUT" "$POD_TIMEOUT"
+_validate_timeout "WEBHOOK_TIMEOUT" "$WEBHOOK_TIMEOUT"
+_validate_timeout "CUSTOM_CHECK_TIMEOUT" "$CUSTOM_CHECK_TIMEOUT"
+_validate_timeout "AUTHORINO_TIMEOUT" "$AUTHORINO_TIMEOUT"
+_validate_timeout "ROLLOUT_TIMEOUT" "$ROLLOUT_TIMEOUT"
+_validate_timeout "KUBECONFIG_WAIT_TIMEOUT" "$KUBECONFIG_WAIT_TIMEOUT"
+_validate_timeout "CATALOGSOURCE_TIMEOUT" "$CATALOGSOURCE_TIMEOUT"
+_validate_timeout "LLMIS_TIMEOUT" "$LLMIS_TIMEOUT"
+_validate_timeout "MAASMODELREF_TIMEOUT" "$MAASMODELREF_TIMEOUT"
+_validate_timeout "AUTHPOLICY_TIMEOUT" "$AUTHPOLICY_TIMEOUT"
+
+# Logging levels
+readonly LOG_LEVEL_DEBUG=0
+readonly LOG_LEVEL_INFO=1
+readonly LOG_LEVEL_WARN=2
+readonly LOG_LEVEL_ERROR=3
+
+# Current log level - honor LOG_LEVEL env var if set
+# This allows standalone usage of helpers with LOG_LEVEL=DEBUG ./script.sh
+case "${LOG_LEVEL:-}" in
+  DEBUG)
+    CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG
+    ;;
+  WARN)
+    CURRENT_LOG_LEVEL=$LOG_LEVEL_WARN
+    ;;
+  ERROR)
+    CURRENT_LOG_LEVEL=$LOG_LEVEL_ERROR
+    ;;
+  *)
+    # Default to INFO (includes unset LOG_LEVEL and LOG_LEVEL=INFO)
+    CURRENT_LOG_LEVEL=$LOG_LEVEL_INFO
+    ;;
+esac
+
+# ============================================================================
+# Version Management
+# ============================================================================
+
+# Minimum version requirements for operators
+export KUADRANT_MIN_VERSION="1.3.1"
+export AUTHORINO_MIN_VERSION="0.22.0"
+export LIMITADOR_MIN_VERSION="0.16.0"
+export DNS_OPERATOR_MIN_VERSION="0.15.0"
+
+# resolve_policy_engine_namespace returns the namespace where RHCL/Kuadrant workloads run.
+# Optional argument: policy engine name (rhcl|kuadrant). Defaults to POLICY_ENGINE env or auto-detect.
+resolve_policy_engine_namespace() {
+  local policy_engine="${1:-${POLICY_ENGINE:-}}"
+  local default_ns="${RHCL_NAMESPACE:-kuadrant-system}"
+  if [[ -z "$policy_engine" ]]; then
+    if kubectl get ns kuadrant-system &>/dev/null \
+      && kubectl get deploy authorino -n kuadrant-system &>/dev/null 2>&1; then
+      echo "kuadrant-system"
+      return
+    fi
+    if kubectl get ns rh-connectivity-link &>/dev/null \
+      && kubectl get deploy authorino -n rh-connectivity-link &>/dev/null 2>&1; then
+      echo "rh-connectivity-link"
+      return
+    fi
+    echo "$default_ns"
+    return
+  fi
+  case "$policy_engine" in
+    rhcl|kuadrant) echo "$default_ns" ;;
+    *)
+      log_warn "Unknown policy engine '$policy_engine', defaulting to $default_ns"
+      echo "$default_ns"
+      ;;
+  esac
+}
+
+# resolve_authorino_namespace returns the namespace where Authorino runs.
+resolve_authorino_namespace() {
+  resolve_policy_engine_namespace "$@"
+}
+
+# wait_for_gateway_programmed polls until a Gateway reaches Programmed=True.
+wait_for_gateway_programmed() {
+  local gateway_name="${1:?gateway name required}"
+  local gateway_ns="${2:-openshift-ingress}"
+  local timeout="${3:-600}"
+
+  echo "Waiting for Gateway ${gateway_ns}/${gateway_name} to be Programmed=True (timeout: ${timeout}s)..."
+
+  if oc wait "gateway/${gateway_name}" -n "${gateway_ns}" --for=condition=Programmed --timeout="${timeout}s"; then
+    echo "✅ Gateway ${gateway_ns}/${gateway_name} is Programmed"
+    return 0
+  fi
+
+  echo "❌ ERROR: Gateway ${gateway_ns}/${gateway_name} did not reach Programmed=True within ${timeout}s"
+  oc get "gateway/${gateway_name}" -n "${gateway_ns}" -o wide || true
+  oc describe "gateway/${gateway_name}" -n "${gateway_ns}" || true
+  return 1
+}
+
+# ==========================================
+# Logging Functions
+# ==========================================
+
+log_debug() {
+  [[ ${CURRENT_LOG_LEVEL:-1} -le $LOG_LEVEL_DEBUG ]] || return 0
+  echo "[DEBUG] $*"
+}
+
+log_info() {
+  [[ ${CURRENT_LOG_LEVEL:-1} -le $LOG_LEVEL_INFO ]] || return 0
+  echo "[INFO] $*"
+}
+
+log_warn() {
+  [[ ${CURRENT_LOG_LEVEL:-1} -le $LOG_LEVEL_WARN ]] || return 0
+  echo "[WARN] $*" >&2
+}
+
+log_error() {
+  [[ ${CURRENT_LOG_LEVEL:-1} -le $LOG_LEVEL_ERROR ]] || return 0
+  echo "[ERROR] $*" >&2
+}
+
+# ==========================================
+# OLM Subscription and CSV Helper Functions
+# ==========================================
+
+# Patch one env var on spec.install.spec.deployments[0].containers[0] of a ClusterServiceVersion.
+# Returns 0 if a patch was applied, 1 if the value was already correct, 2 if patch failed.
+patch_csv_operator_container_env() {
+  local namespace=$1
+  local csv_name=$2
+  local env_name=$3
+  local env_value=$4
+
+  local current
+  current=$(kubectl get csv "$csv_name" -n "$namespace" -o jsonpath="{.spec.install.spec.deployments[0].spec.template.spec.containers[0].env[?(@.name==\"${env_name}\")].value}" 2>/dev/null || echo "")
+
+  if [[ "$current" == "$env_value" ]]; then
+    return 1
+  fi
+
+  local env_index
+  env_index=$(kubectl get csv "$csv_name" -n "$namespace" -o json | jq -r --arg n "$env_name" '.spec.install.spec.deployments[0].spec.template.spec.containers[0].env | to_entries[] | select(.value.name == $n) | .key' 2>/dev/null | head -1)
+
+  if [[ -z "$env_index" ]]; then
+    log_debug "Adding ${env_name} to CSV ${csv_name}"
+    kubectl patch csv "$csv_name" -n "$namespace" --type='json' -p="[
+      {
+        \"op\": \"add\",
+        \"path\": \"/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/-\",
+        \"value\": {
+          \"name\": \"${env_name}\",
+          \"value\": \"${env_value}\"
+        }
+      }
+    ]" 2>/dev/null || {
+      log_warn "Failed to add ${env_name} to CSV"
+      return 2
+    }
+  else
+    log_debug "Updating ${env_name} in CSV ${csv_name} (index: $env_index)"
+    kubectl patch csv "$csv_name" -n "$namespace" --type='json' -p="[
+      {
+        \"op\": \"replace\",
+        \"path\": \"/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/${env_index}/value\",
+        \"value\": \"${env_value}\"
+      }
+    ]" 2>/dev/null || {
+      log_warn "Failed to update ${env_name} in CSV"
+      return 2
+    }
+  fi
+  return 0
+}
+
+# Patch one or more RELATED_IMAGE_* env vars on an operator's CSV and force-restart it so
+# the new values take effect (operators read their own env vars once, at process startup).
+# Used to override sub-component images (e.g. ai-gateway-operator, maas-controller, maas-api)
+# that the ODH operator's module/component reconcilers read from their own container env.
+#
+# Arguments: <namespace> <csv_name_prefix> <NAME=VALUE> [<NAME=VALUE> ...]
+# Entries with an empty VALUE are skipped (so callers can pass through unset overrides safely).
+patch_operator_related_images() {
+  local namespace=$1
+  local operator_prefix=$2
+  shift 2
+
+  local pairs=("$@")
+  [[ ${#pairs[@]} -eq 0 ]] && return 0
+
+  local has_value=false
+  local pair
+  for pair in "${pairs[@]}"; do
+    [[ -n "${pair#*=}" ]] && has_value=true
+  done
+  [[ "$has_value" == "true" ]] || return 0
+
+  local csv_name
+  csv_name=$(kubectl get csv -n "$namespace" --no-headers 2>/dev/null | grep "^${operator_prefix}" | awk '{print $1}' | head -1)
+  if [[ -z "$csv_name" ]]; then
+    log_warn "Could not find CSV for $operator_prefix in $namespace, skipping RELATED_IMAGE patch"
+    return 0
+  fi
+
+  local patched_any=false
+  local pair name value
+  for pair in "${pairs[@]}"; do
+    name="${pair%%=*}"
+    value="${pair#*=}"
+    [[ -z "$value" ]] && continue
+    log_info "Setting ${name}=${value} on ${csv_name}..."
+    patch_csv_operator_container_env "$namespace" "$csv_name" "$name" "$value" && patched_any=true
+  done
+
+  if [[ "$patched_any" != "true" ]]; then
+    log_debug "CSV $csv_name already has the requested RELATED_IMAGE values"
+    return 0
+  fi
+
+  log_info "Restarting $operator_prefix operator to pick up RELATED_IMAGE changes..."
+  kubectl delete pod -n "$namespace" -l control-plane=controller-manager --force --grace-period=0 2>/dev/null || true
+}
+
+# Patch Kuadrant/RHCL CSV to recognize OpenShift Gateway controller
+# This is required because Kuadrant needs to know about the Gateway API provider
+# Without this patch, Kuadrant shows "MissingDependency" and AuthPolicies won't be enforced
+#
+# Also sets RATELIMIT_*_SERVICE_FAILURE_MODE=deny so policy fails closed when Limitador
+# service is unavailable (see Kuadrant operator deployment env).
+#
+# Arguments: <namespace> <csv_name_prefix>  e.g. patch_kuadrant_csv "kuadrant-system" "kuadrant-operator"
+patch_kuadrant_csv() {
+  local namespace=$1
+  local operator_prefix=$2
+
+  log_info "Patching $operator_prefix CSV (Gateway API, rate limit failure modes, auth service timeout)..."
+
+  # Find the CSV
+  local csv_name
+  csv_name=$(kubectl get csv -n "$namespace" --no-headers 2>/dev/null | grep "^${operator_prefix}" | awk '{print $1}' | head -1)
+
+  if [[ -z "$csv_name" ]]; then
+    log_warn "Could not find CSV for $operator_prefix in $namespace, skipping Gateway controller patch"
+    return 0
+  fi
+
+  local patched_any=false
+
+  # --- ISTIO_GATEWAY_CONTROLLER_NAMES (OpenShift Gateway controller) ---
+  local gateway_controller_names="istio.io/gateway-controller,openshift.io/gateway-controller/v1"
+  patch_csv_operator_container_env "$namespace" "$csv_name" "ISTIO_GATEWAY_CONTROLLER_NAMES" "$gateway_controller_names" && patched_any=true
+
+  # --- Rate limit dependency failure modes (fail closed) ---
+  patch_csv_operator_container_env "$namespace" "$csv_name" "RATELIMIT_CHECK_SERVICE_FAILURE_MODE" "deny" && patched_any=true
+  patch_csv_operator_container_env "$namespace" "$csv_name" "RATELIMIT_REPORT_SERVICE_FAILURE_MODE" "deny" && patched_any=true
+
+  # --- Auth service timeout (RHOAIENG-79789) ---
+  patch_csv_operator_container_env "$namespace" "$csv_name" "AUTH_SERVICE_TIMEOUT" "2s" && patched_any=true
+
+  if [[ "$patched_any" != "true" ]]; then
+    log_debug "CSV already has all required operator env (Gateway + rate limit failure modes + auth timeout)"
+    return 0
+  fi
+
+  log_info "CSV patched (Gateway controller and/or rate limit failure modes and/or auth timeout)"
+
+  # CRITICAL: Force delete the operator pod to pick up the new env var
+  # OLM updates the deployment spec but doesn't always trigger a pod restart
+  # The operator must have ISTIO_GATEWAY_CONTROLLER_NAMES set BEFORE Kuadrant CR is created
+  log_info "Forcing operator restart to apply CSV env configuration..."
+
+  # The kuadrant operator deployment is always named kuadrant-operator-controller-manager
+  # regardless of whether we're using rhcl-operator or kuadrant-operator
+  local operator_deployment="kuadrant-operator-controller-manager"
+  if kubectl get deployment "$operator_deployment" -n "$namespace" &>/dev/null; then
+    # Force delete the operator pod - this ensures the new env var is picked up
+    kubectl delete pod -n "$namespace" -l control-plane=controller-manager --force --grace-period=0 2>/dev/null || \
+      kubectl delete pod -n "$namespace" -l app.kubernetes.io/name=kuadrant-operator --force --grace-period=0 2>/dev/null || \
+      kubectl delete pod -n "$namespace" -l app=kuadrant --force --grace-period=0 2>/dev/null || true
+
+    # Wait for the new pod to be ready
+    log_info "Waiting for operator pod to restart..."
+    sleep 5
+    kubectl rollout status deployment/"$operator_deployment" -n "$namespace" --timeout="${ROLLOUT_TIMEOUT}s" 2>/dev/null || \
+      log_warn "Operator rollout status check timed out (timeout: ${ROLLOUT_TIMEOUT}s)"
+
+    # Verify required env vars are in the RUNNING pod
+    local pod_env
+    pod_env=$(kubectl exec -n "$namespace" deployment/"$operator_deployment" -- env 2>/dev/null || true)
+
+    if echo "$pod_env" | grep '^ISTIO_GATEWAY_CONTROLLER_NAMES=' | grep -q 'openshift.io/gateway-controller/v1' \
+      && echo "$pod_env" | grep -Fq 'RATELIMIT_CHECK_SERVICE_FAILURE_MODE=deny' \
+      && echo "$pod_env" | grep -Fq 'RATELIMIT_REPORT_SERVICE_FAILURE_MODE=deny' \
+      && echo "$pod_env" | grep -Fq 'AUTH_SERVICE_TIMEOUT=2s'; then
+      log_info "Operator pod has required CSV env (ISTIO gateway controller + RATELIMIT_* failure modes + AUTH_SERVICE_TIMEOUT)"
+    else
+      log_warn "Operator pod may not have correct env yet (ISTIO / RATELIMIT_* failure modes / AUTH_SERVICE_TIMEOUT)"
+    fi
+
+    # Give the operator time to fully initialize with the new Gateway controller configuration
+    # This is critical - the operator needs to register as a Gateway controller before Kuadrant CR is created
+    log_info "Waiting 15s for operator to fully initialize with Gateway controller configuration..."
+    sleep 15
+  else
+    log_warn "Could not find operator deployment, waiting 60s for env propagation"
+    sleep 60
+  fi
+}
+
+# waitsubscriptioninstalled namespace subscription_name
+#   Waits for an OLM Subscription to finish installing its CSV.
+#   Exits with error if the installation times out.
+waitsubscriptioninstalled() {
+  local ns=${1?namespace is required}; shift
+  local name=${1?subscription name is required}; shift
+
+  echo "  * Waiting for Subscription $ns/$name to start setup..."
+  # Use fully qualified resource name to avoid conflicts with Knative subscriptions
+  if ! kubectl wait subscription.operators.coreos.com --timeout="${SUBSCRIPTION_TIMEOUT}s" -n "$ns" "$name" --for=jsonpath='{.status.currentCSV}'; then
+    echo "    * ERROR: Timeout waiting for Subscription $ns/$name to get currentCSV"
+    return 1
+  fi
+  local csv
+  csv=$(kubectl get subscription.operators.coreos.com -n "$ns" "$name" -o jsonpath='{.status.currentCSV}')
+
+  # Wait for CSV to exist (sometimes there's a delay between currentCSV being set and CSV appearing)
+  local csv_wait_elapsed=0
+  local csv_wait_timeout=$((CSV_TIMEOUT < 60 ? CSV_TIMEOUT : 60))
+  while ! kubectl get -n "$ns" csv "$csv" > /dev/null 2>&1; do
+    if [[ $csv_wait_elapsed -ge $csv_wait_timeout ]]; then
+      echo "    * ERROR: Timeout waiting for CSV $csv to appear in namespace $ns (waited ${csv_wait_timeout}s)"
+      return 1
+    fi
+    sleep 1
+    csv_wait_elapsed=$((csv_wait_elapsed + 1))
+  done
+
+  echo "  * Waiting for Subscription setup to finish setup. CSV = $csv ..."
+  if ! kubectl wait -n "$ns" --for=jsonpath="{.status.phase}"=Succeeded csv "$csv" --timeout="${CSV_TIMEOUT}s"; then
+    echo "    * ERROR: Timeout while waiting for Subscription to finish installation (CSV=$csv, timeout=${CSV_TIMEOUT}s)"
+    return 1
+  fi
+}
+
+# approve_initial_installplan_if_manual namespace subscription_name [timeout_seconds]
+#   When installPlanApproval is Manual, OLM creates an InstallPlan with spec.approved=false.
+#   Approve that InstallPlan once so the first install completes without human action.
+#   Later upgrade InstallPlans remain unapproved until someone approves them manually.
+approve_initial_installplan_if_manual() {
+  local namespace=${1?namespace is required}; shift
+  local subscription_name=${1?subscription name is required}; shift
+  local timeout=${1:-180}
+  local elapsed=0
+  local interval=3
+
+  while [[ $elapsed -lt $timeout ]]; do
+    local ip_name
+    ip_name=$(kubectl get subscription.operators.coreos.com -n "$namespace" "$subscription_name" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || true)
+    if [[ -n "$ip_name" ]]; then
+      local approved
+      approved=$(kubectl get installplan "$ip_name" -n "$namespace" -o jsonpath='{.spec.approved}' 2>/dev/null || echo "")
+      if [[ "$approved" == "false" ]]; then
+        log_info "Approving initial InstallPlan $ip_name (Manual subscription)"
+        kubectl patch installplan "$ip_name" -n "$namespace" --type=merge -p '{"spec":{"approved":true}}' || {
+          log_warn "Could not approve InstallPlan $ip_name"
+        }
+      fi
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+
+  # Fallback: single pending InstallPlan in namespace (e.g. ref not yet on Subscription)
+  local fallback_ip
+  fallback_ip=$(kubectl get installplan -n "$namespace" -o json 2>/dev/null | jq -r '.items[] | select((.spec.approved // false) == false) | .metadata.name' 2>/dev/null | head -1)
+  if [[ -n "$fallback_ip" ]]; then
+    log_info "Approving pending InstallPlan $fallback_ip (Manual subscription, fallback)"
+    kubectl patch installplan "$fallback_ip" -n "$namespace" --type=merge -p '{"spec":{"approved":true}}' || true
+  else
+    log_warn "No InstallPlan to auto-approve within ${timeout}s; if install stalls, approve the InstallPlan manually"
+  fi
+}
+
+# checksubscriptionexists catalog_namespace catalog_name operator_name
+#   Checks if a subscription exists for the given operator from the specified catalog.
+#   Returns the count of matching subscriptions (0 if none found).
+checksubscriptionexists() {
+  local catalog_ns=${1?catalog namespace is required}; shift
+  local catalog_name=${1?catalog name is required}; shift
+  local operator_name=${1?operator name is required}; shift
+
+  local catalogns_cond=".spec.sourceNamespace == \"${catalog_ns}\""
+  local catalog_cond=".spec.source == \"${catalog_name}\""
+  local op_cond=".spec.name == \"${operator_name}\""
+  local query="${catalogns_cond} and ${catalog_cond} and ${op_cond}"
+
+  # Use fully qualified resource name to avoid conflicts with Knative subscriptions
+  kubectl get subscriptions.operators.coreos.com -A -ojson | jq ".items | map(select(${query})) | length"
+}
+
+# checkcsvexists csv_prefix
+#   Checks if a CSV exists by name prefix (e.g., "opendatahub-operator" matches "opendatahub-operator.v3.2.0").
+#   Returns the count of matching CSVs (0 if none found).
+checkcsvexists() {
+  local csv_prefix=${1?csv prefix is required}; shift
+
+  # Count CSVs whose name starts with the given prefix
+  local count
+  count=$(kubectl get csv -A -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -c "^${csv_prefix}" 2>/dev/null) || count=0
+  echo "$count"
+}
+
+# ==========================================
+# Operator Installation Helper Functions
+# ==========================================
+
+# is_operator_installed operator_name namespace
+#   Checks if an operator subscription exists.
+#   Returns 0 if installed, 1 if not found.
+is_operator_installed() {
+  local operator_name=${1?operator name is required}; shift
+  local namespace=${1:-}  # namespace is optional
+
+  # Use fully qualified resource name to avoid conflicts with Knative subscriptions
+  if [[ -n "$namespace" ]]; then
+    kubectl get subscription.operators.coreos.com -n "$namespace" 2>/dev/null | grep -q "$operator_name"
+  else
+    kubectl get subscription.operators.coreos.com --all-namespaces 2>/dev/null | grep -q "$operator_name"
+  fi
+}
+
+# should_install_operator operator_name skip_flag namespace
+#   Determines if an operator should be installed based on skip flag and existing installation.
+#   Returns 0 if should install, 1 if should skip.
+should_install_operator() {
+  local operator_name=${1?operator name is required}; shift
+  local skip_flag=${1?skip flag is required}; shift
+  local namespace=${1:-}  # namespace is optional
+
+  # Explicit skip
+  [[ "$skip_flag" == "true" ]] && return 1
+
+  # Auto mode: check if already installed
+  if [[ "$skip_flag" == "auto" ]]; then
+    is_operator_installed "$operator_name" "$namespace" && return 1
+  fi
+
+  return 0
+}
+
+# install_olm_operator operator_name namespace catalog_source channel starting_csv operatorgroup_target source_namespace install_plan_approval
+#   Generic function to install an OLM operator.
+#
+# Arguments:
+#   operator_name - Name of the operator (e.g., "rhods-operator")
+#   namespace - Target namespace for the operator
+#   catalog_source - CatalogSource name (e.g., "redhat-operators")
+#   channel - Subscription channel (e.g., "stable-3.x")
+#   starting_csv - Starting CSV (optional, can be empty)
+#   operatorgroup_target - Target namespace for OperatorGroup (optional, uses namespace if empty)
+#   source_namespace - Catalog source namespace (optional, defaults to openshift-marketplace)
+#   install_plan_approval - Automatic or Manual (optional, empty = omit). Manual blocks automatic
+#     upgrades; this script auto-approves only the first InstallPlan so initial install still completes.
+install_olm_operator() {
+  local operator_name=${1?operator name is required}; shift
+  local namespace=${1?namespace is required}; shift
+  local catalog_source=${1?catalog source is required}; shift
+  local channel=${1?channel is required}; shift
+  local starting_csv=${1:-}; shift || true
+  local operatorgroup_target=${1:-}; shift || true
+  local source_namespace=${1:-openshift-marketplace}; shift || true
+  local install_plan_approval=${1:-}; shift || true
+
+  log_info "Installing operator: $operator_name in namespace: $namespace"
+
+  # Check if subscription already exists
+  # Use fully qualified resource name to avoid conflicts with Knative subscriptions
+  if kubectl get subscription.operators.coreos.com "$operator_name" -n "$namespace" &>/dev/null; then
+    log_info "Subscription $operator_name already exists in $namespace, skipping"
+    return 0
+  fi
+
+  # Create namespace if not exists
+  if ! kubectl get namespace "$namespace" &>/dev/null; then
+    log_info "Creating namespace: $namespace"
+    kubectl create namespace "$namespace"
+  fi
+
+  # Wait for namespace to be ready
+  wait_for_namespace "$namespace" 60
+
+  # Create OperatorGroup if needed
+  local og_count=$(kubectl get operatorgroup -n "$namespace" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$og_count" -eq 0 ]; then
+    # If operatorgroup_target is "AllNamespaces", omit targetNamespaces field
+    if [ "$operatorgroup_target" = "AllNamespaces" ]; then
+      log_info "Creating OperatorGroup in $namespace for AllNamespaces mode"
+      cat <<EOF | kubectl apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: ${namespace}-operatorgroup
+  namespace: ${namespace}
+spec: {}
+EOF
+    else
+      local og_target_ns="${operatorgroup_target:-$namespace}"
+      log_info "Creating OperatorGroup in $namespace targeting $og_target_ns"
+      cat <<EOF | kubectl apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: ${namespace}-operatorgroup
+  namespace: ${namespace}
+spec:
+  targetNamespaces:
+  - ${og_target_ns}
+EOF
+    fi
+  fi
+
+  # Create Subscription
+  local sub_log="Creating Subscription for $operator_name from $catalog_source (channel: $channel"
+  [[ -n "$install_plan_approval" ]] && sub_log+=", installPlanApproval: $install_plan_approval"
+  [[ -n "$starting_csv" ]] && sub_log+=", startingCSV: $starting_csv"
+  sub_log+=")"
+  log_info "$sub_log"
+  local subscription_yaml="
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ${operator_name}
+  namespace: ${namespace}
+spec:
+  channel: ${channel}
+  name: ${operator_name}
+  source: ${catalog_source}
+  sourceNamespace: ${source_namespace}
+"
+
+  if [[ -n "$install_plan_approval" ]]; then
+    subscription_yaml="${subscription_yaml}  installPlanApproval: ${install_plan_approval}
+"
+  fi
+
+  if [[ -n "$starting_csv" ]]; then
+    subscription_yaml="${subscription_yaml}  startingCSV: ${starting_csv}
+"
+  fi
+
+  echo "$subscription_yaml" | kubectl apply -f -
+
+  if [[ "$install_plan_approval" == "Manual" ]]; then
+    log_info "Manual Subscription: approving initial InstallPlan so first install can proceed..."
+    approve_initial_installplan_if_manual "$namespace" "$operator_name" "$CSV_TIMEOUT"
+  fi
+
+  # Wait for subscription to be installed
+  log_info "Waiting for subscription to install..."
+  if ! waitsubscriptioninstalled "$namespace" "$operator_name"; then
+    log_error "Failed to install operator $operator_name"
+    return 1
+  fi
+
+  log_info "Operator $operator_name installed successfully"
+}
+
+# wait_for_custom_check description timeout interval -- command [args...]
+#   Waits for a custom check command to succeed.
+#
+# Arguments:
+#   description - Description of what we're waiting for
+#   timeout     - Timeout in seconds (default: CUSTOM_CHECK_TIMEOUT)
+#   interval    - Check interval in seconds (default: 5)
+#   --          - Separator before the command
+#   command     - Command and arguments to execute (should return 0 on success).
+#                 For shell pipelines, pass "bash" "-c" "pipeline..." as the command.
+wait_for_custom_check() {
+  local description=${1?description is required}; shift
+  local timeout=${1:-$CUSTOM_CHECK_TIMEOUT}; shift || true
+  local interval=${1:-5}; shift || true
+  [[ "${1:-}" == "--" ]] && shift
+  if [[ $# -eq 0 ]]; then
+    log_error "wait_for_custom_check requires a command after --"
+    return 1
+  fi
+
+  log_info "Waiting for: $description (timeout: ${timeout}s)"
+
+  local elapsed=0
+  while [ $elapsed -lt $timeout ]; do
+    if "$@"; then
+      log_info "$description - Ready"
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+
+  log_error "$description - Timeout after ${timeout}s"
+  return 1
+}
+
+# ==========================================
+# Namespace Helper Functions
+# ==========================================
+
+# wait_for_namespace namespace [timeout]
+#   Waits for a namespace to be created and become Active.
+#   Returns 0 on success, 1 on timeout.
+wait_for_namespace() {
+  local namespace=${1?namespace is required}; shift
+  local timeout=${1:-$NAMESPACE_TIMEOUT}
+
+  if kubectl get namespace "$namespace" >/dev/null 2>&1; then
+    local remaining=$timeout
+    if [ $remaining -lt 1 ]; then remaining=1; fi
+    if ! kubectl wait namespace/"$namespace" --for=jsonpath='{.status.phase}'=Active --timeout="${remaining}s"; then
+      echo "  ERROR: Namespace $namespace exists but failed to become Active"
+      return 1
+    fi
+    return 0
+  fi
+
+  echo "* Waiting for $namespace namespace to be created (timeout: ${timeout}s)..."
+  local elapsed=0
+  local interval=5
+  while [ $elapsed -lt $timeout ]; do
+    if kubectl get namespace "$namespace" >/dev/null 2>&1; then
+      local remaining=$((timeout - elapsed))
+      if [ $remaining -lt 1 ]; then remaining=1; fi
+      if ! kubectl wait namespace/"$namespace" --for=jsonpath='{.status.phase}'=Active --timeout="${remaining}s"; then
+        echo "  ERROR: Namespace $namespace created but failed to become Active"
+        return 1
+      fi
+      return 0
+    fi
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+
+  echo "  ERROR: $namespace namespace was not created within ${timeout}s timeout"
+  return 1
+}
+
+# wait_for_resource kind name namespace [timeout]
+#   Waits for a resource to be created.
+#   Returns 0 when found, 1 on timeout.
+wait_for_resource() {
+  local kind=${1?kind is required}; shift
+  local name=${1?name is required}; shift
+  local namespace=${1?namespace is required}; shift
+  local timeout=${1:-$RESOURCE_TIMEOUT}
+
+  echo "* Waiting for $kind/$name in $namespace (timeout: ${timeout}s)..."
+  local elapsed=0
+  local interval=5
+  while [ $elapsed -lt $timeout ]; do
+    if kubectl get "$kind" "$name" -n "$namespace" >/dev/null 2>&1; then
+      echo "  * Found $kind/$name"
+      return 0
+    fi
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+
+  echo "  ERROR: $kind/$name was not found within ${timeout}s timeout"
+  return 1
+}
+
+# create_tls_secret name namespace cn
+#   Creates a self-signed TLS secret if it doesn't already exist.
+#   Uses OpenSSL to generate a matching key/cert pair.
+#
+# Arguments:
+#   name      - Name of the TLS secret
+#   namespace - Namespace to create the secret in
+#   cn        - Common Name for the certificate (e.g., hostname)
+#
+# Returns:
+#   0 on success (created or already exists), 1 on failure
+create_tls_secret() {
+  local name=${1?secret name is required}; shift
+  local namespace=${1?namespace is required}; shift
+  local cn=${1:-$name}  # default CN to secret name
+
+  # Check if secret already exists
+  if kubectl get secret "$name" -n "$namespace" &>/dev/null; then
+    echo "  * TLS secret $name already exists in $namespace"
+    return 0
+  fi
+
+  echo "  * Creating TLS secret $name in $namespace (CN=$cn)..."
+
+  # Create temp directory for key/cert files
+  local temp_dir
+  temp_dir=$(mktemp -d)
+
+  # Generate self-signed certificate with matching key
+  if ! openssl req -x509 -newkey rsa:2048 \
+      -keyout "${temp_dir}/tls.key" \
+      -out "${temp_dir}/tls.crt" \
+      -days 365 -nodes \
+      -subj "/CN=${cn}" 2>/dev/null; then
+    echo "  ERROR: Failed to generate TLS certificate"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  # Verify files were created
+  if [[ ! -f "${temp_dir}/tls.crt" || ! -f "${temp_dir}/tls.key" ]]; then
+    echo "  ERROR: TLS certificate files not generated"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  # Create the secret
+  if kubectl create secret tls "$name" \
+      --cert="${temp_dir}/tls.crt" \
+      --key="${temp_dir}/tls.key" \
+      -n "$namespace"; then
+    echo "  * TLS secret $name created successfully"
+    rm -rf "$temp_dir"
+    return 0
+  else
+    echo "  ERROR: Failed to create TLS secret $name"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+}
+
+# create_gateway_route name namespace hostname service tls_secret
+#   Creates an OpenShift Route to expose a Gateway via the cluster's apps domain.
+#   Uses 'reencrypt' TLS termination for better security (trusted cert to clients).
+#
+# Arguments:
+#   name       - Name of the Route resource
+#   namespace  - Namespace for the Route
+#   hostname   - Hostname for the Route (e.g., maas.apps.cluster.domain)
+#   service    - Target Service name
+#   tls_secret - Name of the TLS secret containing the Gateway's certificate
+#
+# Returns:
+#   0 on success, 1 on failure
+create_gateway_route() {
+  local name=${1?route name is required}; shift
+  local namespace=${1?namespace is required}; shift
+  local hostname=${1?hostname is required}; shift
+  local service=${1?service name is required}; shift
+  local tls_secret=${1?tls secret name is required}
+
+  echo "  * Creating Route $name for $hostname..."
+
+  # Get the Gateway's TLS certificate for reencrypt mode
+  # This allows the Router to trust the Gateway's certificate
+  local dest_ca_cert
+  dest_ca_cert=$(kubectl get secret "$tls_secret" -n "$namespace" \
+    -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d || echo "")
+
+  if [[ -n "$dest_ca_cert" ]]; then
+    # Use reencrypt: Router terminates TLS with trusted cert, re-encrypts to Gateway
+    # This gives clients a trusted certificate instead of our self-signed one
+    cat <<EOF | kubectl apply -f -
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+spec:
+  host: ${hostname}
+  port:
+    targetPort: https
+  to:
+    kind: Service
+    name: ${service}
+    weight: 100
+  tls:
+    termination: reencrypt
+    destinationCACertificate: |
+$(echo "$dest_ca_cert" | sed 's/^/      /')
+EOF
+  else
+    # Fallback to passthrough if we can't get the certificate
+    echo "  WARNING: Could not retrieve TLS certificate from $tls_secret, using passthrough"
+    cat <<EOF | kubectl apply -f -
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+spec:
+  host: ${hostname}
+  port:
+    targetPort: https
+  to:
+    kind: Service
+    name: ${service}
+    weight: 100
+  tls:
+    termination: passthrough
+EOF
+  fi
+}
+
+# find_project_root [start_dir] [marker]
+#   Walks up the directory tree to find the project root.
+#   Returns the path containing the marker (default: .git)
+find_project_root() {
+  local start_dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+  local marker="${2:-.git}"
+  local dir="$start_dir"
+
+  while [[ "$dir" != "/" && ! -e "$dir/$marker" ]]; do
+    dir="$(dirname "$dir")"
+  done
+
+  if [[ -e "$dir/$marker" ]]; then
+    printf '%s\n' "$dir"
+  else
+    echo "Error: couldn't find '$marker' in any parent of '$start_dir'" >&2
+    return 1
+  fi
+}
+
+# set_overlay_namespace overlay_dir namespace
+#   Sets the namespace in the overlay's kustomization.yaml before build.
+#   Creates a backup that must be restored by calling cleanup_overlay_namespace.
+#
+# Arguments:
+#   overlay_dir - Path to overlay directory
+#   namespace   - Namespace to set (e.g. opendatahub)
+set_overlay_namespace() {
+  local overlay_dir="${1?overlay_dir is required}"
+  local namespace="${2?namespace is required}"
+
+  local kustomization="$overlay_dir/kustomization.yaml"
+  if [ ! -f "$kustomization" ]; then
+    echo "Error: overlay kustomization not found: $kustomization" >&2
+    return 1
+  fi
+
+  export _OVERLAY_KUSTOMIZATION="$kustomization"
+  export _OVERLAY_BACKUP="${_OVERLAY_KUSTOMIZATION}.backup"
+
+  cp "$_OVERLAY_KUSTOMIZATION" "$_OVERLAY_BACKUP" || {
+    echo "Error: failed to backup overlay kustomization" >&2
+    return 1
+  }
+  (cd "$overlay_dir" && kustomize edit set namespace "$namespace") || {
+    mv -f "$_OVERLAY_BACKUP" "$_OVERLAY_KUSTOMIZATION" 2>/dev/null || true
+    return 1
+  }
+}
+
+# cleanup_overlay_namespace
+#   Restores the overlay kustomization.yaml from backup.
+cleanup_overlay_namespace() {
+  if [ -n "${_OVERLAY_BACKUP:-}" ] && [ -f "$_OVERLAY_BACKUP" ]; then
+    mv -f "$_OVERLAY_BACKUP" "$_OVERLAY_KUSTOMIZATION" 2>/dev/null || true
+  fi
+}
+
+# inject_maas_api_image_operator_mode namespace
+#   Patches the maas-api deployment with custom image when MAAS_API_IMAGE is set.
+#   Used in operator mode after the operator creates the deployment.
+#
+# Arguments:
+#   namespace - Namespace where maas-api is deployed (opendatahub or redhat-ods-applications)
+#
+# Environment:
+#   MAAS_API_IMAGE - Custom MaaS API container image
+#
+# Returns:
+#   0 on success, 0 if MAAS_API_IMAGE not set (skip), 1 on failure
+inject_maas_api_image_operator_mode() {
+  local namespace=${1?namespace is required}; shift
+
+  # Skip if MAAS_API_IMAGE is not set
+  if [ -z "${MAAS_API_IMAGE:-}" ]; then
+    echo "  * MAAS_API_IMAGE not set, using operator default"
+    return 0
+  fi
+
+  echo "  * Injecting custom MaaS API image: ${MAAS_API_IMAGE}"
+
+  # Wait for maas-api deployment to be created by the operator
+  echo "  * Waiting for maas-api deployment to be created by operator..."
+  local timeout=300
+  local elapsed=0
+  while [ $elapsed -lt $timeout ]; do
+    if kubectl get deployment maas-api -n "$namespace" >/dev/null 2>&1; then
+      echo "  * maas-api deployment found"
+      break
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  if [ $elapsed -ge $timeout ]; then
+    echo "ERROR: Timeout waiting for maas-api deployment to be created" >&2
+    return 1
+  fi
+
+  # Patch the deployment with custom image
+  echo "  * Patching maas-api deployment with image: ${MAAS_API_IMAGE}"
+  kubectl patch deployment maas-api -n "$namespace" --type='json' -p="[
+    {\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/image\", \"value\": \"${MAAS_API_IMAGE}\"}
+  ]" || {
+    echo "ERROR: Failed to patch maas-api deployment" >&2
+    return 1
+  }
+
+  # Wait for rollout to complete
+  echo "  * Waiting for deployment rollout to complete..."
+  kubectl rollout status deployment/maas-api -n "$namespace" --timeout=180s || {
+    echo "WARNING: Deployment rollout did not complete within timeout (continuing anyway)" >&2
+  }
+
+  echo "  * Successfully injected custom MaaS API image"
+  return 0
+}
+
+# Helper function to wait for CRD to be established
+wait_for_crd() {
+  local crd="$1"
+  local timeout="${2:-$CRD_TIMEOUT}"
+  local interval=2
+  local end_time=$((SECONDS + timeout))
+
+  echo "⏳ Waiting for CRD ${crd} to appear (timeout: ${timeout}s)…"
+  while [ $SECONDS -lt $end_time ]; do
+    if kubectl get crd "$crd" &>/dev/null; then
+      echo "✅ CRD ${crd} detected, waiting for it to become Established..."
+      # Pass remaining time, not full timeout
+      local remaining_time=$((end_time - SECONDS))
+      [ $remaining_time -lt 1 ] && remaining_time=1
+      if kubectl wait --for=condition=Established --timeout="${remaining_time}s" "crd/$crd" 2>/dev/null; then
+        return 0
+      else
+        echo "❌ CRD ${crd} failed to become Established" >&2
+        return 1
+      fi
+    fi
+    sleep $interval
+  done
+
+  echo "❌ Timed out after ${timeout}s waiting for CRD $crd to appear." >&2
+  return 1
+}
+
+# Apply MaaS maas.opendatahub.io CRDs from deployment/base/maas-controller/crd and wait until
+# each is Established. Ensures the API server accepts CR writes before maas-controller starts
+# (the manager creates Config/default from code once the Deployment is running).
+install_maas_controller_crds_and_wait() {
+  local crd_bundle_dir="$1"
+  if [[ ! -d "$crd_bundle_dir" ]]; then
+    echo "ERROR: MaaS CRD bundle directory not found: $crd_bundle_dir" >&2
+    return 1
+  fi
+  local bases_dir="${crd_bundle_dir}/bases"
+  if [[ ! -d "$bases_dir" ]]; then
+    echo "ERROR: MaaS CRD bases directory not found: $bases_dir" >&2
+    return 1
+  fi
+  echo "⏳ Applying MaaS Controller CRDs from ${crd_bundle_dir}..."
+  kubectl apply -k "$crd_bundle_dir" || return 1
+  local f crd_name
+  for f in "${bases_dir}"/*.yaml; do
+    [[ -e "$f" ]] || continue
+    crd_name=$(awk '/^kind: CustomResourceDefinition$/ {crd=1} crd && /^  name: / {print $2; exit}' "$f" || true)
+    [[ -n "${crd_name:-}" ]] || continue
+    if ! wait_for_crd "$crd_name" "${CRD_TIMEOUT:-180}"; then
+      return 1
+    fi
+  done
+  echo "✅ MaaS Controller CRDs are Established"
+  return 0
+}
+
+# Helper function to extract version from CSV name (e.g., "operator.v1.2.3" -> "1.2.3")
+extract_version_from_csv() {
+  local csv_name="$1"
+  echo "$csv_name" | sed -n 's/.*\.v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p'
+}
+
+# Helper function to compare semantic versions (returns 0 if version1 >= version2)
+#
+# NOTE: This comparison is intentionally simple and may have edge cases (e.g., comparing
+# 1.2.9 vs 1.2.10 with string comparison). The trade-off:
+# - Loose validation = resilient to minor/patch version updates, easier maintenance
+# - Strict semver = more accurate, but requires updates for every version bump
+# For a deployment script, we prefer resilience over strict accuracy. If false positives
+# become an issue in practice, we can implement proper semver comparison.
+version_compare() {
+  local version1="$1"
+  local version2="$2"
+
+  # Convert versions to comparable numbers (e.g., "1.2.3" -> "001002003")
+  local v1=$(echo "$version1" | awk -F. '{printf "%03d%03d%03d", $1, $2, $3}')
+  local v2=$(echo "$version2" | awk -F. '{printf "%03d%03d%03d", $1, $2, $3}')
+
+  [ "$v1" -ge "$v2" ]
+}
+
+# Helper function to find CSV by operator name and check minimum version
+find_csv_with_min_version() {
+  local operator_prefix="$1"
+  local min_version="$2"
+  local namespace="${3:-kuadrant-system}"
+  
+  local csv_name=$(kubectl get csv -n "$namespace" --no-headers 2>/dev/null | grep "^${operator_prefix}" | head -n1 | awk '{print $1}')
+  
+  if [ -z "$csv_name" ]; then
+    echo "   No CSV found for ${operator_prefix} in ${namespace}" >&2
+    return 1
+  fi
+  
+  local installed_version=$(extract_version_from_csv "$csv_name")
+  if [ -z "$installed_version" ]; then
+    echo "   Could not parse version from CSV name: ${csv_name}" >&2
+    return 1
+  fi
+  
+  if version_compare "$installed_version" "$min_version"; then
+    echo "$csv_name"
+    return 0
+  fi
+  
+  echo "   ${csv_name} version ${installed_version} is below minimum ${min_version}" >&2
+  return 1
+}
+
+# Helper function to wait for CSV with minimum version requirement
+wait_for_csv_with_min_version() {
+  local operator_prefix="$1"
+  local min_version="$2"
+  local namespace="${3:-kuadrant-system}"
+  local timeout="${4:-$CSV_TIMEOUT}"
+
+  echo "⏳ Looking for ${operator_prefix} (minimum version: ${min_version}, timeout: ${timeout}s)..."
+
+  local end_time=$((SECONDS + timeout))
+
+  while [ $SECONDS -lt $end_time ]; do
+    local csv_name
+    csv_name=$(find_csv_with_min_version "$operator_prefix" "$min_version" "$namespace") || true
+
+    if [ -n "$csv_name" ]; then
+      local installed_version
+      installed_version=$(extract_version_from_csv "$csv_name")
+      echo "✅ Found CSV: ${csv_name} (version: ${installed_version} >= ${min_version})"
+      # Pass remaining time, not full timeout
+      local remaining_time=$((end_time - SECONDS))
+      [ $remaining_time -lt 1 ] && remaining_time=1
+      wait_for_csv "$csv_name" "$namespace" "$remaining_time"
+      return $?
+    fi
+
+    # Check if any version exists (for progress feedback)
+    local any_csv
+    any_csv=$(kubectl get csv -n "$namespace" --no-headers 2>/dev/null | grep "^${operator_prefix}" | head -n1 | awk '{print $1}' || echo "")
+    if [ -n "$any_csv" ]; then
+      local installed_version
+      installed_version=$(extract_version_from_csv "$any_csv")
+      echo "   Found ${any_csv} with version ${installed_version}, waiting for version >= ${min_version}..."
+    else
+      echo "   No CSV found for ${operator_prefix} yet, waiting for installation..."
+    fi
+
+    sleep 10
+  done
+
+  # Timeout reached
+  echo "❌ Timed out after ${timeout}s waiting for ${operator_prefix} with minimum version ${min_version}"
+  return 1
+}
+
+# Helper function to wait for CSV to reach Succeeded state
+wait_for_csv() {
+  local csv_name="$1"
+  local namespace="${2:-kuadrant-system}"
+  local timeout="${3:-$CSV_TIMEOUT}"
+  local interval=5
+  local end_time=$((SECONDS + timeout))
+  local last_status_print=$SECONDS
+
+  echo "⏳ Waiting for CSV ${csv_name} to succeed (timeout: ${timeout}s)..."
+  while [ $SECONDS -lt $end_time ]; do
+    local phase=$(kubectl get csv -n "$namespace" "$csv_name" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+    local elapsed=$((SECONDS - (end_time - timeout)))
+
+    case "$phase" in
+      "Succeeded")
+        echo "✅ CSV ${csv_name} succeeded"
+        return 0
+        ;;
+      "Failed")
+        echo "❌ CSV ${csv_name} failed" >&2
+        kubectl get csv -n "$namespace" "$csv_name" -o jsonpath='{.status.message}' 2>/dev/null
+        return 1
+        ;;
+      *)
+        if [ $((SECONDS - last_status_print)) -ge 30 ]; then
+          echo "   CSV ${csv_name} status: ${phase} (${elapsed}s elapsed)"
+          last_status_print=$SECONDS
+        fi
+        ;;
+    esac
+
+    sleep $interval
+  done
+
+  echo "❌ Timed out after ${timeout}s waiting for CSV ${csv_name}" >&2
+  return 1
+}
+
+# Helper function to wait for pods in a namespace to be ready
+wait_for_pods() {
+  local namespace="$1"
+  local timeout="${2:-$POD_TIMEOUT}"
+
+  kubectl get namespace "$namespace" &>/dev/null || return 0
+
+  echo "⏳ Waiting for pods in $namespace to be ready (timeout: ${timeout}s)..."
+  local end=$((SECONDS + timeout))
+  local not_ready
+  while [ $SECONDS -lt $end ]; do
+    not_ready=$(kubectl get pods -n "$namespace" --no-headers 2>/dev/null | grep -v -E 'Running|Completed|Succeeded' | wc -l)
+    [ "$not_ready" -eq 0 ] && return 0
+    sleep 5
+  done
+  echo "⚠️  Timeout after ${timeout}s waiting for pods in $namespace" >&2
+  return 1
+}
+
+wait_for_validating_webhooks() {
+    local namespace="$1"
+    local timeout="${2:-$WEBHOOK_TIMEOUT}"
+    local interval=2
+    local end=$((SECONDS+timeout))
+
+    echo "⏳ Waiting for validating webhooks in namespace $namespace (timeout: ${timeout}s)..."
+
+    while [ $SECONDS -lt $end ]; do
+        local not_ready=0
+
+        local services
+        services=$(kubectl get validatingwebhookconfigurations \
+          -o jsonpath='{range .items[*].webhooks[*].clientConfig.service}{.namespace}/{.name}{"\n"}{end}' \
+          | grep "^$namespace/" | sort -u)
+
+        if [ -z "$services" ]; then
+            echo "⚠️  No validating webhooks found in namespace $namespace"
+            return 0
+        fi
+
+        for svc in $services; do
+            local ns name ready
+            ns=$(echo "$svc" | cut -d/ -f1)
+            name=$(echo "$svc" | cut -d/ -f2)
+
+            ready=$(kubectl get endpoints -n "$ns" "$name" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+            if [ -z "$ready" ]; then
+                echo "🔴 Webhook service $ns/$name not ready"
+                not_ready=1
+            else
+                echo "✅ Webhook service $ns/$name has ready endpoints"
+            fi
+        done
+
+        if [ "$not_ready" -eq 0 ]; then
+            echo "🎉 All validating webhook services in $namespace are ready"
+            return 0
+        fi
+
+        sleep $interval
+    done
+
+    echo "❌ Timed out after ${timeout}s waiting for validating webhooks in $namespace"
+    return 1
+}
+
+# ==========================================
+# Custom Catalog Source Functions
+# ==========================================
+
+# create_custom_catalogsource name namespace catalog_image
+#   Creates a CatalogSource from a catalog/index image.
+#   This allows installing operators from custom catalog images instead of the default catalog.
+#
+#   IMPORTANT: This requires a CATALOG/INDEX image, NOT a bundle image!
+#   - Catalog image: Contains the FBC database and runs 'opm serve' (e.g., quay.io/opendatahub/opendatahub-operator-catalog:latest)
+#   - Bundle image: Contains operator manifests only, cannot be used directly (e.g., quay.io/opendatahub/opendatahub-operator-bundle:latest)
+#
+# Arguments:
+#   name          - Name for the CatalogSource
+#   namespace     - Namespace for the CatalogSource (usually openshift-marketplace)
+#   catalog_image - The operator catalog/index image (e.g., quay.io/opendatahub/opendatahub-operator-catalog:latest)
+#
+# Returns:
+#   0 on success, 1 on failure
+create_custom_catalogsource() {
+  local name=${1?catalogsource name is required}; shift
+  local namespace=${1?namespace is required}; shift
+  local catalog_image=${1?catalog image is required}; shift
+
+  echo "* Creating CatalogSource '$name' from catalog image: $catalog_image"
+
+  # Check if CatalogSource already exists
+  if kubectl get catalogsource "$name" -n "$namespace" &>/dev/null; then
+    echo "  * CatalogSource '$name' already exists. Updating..."
+    kubectl delete catalogsource "$name" -n "$namespace" --ignore-not-found
+    sleep 5
+  fi
+
+  cat <<EOF | kubectl apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+spec:
+  sourceType: grpc
+  image: ${catalog_image}
+  displayName: "Custom ${name} Catalog"
+  publisher: "Custom"
+  updateStrategy:
+    registryPoll:
+      interval: 10m
+EOF
+
+  echo "  * Waiting for CatalogSource to be ready..."
+
+  if ! kubectl wait catalogsource "$name" -n "$namespace" \
+      --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
+      --timeout="${CATALOGSOURCE_TIMEOUT}s" 2>/dev/null; then
+    local state
+    state=$(kubectl get catalogsource "$name" -n "$namespace" \
+      -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null) || true
+    echo "  ERROR: CatalogSource not ready after ${CATALOGSOURCE_TIMEOUT}s (state: $state)"
+    return 1
+  fi
+  echo "  * CatalogSource '$name' is ready"
+  return 0
+}
+
+# cleanup_custom_catalogsource name namespace
+#   Removes a custom CatalogSource created by create_custom_catalogsource.
+cleanup_custom_catalogsource() {
+  local name=${1?catalogsource name is required}; shift
+  local namespace=${1?namespace is required}; shift
+
+  if kubectl get catalogsource "$name" -n "$namespace" &>/dev/null; then
+    echo "* Removing CatalogSource '$name'..."
+    kubectl delete catalogsource "$name" -n "$namespace" --ignore-not-found
+  fi
+}
+
+# wait_datasciencecluster_ready [name] [timeout]
+#   Waits for a DataScienceCluster's KServe component (and AIGateway, if enabled) to be
+#   ready. Does NOT gate on ModelsAsServiceReady — see the comment inside the loop below
+#   for why that condition isn't a usable signal at this function's call sites.
+#
+# Arguments:
+#   name    - Name of the DataScienceCluster (default: default-dsc)
+#   timeout - Timeout in seconds (default: 600)
+#
+# Returns:
+#   0 on success, 1 on failure
+wait_datasciencecluster_ready() {
+  local name="${1:-default-dsc}"
+  local timeout="${2:-600}"
+  local interval=20
+  local elapsed=0
+
+  echo "* Waiting for DataScienceCluster '$name' KServe component to be ready..."
+
+  # AIGateway is only expected to be Managed/ready when the caller asked deploy.sh to pin
+  # an ai-gateway-operator image (see enable_ai_gateway_component). Only gate on it then —
+  # otherwise a cluster without AI Gateway enabled would never satisfy this check.
+  local require_aigateway=false
+  [[ -n "${AI_GATEWAY_OPERATOR_IMAGE:-}" ]] && require_aigateway=true
+
+  while [ $elapsed -lt $timeout ]; do
+    # Grab full DSC status as JSON
+    local dsc_json
+    dsc_json=$(kubectl get datasciencecluster "$name" -o json 2>/dev/null || echo "")
+    
+    if [ -z "$dsc_json" ]; then
+      echo "  - Waiting for DataScienceCluster/$name resource to appear..."
+      sleep $interval
+      elapsed=$((elapsed + interval))
+      continue
+    fi
+
+    local kserve_state kserve_ready maas_ready aigateway_ready aigateway_message
+    kserve_state=$(echo "$dsc_json" | jq -r '.status.components.kserve.managementState // ""')
+    kserve_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="KserveReady") | .status' | tail -n1)
+    maas_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="ModelsAsServiceReady") | .status' | tail -n1)
+    aigateway_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="AIGatewayReady") | .status' | tail -n1)
+    aigateway_message=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="AIGatewayReady") | .message' | tail -n1)
+
+    # ModelsAsServiceReady is NOT gated on here. Per the ModelsAsService component's own
+    # reconciler (opendatahub-operator internal/controller/components/modelsasservice), this
+    # condition just mirrors the maas-controller-owned Tenant CR's Ready status — and
+    # maas-controller isn't installed yet at any of this function's call sites (kustomize mode
+    # installs it via deploy.sh only after this DSC-readiness wait returns; operator mode's
+    # AIGateway module deploys it asynchronously afterward too). So ModelsAsServiceReady can
+    # never legitimately be True here — it isn't a usable readiness signal at this point in
+    # either deploy mode. Real maas-controller/Tenant readiness is verified later, once it
+    # actually exists (see wait_for_resource "deployment" "maas-controller" in deploy.sh).
+    # We still surface it below purely for diagnostics.
+    if [[ "$require_aigateway" == "true" && "$aigateway_ready" == "False" && -n "$aigateway_message" ]]; then
+      echo "  ERROR: AIGateway failed to reconcile in DataScienceCluster/$name: $aigateway_message"
+      echo "  This is a real deployment gap (not a transient state) — failing fast instead of waiting out the full timeout."
+      return 1
+    fi
+
+    if [[ "$kserve_state" == "Managed" && "$kserve_ready" == "True" ]] \
+      && { [[ "$require_aigateway" != "true" ]] || [[ "$aigateway_ready" == "True" ]]; }; then
+      echo "  * KServe (and AIGateway, if applicable) are ready in DataScienceCluster '$name'"
+      return 0
+    else
+      echo "  - KServe state: $kserve_state, KserveReady: $kserve_ready, ModelsAsServiceReady: ${maas_ready:-<absent>} (informational only), AIGatewayReady: ${aigateway_ready:-<n/a>}"
+    fi
+
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+
+  echo "  ERROR: KServe/AIGateway did not become ready in DataScienceCluster/$name within $timeout seconds."
+  echo "  Final status: KServe=$kserve_state, KserveReady=$kserve_ready, ModelsAsServiceReady=${maas_ready:-<absent>} (informational only), AIGatewayReady=${aigateway_ready:-<n/a>}"
+  echo "  Tip: Check 'kubectl describe datasciencecluster $name' for more details"
+  return 1
+}
+
+# wait_authorino_ready <namespace> [timeout]
+#   Waits for Authorino to be ready and accepting requests.
+#   Note: Request are required because authorino will report ready status but still give 500 errors.
+#
+#   This checks:
+#   1. Authorino CR status is Ready
+#   2. Auth service cluster is healthy in gateway's Envoy
+#   3. Auth requests are actually succeeding (not erroring)
+#
+# Arguments:
+#   namespace - Authorino namespace (required)
+#               "kuadrant-system" for Kuadrant (upstream/ODH)
+#               "rh-connectivity-link" for RHCL (downstream/RHOAI)
+#   timeout   - Timeout in seconds (default: AUTHORINO_TIMEOUT)
+#
+# Returns:
+#   0 on success, 1 on failure
+wait_authorino_ready() {
+  local authorino_namespace="${1:?ERROR: namespace is required (kuadrant-system or rh-connectivity-link)}"
+  local timeout=${2:-$AUTHORINO_TIMEOUT}
+  local interval=5
+  local elapsed=0
+
+  echo "* Waiting for Authorino to be ready (timeout: ${timeout}s)..."
+  echo "  - Checking Authorino in namespace: $authorino_namespace"
+
+  if ! kubectl get authorino -n "$authorino_namespace" &>/dev/null; then
+    echo "  ERROR: No Authorino CR found in namespace: $authorino_namespace"
+    return 1
+  fi
+
+  # First, wait for Authorino CR to be ready
+  echo "  - Checking Authorino CR status..."
+  while [[ $elapsed -lt $timeout ]]; do
+    local authorino_ready
+    authorino_ready=$(kubectl get authorino -n "$authorino_namespace" -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+
+    if [[ "$authorino_ready" == "True" ]]; then
+      echo "  * Authorino CR is Ready"
+      break
+    fi
+
+    echo "  - Authorino CR not ready yet (status: ${authorino_ready:-not found}), waiting..."
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+
+  if [[ $elapsed -ge $timeout ]]; then
+    echo "  ERROR: Authorino CR did not become ready within ${timeout} seconds"
+    return 1
+  fi
+
+  # Verify Gateway resource is ready
+  echo "  - Verifying Gateway resource is ready..."
+  local gateway_programmed
+  gateway_programmed=$(kubectl get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || echo "")
+
+  if [[ "$gateway_programmed" != "True" ]]; then
+    echo "  WARNING: Gateway is not Programmed yet (status: ${gateway_programmed:-not found})"
+    echo "  WARNING: This may cause auth service routing issues"
+  else
+    echo "  * Gateway is Programmed and ready"
+  fi
+
+  # Try to check auth service cluster health in gateway (Istio-specific, may not work with OpenShift Gateway)
+  echo "  - Checking if auth service is registered in gateway..."
+  local gateway_pod
+  gateway_pod=$(kubectl get pods -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=maas-default-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+  if [[ -z "$gateway_pod" ]]; then
+    echo "  - No dedicated gateway pod found (expected with OpenShift Gateway controller)"
+    echo "  - OpenShift Gateway uses shared router infrastructure"
+  else
+    # Try to check cluster health, but don't wait long since this might not work with OpenShift Gateway
+    local health_status
+    health_status=$(timeout 10s kubectl exec -n openshift-ingress "$gateway_pod" -- pilot-agent request GET /clusters 2>/dev/null | grep -E "kuadrant-auth-service|authorino.*authorization" | grep "health_flags" | head -1 || echo "")
+
+    if [[ "$health_status" == *"healthy"* ]]; then
+      echo "  * Auth service cluster is healthy in gateway"
+    else
+      echo "  - Gateway pod found but cluster health check not available (not Istio-based)"
+    fi
+  fi
+
+  # Finally, verify auth requests are actually succeeding (not just cluster marked healthy)
+  echo "  - Verifying auth requests are succeeding..."
+
+  # Get gateway URL from the gateway spec (aligned with verify-models-and-limits.sh)
+  local maas_url=""
+  local https_hostname
+  https_hostname=$(kubectl get gateway maas-default-gateway -n openshift-ingress \
+    -o jsonpath='{.spec.listeners[?(@.protocol=="HTTPS")].hostname}' 2>/dev/null | awk '{print $1}')
+
+  if [[ -n "$https_hostname" ]]; then
+    maas_url="https://${https_hostname}/maas-api/health"
+  else
+    local http_hostname
+    http_hostname=$(kubectl get gateway maas-default-gateway -n openshift-ingress \
+      -o jsonpath='{.spec.listeners[?(@.protocol=="HTTP")].hostname}' 2>/dev/null | awk '{print $1}')
+
+    if [[ -n "$http_hostname" ]]; then
+      maas_url="http://${http_hostname}/maas-api/health"
+    fi
+  fi
+
+  if [[ -z "$maas_url" ]]; then
+    echo "  WARNING: Could not determine gateway URL, skipping request verification"
+    return 0
+  fi
+
+  echo "  - Using gateway URL: $maas_url"
+  local consecutive_success=0
+  local required_success=3
+
+  while [[ $elapsed -lt $timeout ]]; do
+    # Make a test request - we expect 401 (auth working) not 500 (auth failing)
+    # Capture both response body and HTTP code for better diagnostics
+    local response_file
+    response_file=$(mktemp)
+    local http_code
+    http_code=$(curl -sSk -o "$response_file" -w "%{http_code}" "$maas_url" 2>&1)
+
+    # If http_code is not a 3-digit number, curl failed
+    if ! [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
+      local curl_error="$http_code"
+      http_code="000"
+    fi
+
+    if [[ "$http_code" == "401" || "$http_code" == "200" ]]; then
+      consecutive_success=$((consecutive_success + 1))
+      echo "  - Auth request succeeded (HTTP $http_code) [$consecutive_success/$required_success]"
+      rm -f "$response_file"
+
+      if [[ $consecutive_success -ge $required_success ]]; then
+        echo "  * Auth requests verified working"
+        return 0
+      fi
+    else
+      consecutive_success=0
+      if [[ "$http_code" == "000" ]]; then
+        # Show actual curl error
+        local error_msg
+        error_msg=$(echo "$curl_error" | head -1 | sed 's/^curl: ([0-9]*) //')
+        echo "  - Auth request failed: ${error_msg:-Connection failed}"
+      elif [[ "$http_code" == "500" || "$http_code" == "502" || "$http_code" == "503" ]]; then
+        # Show response body for server errors
+        local error_body
+        error_body=$(cat "$response_file" 2>/dev/null | head -c 200 | tr '\n' ' ')
+        echo "  - Auth request returned HTTP $http_code: ${error_body:-no details}"
+      else
+        echo "  - Auth request returned HTTP $http_code, waiting for stabilization..."
+      fi
+      rm -f "$response_file"
+    fi
+
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  echo "  WARNING: Auth request verification timed out, continuing anyway"
+  return 0
+}
+
+# ==========================================
+# External OIDC / AuthPolicy alignment
+# ==========================================
+
+# verify_gateway_oidc_authpolicy <gateway_namespace>
+# When OIDC_ISSUER_URL is set, verify the gateway-level maas-gateway-auth AuthPolicy
+# contains oidc-identities authentication with the correct issuer URL.
+# This is the consolidated gateway AuthPolicy that replaces the per-route
+# maas-api-auth-policy for OIDC configuration.
+# Returns 0 if skipped (no OIDC_ISSUER_URL) or match; 1 on failure.
+verify_gateway_oidc_authpolicy() {
+  local ns="${1:-openshift-ingress}"
+  if [[ -z "${OIDC_ISSUER_URL:-}" ]]; then
+    return 0
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "verify_gateway_oidc_authpolicy: jq not found; skipping OIDC issuer check" >&2
+    return 0
+  fi
+  local json
+  if ! json=$(kubectl get authpolicy maas-gateway-auth -n "$ns" -o json 2>/dev/null); then
+    echo "verify_gateway_oidc_authpolicy: could not read authpolicy/maas-gateway-auth in namespace $ns" >&2
+    return 1
+  fi
+  local policy_issuer
+  # Try v1 structure first (.spec.rules), then fall back to v1beta2 (.spec.defaults.rules)
+  # TenantReconciler uses v1 structure; MaaSAuthPolicyReconciler still uses v1beta2 structure
+  policy_issuer=$(echo "$json" | jq -r '.spec.rules.authentication["oidc-identities"].jwt.issuerUrl // .spec.defaults.rules.authentication["oidc-identities"].jwt.issuerUrl // empty')
+  if [[ -z "$policy_issuer" ]]; then
+    echo "verify_gateway_oidc_authpolicy: maas-gateway-auth has no oidc-identities authentication rule" >&2
+    echo "  Ensure the default AITenant has spec.oidc configured and MaaSAuthPolicy controller has reconciled." >&2
+    return 1
+  fi
+  local exp got
+  exp="${OIDC_ISSUER_URL%/}"
+  got="${policy_issuer%/}"
+  if [[ "$exp" != "$got" ]]; then
+    echo "verify_gateway_oidc_authpolicy: OIDC issuer mismatch." >&2
+    echo "  Expected (OIDC_ISSUER_URL):          $exp" >&2
+    echo "  Live maas-gateway-auth issuerUrl:   $got" >&2
+    echo "  Fix: ensure AITenant spec.oidc.issuerUrl matches OIDC_ISSUER_URL." >&2
+    return 1
+  fi
+  return 0
+}
+
+# ==========================================
+# Database Secret Helpers
+# ==========================================
+
+# create_maas_db_config_secret <namespace> <connection_url>
+#   Creates the maas-db-config Secret containing DB_CONNECTION_URL.
+#   This secret is read by maas-api at startup to connect to PostgreSQL.
+#
+# Usage:
+#   create_maas_db_config_secret "opendatahub" "postgresql://user:pass@host:5432/db?sslmode=require"
+create_maas_db_config_secret() {
+  local namespace="$1"
+  local connection_url="$2"
+
+  if [[ -z "$namespace" ]]; then
+    log_error "create_maas_db_config_secret: namespace is required"
+    return 1
+  fi
+  if [[ -z "$connection_url" ]]; then
+    log_error "create_maas_db_config_secret: connection_url is required"
+    return 1
+  fi
+
+  # Pass the connection URL via stdin to avoid exposing credentials in process arguments
+  printf '%s' "$connection_url" | \
+    kubectl create secret generic maas-db-config \
+      --from-file=DB_CONNECTION_URL=/dev/stdin \
+      --dry-run=client -o yaml | \
+    kubectl label --local -f - app=maas-api --dry-run=client -o yaml | \
+    kubectl apply -n "$namespace" -f -
+}
+
+# ==========================================
+# Diagnostic Helpers
+# ==========================================
+
+# dump_llmis_diagnostics <llmis_name> <namespace>
+#   Dumps comprehensive diagnostic information when an LLMInferenceService
+#   fails to become ready. Captures pod status, logs, events, and node resources
+#   to help diagnose deployment failures.
+#
+# Usage:
+#   if ! kubectl wait llminferenceservice/my-model --for=condition=Ready; then
+#       dump_llmis_diagnostics "my-model" "llm"
+#   fi
+#
+# Output:
+#   - LLMInferenceService status (conditions, observedGeneration)
+#   - Pod status (wide format)
+#   - ReplicaSet/Deployment status
+#   - Container logs (current and previous)
+#   - Namespace events
+#   - Node resource allocation
+dump_llmis_diagnostics() {
+    local llmis_name="$1"
+    local namespace="$2"
+
+    if [[ -z "$llmis_name" || -z "$namespace" ]]; then
+        echo "Usage: dump_llmis_diagnostics <llmis_name> <namespace>"
+        return 1
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "LLMInferenceService Diagnostics: $llmis_name"
+    echo "=========================================="
+
+    echo ""
+    echo "========== LLMInferenceService Status =========="
+    # Only output status (not full YAML) to avoid logging potentially sensitive spec fields
+    kubectl get llminferenceservice/"$llmis_name" -n "$namespace" -o jsonpath='{.status}' 2>&1 | jq -C '.' 2>/dev/null || \
+        kubectl get llminferenceservice/"$llmis_name" -n "$namespace" -o jsonpath='{.status}' 2>&1 || \
+        echo "  (failed to get LLMIS status)"
+
+    echo ""
+    echo "========== Pod Status =========="
+    # KServe creates resources with pattern: ${llmis_name}-kserve-*
+    # Use name-based filtering since label selectors may not match
+    if kubectl get pods -n "$namespace" 2>/dev/null | grep -q "^${llmis_name}-"; then
+        kubectl get pods -n "$namespace" 2>&1 | grep "^NAME\|^${llmis_name}-" || echo "  (no matching pods found)"
+    else
+        echo "  (no pods found matching pattern: ${llmis_name}-*)"
+    fi
+
+    echo ""
+    echo "========== ReplicaSet Status =========="
+    if kubectl get rs -n "$namespace" 2>/dev/null | grep -q "^${llmis_name}-"; then
+        kubectl get rs -n "$namespace" -o wide 2>&1 | grep "^NAME\|^${llmis_name}-" || echo "  (no matching replicasets found)"
+    else
+        echo "  (no replicasets found matching pattern: ${llmis_name}-*)"
+    fi
+
+    echo ""
+    echo "========== Deployment Status =========="
+    if kubectl get deployment -n "$namespace" 2>/dev/null | grep -q "^${llmis_name}-"; then
+        kubectl get deployment -n "$namespace" -o wide 2>&1 | grep "^NAME\|^${llmis_name}-" || echo "  (no matching deployments found)"
+    else
+        echo "  (no deployments found matching pattern: ${llmis_name}-*)"
+    fi
+
+    echo ""
+    echo "========== Container Logs =========="
+    local pods
+    # Use awk alone to avoid grep exit code 1 when no matches found
+    pods=$(kubectl get pods -n "$namespace" --no-headers 2>/dev/null | awk '/^'"${llmis_name}"'-/ {print $1}')
+
+    if [[ -z "$pods" ]]; then
+        echo "  (no pods found - container logs unavailable)"
+    else
+        for pod in $pods; do
+            echo ""
+            echo "--- Pod: $pod ---"
+
+            # Try main container
+            echo "Main container (current):"
+            kubectl logs "$pod" -n "$namespace" -c main --tail=100 2>&1 || echo "  (no logs available)"
+
+            echo ""
+            echo "Main container (previous - if crashed):"
+            kubectl logs "$pod" -n "$namespace" -c main --previous --tail=100 2>&1 || echo "  (no previous logs)"
+
+            echo ""
+            echo "Storage initializer container:"
+            kubectl logs "$pod" -n "$namespace" -c storage-initializer --tail=50 2>&1 || echo "  (no logs available)"
+        done
+    fi
+
+    echo ""
+    echo "========== Namespace Events (Recent 100) =========="
+    kubectl get events -n "$namespace" --sort-by='.lastTimestamp' 2>&1 | tail -100 || echo "  (failed to get events)"
+
+    echo ""
+    echo "========== Node Status =========="
+    kubectl get nodes -o wide 2>&1 || echo "  (failed to get nodes)"
+
+    echo ""
+    echo "========== Node Resource Allocation =========="
+    kubectl describe nodes 2>&1 | grep -A 10 "Allocated resources:" || echo "  (failed to get node resources)"
+
+    echo ""
+    echo "=========================================="
+    echo "End of diagnostics for: $llmis_name"
+    echo "=========================================="
+}
+
+# ==========================================
+# Gateway AllowedRoutes Helpers
+# ==========================================
+
+# _allowed_routes_same_yaml <indent_string>
+#   Emits the secure-default allowedRoutes YAML block (from: Same).
+_allowed_routes_same_yaml() {
+  local I="$1"
+  printf '%s' \
+"${I}allowedRoutes:
+${I}  namespaces:
+${I}    from: Same"
+}
+
+# _is_valid_dns1123_label <value>
+#   Returns 0 if value is a DNS-1123 label (safe to embed in YAML/JSON quotes).
+_is_valid_dns1123_label() {
+  local v="$1"
+  [[ ${#v} -le 63 ]] && [[ "$v" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]
+}
+
+# _is_valid_k8s_label_key <key>
+#   Returns 0 if key is a valid Kubernetes label key (name or prefix/name).
+_is_valid_k8s_label_key() {
+  local key="$1" name prefix
+  [[ -z "$key" || ${#key} -gt 253 ]] && return 1
+  if [[ "$key" == */* ]]; then
+    prefix="${key%/*}"
+    name="${key##*/}"
+    [[ -z "$prefix" || -z "$name" ]] && return 1
+    # Prefix: DNS subdomain; name: DNS-1123 label with optional dots/underscores mid-segment
+    [[ "$prefix" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]] || return 1
+    [[ ${#name} -le 63 && "$name" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]] || return 1
+    return 0
+  fi
+  [[ ${#key} -le 63 && "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
+}
+
+# _is_valid_k8s_label_value <value>
+#   Returns 0 if value is a valid Kubernetes label value (or empty).
+_is_valid_k8s_label_value() {
+  local v="$1"
+  [[ -z "$v" ]] && return 0
+  [[ ${#v} -le 63 && "$v" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
+}
+
+# build_allowed_routes_yaml <indent>
+#   Generates the allowedRoutes YAML block for a Gateway listener at the given
+#   indentation level. Designed for embedding directly into heredoc manifests.
+#
+#   Uses env vars (see below) to pick a mode:
+#     ALLOWED_ROUTE_NAMESPACES  → from: Selector with matchExpressions on
+#                                  kubernetes.io/metadata.name (namespace name list)
+#     NAMESPACE_SELECTOR_LABELS → from: Selector with matchLabels (label filter)
+#     (neither / invalid)       → from: Same (secure default; only the Gateway's
+#                                  own namespace can attach HTTPRoutes)
+#
+# Arguments:
+#   indent - Number of spaces for the 'allowedRoutes:' key (default: 6)
+#
+# Environment:
+#   ALLOWED_ROUTE_NAMESPACES  - Comma-separated namespace names, e.g. "opendatahub,llm"
+#   NAMESPACE_SELECTOR_LABELS - Comma-separated key=value pairs, e.g. "gateway-access=true"
+build_allowed_routes_yaml() {
+  local indent="${1:-6}"
+  local I
+  I="$(printf '%*s' "$indent" '')"
+
+  if [[ -n "${ALLOWED_ROUTE_NAMESPACES:-}" ]]; then
+    local values_lines="" _ns
+    IFS=',' read -ra _ns_arr <<< "$ALLOWED_ROUTE_NAMESPACES"
+    for _ns in "${_ns_arr[@]}"; do
+      _ns="${_ns//[[:space:]]/}"
+      [[ -z "$_ns" ]] && continue
+      if ! _is_valid_dns1123_label "$_ns"; then
+        log_warn "Ignoring invalid namespace name in ALLOWED_ROUTE_NAMESPACES: ${_ns}"
+        continue
+      fi
+      values_lines+="${I}        - \"${_ns}\""$'\n'
+    done
+    if [[ -z "$values_lines" ]]; then
+      # Empty/invalid list would emit values:[] which matches nothing and is not
+      # a useful config — fall back to the secure default instead.
+      log_warn "ALLOWED_ROUTE_NAMESPACES has no valid namespace names; falling back to from: Same"
+      _allowed_routes_same_yaml "$I"
+      return 0
+    fi
+    printf '%s' \
+"${I}allowedRoutes:
+${I}  namespaces:
+${I}    from: Selector
+${I}    selector:
+${I}      matchExpressions:
+${I}      - key: kubernetes.io/metadata.name
+${I}        operator: In
+${I}        values:
+${values_lines}"
+  elif [[ -n "${NAMESPACE_SELECTOR_LABELS:-}" ]]; then
+    local labels_lines="" _pair _key _val
+    IFS=',' read -ra _pairs <<< "$NAMESPACE_SELECTOR_LABELS"
+    for _pair in "${_pairs[@]}"; do
+      _pair="${_pair//[[:space:]]/}"
+      [[ -z "$_pair" || "$_pair" != *=* ]] && continue
+      _key="${_pair%%=*}"
+      _val="${_pair#*=}"
+      if [[ -z "$_key" ]] || ! _is_valid_k8s_label_key "$_key" || ! _is_valid_k8s_label_value "$_val"; then
+        log_warn "Ignoring invalid label selector pair in NAMESPACE_SELECTOR_LABELS: ${_pair}"
+        continue
+      fi
+      labels_lines+="${I}        ${_key}: \"${_val}\""$'\n'
+    done
+    if [[ -z "$labels_lines" ]]; then
+      # No valid key=value pairs — fall back to the secure default instead of
+      # emitting an empty matchLabels selector, which would match all namespaces.
+      log_warn "NAMESPACE_SELECTOR_LABELS has no valid key=value pairs; falling back to from: Same"
+      _allowed_routes_same_yaml "$I"
+      return 0
+    fi
+    printf '%s' \
+"${I}allowedRoutes:
+${I}  namespaces:
+${I}    from: Selector
+${I}    selector:
+${I}      matchLabels:
+${labels_lines}"
+  else
+    _allowed_routes_same_yaml "$I"
+  fi
+}
+
+# build_allowed_routes_json
+#   Outputs the allowedRoutes value as JSON for use with kubectl patch --type=json.
+#   Uses the same ALLOWED_ROUTE_NAMESPACES / NAMESPACE_SELECTOR_LABELS env vars
+#   as build_allowed_routes_yaml; defaults to {"namespaces":{"from":"Same"}}.
+build_allowed_routes_json() {
+  if [[ -n "${ALLOWED_ROUTE_NAMESPACES:-}" ]]; then
+    local values="" _ns
+    IFS=',' read -ra _ns_arr <<< "$ALLOWED_ROUTE_NAMESPACES"
+    for _ns in "${_ns_arr[@]}"; do
+      _ns="${_ns//[[:space:]]/}"
+      [[ -z "$_ns" ]] && continue
+      if ! _is_valid_dns1123_label "$_ns"; then
+        log_warn "Ignoring invalid namespace name in ALLOWED_ROUTE_NAMESPACES: ${_ns}" >&2
+        continue
+      fi
+      [[ -n "$values" ]] && values+=","
+      values+="\"${_ns}\""
+    done
+    if [[ -z "$values" ]]; then
+      log_warn "ALLOWED_ROUTE_NAMESPACES has no valid namespace names; falling back to from: Same" >&2
+      printf '{"namespaces":{"from":"Same"}}'
+      return 0
+    fi
+    printf '{"namespaces":{"from":"Selector","selector":{"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":[%s]}]}}}' "$values"
+  elif [[ -n "${NAMESPACE_SELECTOR_LABELS:-}" ]]; then
+    local labels_json="{" first=true _pair _key _val
+    IFS=',' read -ra _pairs <<< "$NAMESPACE_SELECTOR_LABELS"
+    for _pair in "${_pairs[@]}"; do
+      _pair="${_pair//[[:space:]]/}"
+      [[ -z "$_pair" || "$_pair" != *=* ]] && continue
+      _key="${_pair%%=*}"
+      _val="${_pair#*=}"
+      if [[ -z "$_key" ]] || ! _is_valid_k8s_label_key "$_key" || ! _is_valid_k8s_label_value "$_val"; then
+        log_warn "Ignoring invalid label selector pair in NAMESPACE_SELECTOR_LABELS: ${_pair}" >&2
+        continue
+      fi
+      [[ "$first" == "true" ]] && first=false || labels_json+=","
+      labels_json+="\"${_key}\":\"${_val}\""
+    done
+    labels_json+="}"
+    if [[ "$labels_json" == "{}" ]]; then
+      # No valid key=value pairs — fall back to the secure default instead of
+      # emitting matchLabels:{} which matches all namespaces.
+      log_warn "NAMESPACE_SELECTOR_LABELS has no valid key=value pairs; falling back to from: Same" >&2
+      printf '{"namespaces":{"from":"Same"}}'
+      return 0
+    fi
+    printf '{"namespaces":{"from":"Selector","selector":{"matchLabels":%s}}}' "$labels_json"
+  else
+    printf '{"namespaces":{"from":"Same"}}'
+  fi
+}
+
+# patch_gateway_allowed_routes <gateway_name> <gateway_namespace>
+#   Ensures ALL listeners' allowedRoutes on an existing Gateway match the desired
+#   configuration. Patches when:
+#     - Any listener has an insecure allowedRoutes default, OR
+#     - ALLOWED_ROUTE_NAMESPACES or NAMESPACE_SELECTOR_LABELS is set (applies user config)
+#   Skips when all listeners are already at a secure non-All state and no custom
+#   config is requested. Applies the same allowedRoutes to every listener so that
+#   multi-listener Gateways (e.g. HTTP + HTTPS) are patched consistently.
+#
+# Arguments:
+#   gateway_name      - Name of the Gateway resource
+#   gateway_namespace - Namespace of the Gateway
+patch_gateway_allowed_routes() {
+  local gateway_name="$1"
+  local gateway_namespace="$2"
+
+  # Count listeners without requiring jq: emit one 'x' per listener then count chars.
+  local listener_count
+  if ! listener_count=$(kubectl get gateway "$gateway_name" -n "$gateway_namespace" \
+    -o jsonpath='{range .spec.listeners[*]}x{end}' 2>/dev/null | wc -c | tr -d ' '); then
+    log_error "Unable to read Gateway ${gateway_namespace}/${gateway_name} for allowedRoutes update"
+    return 1
+  fi
+  if [[ "$listener_count" -eq 0 ]]; then
+    log_debug "  Gateway ${gateway_namespace}/${gateway_name} has no listeners — skipping allowedRoutes patch"
+    return 0
+  fi
+
+  local has_custom_config=false
+  [[ -n "${ALLOWED_ROUTE_NAMESPACES:-}" || -n "${NAMESPACE_SELECTOR_LABELS:-}" ]] && has_custom_config=true
+
+  # Check whether any listener still carries an insecure allowedRoutes default.
+  # Treat a read failure as needing a patch (fail closed) rather than silently skipping.
+  local any_all=false
+  local i current_from
+  for ((i=0; i<listener_count; i++)); do
+    if ! current_from=$(kubectl get gateway "$gateway_name" -n "$gateway_namespace" \
+      -o jsonpath="{.spec.listeners[$i].allowedRoutes.namespaces.from}" 2>/dev/null); then
+      log_warn "  Could not read listener $i allowedRoutes from Gateway ${gateway_namespace}/${gateway_name} — assuming patch needed"
+      any_all=true
+      break
+    fi
+    [[ "$current_from" == "All" ]] && any_all=true && break
+  done
+
+  # Skip if all listeners are already secure and no custom config is requested.
+  if [[ "$any_all" == "false" && "$has_custom_config" == "false" ]]; then
+    log_debug "  Gateway allowedRoutes already secure on all listeners — skipping"
+    return 0
+  fi
+
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    log_info "  [DRY RUN] Would update allowedRoutes on ${listener_count} listener(s)"
+    return 0
+  fi
+
+  log_info "  Updating Gateway allowedRoutes on ${listener_count} listener(s)..."
+  local json patch_ops="" sep=""
+  json="$(build_allowed_routes_json)"
+  # Build a single JSON patch array covering every listener.
+  # op:add is safe for both present and absent allowedRoutes fields (RFC 6902 §4.1).
+  for ((i=0; i<listener_count; i++)); do
+    patch_ops+="${sep}{\"op\":\"add\",\"path\":\"/spec/listeners/${i}/allowedRoutes\",\"value\":${json}}"
+    sep=","
+  done
+  kubectl patch gateway "$gateway_name" -n "$gateway_namespace" --type='json' \
+    -p="[${patch_ops}]"
+}

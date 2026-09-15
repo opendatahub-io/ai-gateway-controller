@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-api
+spec:
+  selector:
+    app.kubernetes.io/name: maas-api
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  # Metrics are exposed only via Service/maas-api-metrics (see metrics_service.yaml).
+  # That dedicated Service owns the OpenShift service-ca serving cert for HTTPS scrape.
+  type: ClusterIP

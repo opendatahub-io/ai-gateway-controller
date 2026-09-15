@@ -1,0 +1,74 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../default
+  - destinationrule.yaml
+
+configMapGenerator:
+  - name: maas-parameters
+    literals:
+      - namespace=opendatahub
+    options:
+      disableNameSuffixHash: true
+
+patches:
+  - path: deployment-patch.yaml
+  - path: service-patch.yaml
+  - path: servicemonitor-patch.yaml
+  - path: cronjob-cleanup-patch.yaml
+  - path: networkpolicy-cleanup-patch.yaml
+  - target:
+      group: gateway.networking.k8s.io
+      version: v1
+      kind: HTTPRoute
+      name: maas-api-route
+    patch: |-
+      # Patches both HTTPRoute rules to use HTTPS port 8443
+      # Rule 0: /maas-api/* paths, Rule 1: /v1/models paths
+      - op: replace
+        path: /spec/rules/0/backendRefs/0/port
+        value: 8443
+      - op: replace
+        path: /spec/rules/1/backendRefs/0/port
+        value: 8443
+  # Fix NetworkPolicy ingress podSelector - the labels transformer in 'default'
+  # incorrectly adds MaaS labels to the Authorino podSelector. Authorino pods
+  # only have 'authorino-resource: authorino', so we restore the correct selector.
+  - target:
+      kind: NetworkPolicy
+      name: maas-authorino-allow
+    patch: |
+      - op: replace
+        path: /spec/ingress/0/from/0/podSelector/matchLabels
+        value:
+          authorino-resource: authorino
+
+# Derive ServiceMonitor tlsConfig.serverName as <service-name>.<namespace>.svc
+replacements:
+  - source:
+      kind: Service
+      name: maas-api-metrics
+      fieldPath: metadata.name
+    targets:
+      - select:
+          kind: ServiceMonitor
+          name: maas-api-metrics
+        fieldPaths:
+          - spec.endpoints.0.tlsConfig.serverName
+        options:
+          delimiter: "."
+          index: 0
+  - source:
+      kind: ConfigMap
+      name: maas-parameters
+      fieldPath: data.namespace
+    targets:
+      - select:
+          kind: ServiceMonitor
+          name: maas-api-metrics
+        fieldPaths:
+          - spec.endpoints.0.tlsConfig.serverName
+        options:
+          delimiter: "."
+          index: 1

@@ -1,0 +1,94 @@
+{
+  "realm": "tenant-a",
+  "enabled": true,
+  "accessTokenLifespan": 60,
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "verifyEmail": false,
+  "requiredActions": [],
+  "defaultDefaultClientScopes": ["profile", "email"],
+  "clients": [
+    {
+      "clientId": "test-client",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "groups",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "wrong-client",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "description": "Test-only client used to verify oidc-client-bound enforcement. Tokens issued to this client carry azp=wrong-client and must be rejected by MaaS even though the issuer is valid."
+    }
+  ],
+  "groups": [
+    {"name": "Engineering"},
+    {"name": "Site-Reliability"},
+    {"name": "Project-Alpha"},
+    {"name": "unsafe;group"}
+  ],
+  "users": [
+    {
+      "username": "alice_lead",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [{"type": "password", "value": "letmein", "temporary": false}],
+      "groups": ["Engineering", "Project-Alpha"]
+    },
+    {
+      "username": "bob_sre",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [{"type": "password", "value": "letmein", "temporary": false}],
+      "groups": ["Site-Reliability"]
+    },
+    {
+      "username": "evil_user",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [{"type": "password", "value": "letmein", "temporary": false}],
+      "groups": ["unsafe;group"]
+    },
+    {
+      "username": "dave_noaccess",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [{"type": "password", "value": "letmein", "temporary": false}],
+      "groups": []
+    },
+    {
+      "username": "mixed_user",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [{"type": "password", "value": "letmein", "temporary": false}],
+      "groups": ["Engineering", "unsafe;group"]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: maas-xks-overlay
+
+resources:
+  - ../../base/maas-controller/overlays/xks

@@ -1,0 +1,1834 @@
+"""
+Shared helpers and constants for MaaS E2E tests.
+
+This module centralizes common utilities used across multiple test files:
+- Environment-based constants (timeouts, model refs, namespaces)
+- Cluster authentication (OC tokens, service account tokens)
+- API key management (create, revoke)
+- Custom Resource management (apply, delete, get, list, snapshot)
+- Inference helpers (send requests, poll for expected status)
+- Wait/polling utilities (reconciliation, CR readiness, phase checks)
+- CR creation helpers (MaaSAuthPolicy, MaaSSubscription)
+
+Environment variables (all optional unless noted):
+  - GATEWAY_HOST: Gateway hostname (required)
+  - MAAS_API_BASE_URL: MaaS API URL (auto-derived from GATEWAY_HOST if not set)
+  - MAAS_SUBSCRIPTION_NAMESPACE: MaaS CRs namespace (default: models-as-a-service)
+  - E2E_MAAS_API_DEPLOYMENT_NAMESPACE: Namespace where maas-api workloads run (default: derived INFRA_NAMESPACE)
+  - E2E_CURL_POD_NAMESPACE: Namespace for ephemeral kubectl-run curl probes (default: GATEWAY_NAMESPACE)
+  - GATEWAY_NAMESPACE: Gateway namespace (default: openshift-ingress)
+  - E2E_TEST_TOKEN_SA_NAMESPACE, E2E_TEST_TOKEN_SA_NAME: SA token source for Prow
+  - E2E_TIMEOUT: Request timeout in seconds (default: 45)
+  - E2E_RECONCILE_WAIT: Baseline for poll timeouts in seconds (default: 8)
+  - E2E_SKIP_TLS_VERIFY: Set to "true" to skip TLS verification
+  - E2E_CURL_CA_CONFIGMAP: ConfigMap containing CA bundle for curl pod TLS (default: "" = OpenShift service CA, then SA ca.crt fallback)
+  - E2E_CURL_CA_CONFIGMAP_KEY: Key within the CA ConfigMap (default: service-ca.crt)
+  - E2E_MODEL_PATH: Path to free model (default: /llm/facebook-opt-125m-simulated)
+  - E2E_MODEL_NAME: Model name for API requests (default: facebook/opt-125m)
+  - E2E_MODEL_REF: Model ref for CRs (default: facebook-opt-125m-simulated)
+  - E2E_MODEL_NAMESPACE: Namespace where models live (default: llm)
+  - E2E_SIMULATOR_SUBSCRIPTION: Free-tier subscription (default: simulator-subscription)
+  - E2E_PREMIUM_MODEL_REF: Premium model ref (default: premium-simulated-simulated-premium)
+  - E2E_PREMIUM_MODEL_NAME: Premium served model name (default: facebook/opt-125m-premium)
+  - E2E_PREMIUM_MODEL_PATH: Gateway path for premium model (default: /llm/premium-simulated-simulated-premium)
+  - E2E_PREMIUM_SIMULATOR_SUBSCRIPTION: Premium subscription (default: premium-simulator-subscription)
+  - E2E_SIMULATOR_ACCESS_POLICY: Simulator auth policy name (default: simulator-access)
+  - E2E_UNCONFIGURED_MODEL_REF: Unconfigured model ref (default: e2e-unconfigured-facebook-opt-125m-simulated)
+  - E2E_UNCONFIGURED_MODEL_PATH: Path to unconfigured model (default: /llm/e2e-unconfigured-facebook-opt-125m-simulated)
+  - E2E_UNCONFIGURED_MODEL_NAME: Unconfigured served model name (default: test/e2e-unconfigured-model)
+  - E2E_DISTINCT_MODEL_REF: First distinct model ref (default: e2e-distinct-simulated)
+  - E2E_DISTINCT_MODEL_ID: Canonical BBR model ID for first distinct model (default: publishers/{MODEL_NAMESPACE}/models/test/e2e-distinct-model)
+  - E2E_DISTINCT_MODEL_2_REF: Second distinct model ref (default: e2e-distinct-2-simulated)
+  - E2E_DISTINCT_MODEL_2_ID: Canonical BBR model ID for second distinct model (default: publishers/{MODEL_NAMESPACE}/models/test/e2e-distinct-model-2)
+  - E2E_TRLP_TEST_MODEL_REF: TRLP test model ref (default: e2e-trlp-test-simulated)                                                                                                   
+  - E2E_TRLP_TEST_MODEL_PATH: Path to TRLP test model (default: /llm/e2e-trlp-test-simulated)
+  - E2E_TRLP_TEST_MODEL_ID: Model ID for TRLP test model (default: test/e2e-trlp-test-model)
+  - E2E_GATEWAY_AUTH_POLICY_NAME: Gateway Kuadrant AuthPolicy name (default: maas-gateway-auth)
+  - E2E_GATEWAY_PROPAGATION_RETRIES: Retries for empty 401/403 / AUTH_FAILURE (default: 6)
+  - E2E_GATEWAY_PROPAGATION_DELAY: Delay between gateway retries in seconds (default: 5)
+  - E2E_GATEWAY_ENFORCED_TIMEOUT: Wait for AuthPolicy Accepted+Enforced (default: 180)
+  - E2E_GATEWAY_ENFORCED_MISSING_GRACE: Fail early if AuthPolicy CR absent this long (default: 30)
+"""
+
+import base64
+import functools
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import time
+import uuid
+from typing import Optional
+
+import requests
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants (override with env vars)
+# ---------------------------------------------------------------------------
+TIMEOUT = int(os.environ.get("E2E_TIMEOUT", "45"))
+RECONCILE_WAIT = int(os.environ.get("E2E_RECONCILE_WAIT", "8"))
+TLS_VERIFY = os.environ.get("E2E_SKIP_TLS_VERIFY", "").lower() != "true"
+MODEL_PATH = os.environ.get("E2E_MODEL_PATH", "/llm/facebook-opt-125m-simulated")
+MODEL_NAME = os.environ.get("E2E_MODEL_NAME", "facebook/opt-125m")
+MODEL_REF = os.environ.get("E2E_MODEL_REF", "facebook-opt-125m-simulated")
+MODEL_NAMESPACE = os.environ.get("E2E_MODEL_NAMESPACE", "llm")
+# Canonical BBR model ID as returned by GET /v1/models (publishers/{namespace}/models/{spec.model.name}).
+# Clients must use this form in the "model" field when targeting the BBR gateway endpoint.
+MODEL_CANONICAL_ID = os.environ.get("E2E_MODEL_CANONICAL_ID", f"publishers/{MODEL_NAMESPACE}/models/{MODEL_NAME}")
+DEPLOYMENT_NAMESPACE = os.environ.get("DEPLOYMENT_NAMESPACE", "opendatahub")
+# Kuadrant gateway AuthPolicy that Authorino enforces for maas-api + model routes.
+GATEWAY_AUTH_POLICY_NAME = os.environ.get("E2E_GATEWAY_AUTH_POLICY_NAME", "maas-gateway-auth")
+# Empty 403 / Authorino AUTH_FAILURE while Envoy catches up after AuthPolicy updates.
+GATEWAY_PROPAGATION_RETRIES = int(os.environ.get("E2E_GATEWAY_PROPAGATION_RETRIES", "6"))
+GATEWAY_PROPAGATION_DELAY = int(os.environ.get("E2E_GATEWAY_PROPAGATION_DELAY", "5"))
+# Wait for maas-gateway-auth Accepted+Enforced before minting keys / calling maas-api.
+# 180s covers AuthConfig backlog after heavy MaaSAuthPolicy churn in Konflux e2e.
+GATEWAY_ENFORCED_TIMEOUT = int(os.environ.get("E2E_GATEWAY_ENFORCED_TIMEOUT", "180"))
+# If the AuthPolicy CR is missing this long, fail fast (misconfigured name/namespace)
+# instead of burning the full GATEWAY_ENFORCED_TIMEOUT.
+GATEWAY_ENFORCED_MISSING_GRACE = int(os.environ.get("E2E_GATEWAY_ENFORCED_MISSING_GRACE", "30"))
+# Controller reconcile under pytest-xdist load needs longer phase waits (see prow_run_smoke_test.sh).
+AUTHPOLICY_PHASE_TIMEOUT = int(os.environ.get("E2E_AUTHPOLICY_PHASE_TIMEOUT", "60"))
+MAAS_SUBSCRIPTION_PHASE_TIMEOUT = int(os.environ.get("E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT", "60"))
+
+
+def _derive_infra_namespace(controller_namespace: str) -> str:
+    if controller_namespace == "redhat-ods-applications":
+        return "redhat-ai-gateway-infra"
+    if controller_namespace == "opendatahub":
+        return "odh-ai-gateway-infra"
+    return controller_namespace
+
+
+def _resolve_maas_api_deployment_namespace() -> str:
+    explicit_namespace = os.environ.get("E2E_MAAS_API_DEPLOYMENT_NAMESPACE")
+    if explicit_namespace:
+        return explicit_namespace
+
+    infra_namespace = os.environ.get("INFRA_NAMESPACE")
+    if infra_namespace is None or infra_namespace == "AUTO":
+        return _derive_infra_namespace(DEPLOYMENT_NAMESPACE)
+    if infra_namespace == "":
+        return DEPLOYMENT_NAMESPACE
+    return infra_namespace
+
+
+# Infrastructure namespace where maas-api workloads run.
+MAAS_API_DEPLOYMENT_NAMESPACE = _resolve_maas_api_deployment_namespace()
+GATEWAY_NAMESPACE = os.environ.get("GATEWAY_NAMESPACE", "openshift-ingress")
+# Ephemeral curl probes run from the deployment namespace (where the UI runs),
+# matching the real traffic path for internal endpoints like /v1/tenants.
+E2E_CURL_POD_NAMESPACE = os.environ.get("E2E_CURL_POD_NAMESPACE", DEPLOYMENT_NAMESPACE)
+E2E_CURL_IMAGE = os.environ.get("E2E_CURL_IMAGE", "registry.access.redhat.com/ubi9/ubi-minimal:9.5")
+E2E_CURL_CA_CONFIGMAP = os.environ.get("E2E_CURL_CA_CONFIGMAP", "")
+E2E_CURL_CA_CONFIGMAP_KEY = os.environ.get("E2E_CURL_CA_CONFIGMAP_KEY", "service-ca.crt")
+SIMULATOR_SUBSCRIPTION = os.environ.get("E2E_SIMULATOR_SUBSCRIPTION", "simulator-subscription")
+PREMIUM_MODEL_REF = os.environ.get("E2E_PREMIUM_MODEL_REF", "premium-simulated-simulated-premium")
+PREMIUM_MODEL_NAME = os.environ.get("E2E_PREMIUM_MODEL_NAME", "facebook/opt-125m-premium")
+PREMIUM_MODEL_PATH = os.environ.get("E2E_PREMIUM_MODEL_PATH", "/llm/premium-simulated-simulated-premium")
+PREMIUM_MODEL_CANONICAL_ID = os.environ.get(
+    "E2E_PREMIUM_MODEL_CANONICAL_ID",
+    f"publishers/{MODEL_NAMESPACE}/models/{PREMIUM_MODEL_NAME}",
+)
+PREMIUM_SIMULATOR_SUBSCRIPTION = os.environ.get("E2E_PREMIUM_SIMULATOR_SUBSCRIPTION", "premium-simulator-subscription")
+SIMULATOR_ACCESS_POLICY = os.environ.get("E2E_SIMULATOR_ACCESS_POLICY", "simulator-access")
+UNCONFIGURED_MODEL_REF = os.environ.get("E2E_UNCONFIGURED_MODEL_REF", "e2e-unconfigured-facebook-opt-125m-simulated")
+UNCONFIGURED_MODEL_PATH = os.environ.get("E2E_UNCONFIGURED_MODEL_PATH", "/llm/e2e-unconfigured-facebook-opt-125m-simulated")
+UNCONFIGURED_MODEL_NAME = os.environ.get("E2E_UNCONFIGURED_MODEL_NAME", "test/e2e-unconfigured-model")
+DISTINCT_MODEL_REF = os.environ.get("E2E_DISTINCT_MODEL_REF", "e2e-distinct-simulated")
+# Canonical BBR form: publishers/{namespace}/models/{spec.model.name}
+DISTINCT_MODEL_ID = os.environ.get("E2E_DISTINCT_MODEL_ID", f"publishers/{MODEL_NAMESPACE}/models/test/e2e-distinct-model")
+DISTINCT_MODEL_2_REF = os.environ.get("E2E_DISTINCT_MODEL_2_REF", "e2e-distinct-2-simulated")
+DISTINCT_MODEL_2_ID = os.environ.get("E2E_DISTINCT_MODEL_2_ID", f"publishers/{MODEL_NAMESPACE}/models/test/e2e-distinct-model-2")
+TRLP_TEST_MODEL_REF = os.environ.get("E2E_TRLP_TEST_MODEL_REF", "e2e-trlp-test-simulated")
+TRLP_TEST_MODEL_PATH = os.environ.get("E2E_TRLP_TEST_MODEL_PATH", "/llm/e2e-trlp-test-simulated")
+TRLP_TEST_MODEL_ID = os.environ.get("E2E_TRLP_TEST_MODEL_ID", "test/e2e-trlp-test-model")
+EMBEDDING_MODEL_REF = os.environ.get("E2E_EMBEDDING_MODEL_REF", "e2e-embedding-simulated")
+EMBEDDING_MODEL_PATH = os.environ.get("E2E_EMBEDDING_MODEL_PATH", "/llm/e2e-embedding-simulated")
+EMBEDDING_MODEL_NAME = os.environ.get("E2E_EMBEDDING_MODEL_NAME", "test/e2e-embedding-model")
+EMBEDDING_MODEL_CANONICAL_ID = os.environ.get(
+    "E2E_EMBEDDING_MODEL_CANONICAL_ID",
+    f"publishers/{MODEL_NAMESPACE}/models/{EMBEDDING_MODEL_NAME}",
+)
+
+
+# ---------------------------------------------------------------------------
+# Environment / URL helpers
+# ---------------------------------------------------------------------------
+
+def _ns():
+    """Default MaaS subscription namespace."""
+    return os.environ.get("MAAS_SUBSCRIPTION_NAMESPACE", "models-as-a-service")
+
+
+def _gateway_url():
+    host = os.environ.get("GATEWAY_HOST", "")
+    if not host:
+        raise RuntimeError("GATEWAY_HOST env var is required")
+    scheme = "http" if os.environ.get("INSECURE_HTTP", "").lower() == "true" else "https"
+    return f"{scheme}://{host}"
+
+
+_SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+_CUSTOM_CA_PATH = "/tmp/ca-bundle.crt"
+
+
+@functools.lru_cache(maxsize=1)
+def _fetch_openshift_service_ca() -> Optional[str]:
+    """Try to fetch the OpenShift service-serving CA bundle.
+
+    On OpenShift clusters, service-serving certificates are signed by a
+    dedicated CA that differs from the Kubernetes API server CA.  The
+    canonical source is the ``signing-cabundle`` ConfigMap in the
+    ``openshift-service-ca`` namespace.
+
+    The result is cached for the lifetime of the test session because the
+    service-serving CA does not change during a run.
+    """
+    tpl = '{{index .data "ca-bundle.crt"}}'
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "configmap", "signing-cabundle",
+             "-n", "openshift-service-ca",
+             "-o", f"go-template={tpl}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "Timed out fetching signing-cabundle from openshift-service-ca; "
+            "will fall back to service-account CA"
+        )
+    return None
+
+
+def get_curl_ca_bundle(namespace: str) -> tuple[str, Optional[str]]:
+    """Determine the CA cert path and optional content for curl TLS verification.
+
+    Resolution order:
+    1. If ``E2E_CURL_CA_CONFIGMAP`` is set, fetch that ConfigMap from *namespace*.
+    2. Otherwise, try the OpenShift service-serving CA (``signing-cabundle``
+       in ``openshift-service-ca``).
+    3. Fall back to the service-account CA already mounted in the pod.
+
+    Returns:
+        (ca_cert_path_inside_pod, ca_bundle_content_or_None)
+    """
+    if E2E_CURL_CA_CONFIGMAP:
+        tpl = '{{index .data "' + E2E_CURL_CA_CONFIGMAP_KEY + '"}}'
+        try:
+            result = subprocess.run(
+                ["kubectl", "get", "configmap", E2E_CURL_CA_CONFIGMAP,
+                 "-n", namespace, "-o", f"go-template={tpl}"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "Timed out fetching E2E_CURL_CA_CONFIGMAP=%s in namespace %s, falling back to SA CA",
+                E2E_CURL_CA_CONFIGMAP, namespace,
+            )
+            return _SA_CA_PATH, None
+        if result.returncode == 0 and result.stdout.strip():
+            return _CUSTOM_CA_PATH, result.stdout
+
+        log.warning(
+            "E2E_CURL_CA_CONFIGMAP=%s not found in namespace %s, falling back to SA CA",
+            E2E_CURL_CA_CONFIGMAP, namespace,
+        )
+        return _SA_CA_PATH, None
+
+    ca_content = _fetch_openshift_service_ca()
+    if ca_content:
+        return _CUSTOM_CA_PATH, ca_content
+
+    log.warning(
+        "No service-serving CA found; falling back to service-account CA at %s "
+        "(this uses the API-server CA which may not verify service-serving TLS certificates)",
+        _SA_CA_PATH,
+    )
+    return _SA_CA_PATH, None
+
+
+def _write_ca_to_pod(pod_name: str, namespace: str, ca_content: str) -> None:
+    """Write CA bundle content into an ephemeral curl pod at _CUSTOM_CA_PATH."""
+    subprocess.run(
+        ["kubectl", "exec", "-i", pod_name, "-n", namespace,
+         "--", "sh", "-c", f"cat > {_CUSTOM_CA_PATH}"],
+        input=ca_content, capture_output=True, text=True, timeout=15, check=True,
+    )
+
+
+def kubectl_curl(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict = None,
+    json_body: dict = None,
+    namespace: str = None,
+) -> tuple[int, str]:
+    """Execute an HTTP request from inside the cluster via kubectl exec.
+
+    The pod is created without credentials in its spec.  Credentials
+    (headers, request body) are passed only via stdin to ``kubectl exec -i``
+    so that they never appear in the Pod object stored in the Kubernetes API.
+
+    Args:
+        url: Target URL (must be reachable from within the cluster).
+        method: HTTP method (default: GET).
+        headers: Optional HTTP headers (e.g. Authorization).
+        json_body: Optional JSON body (implicitly switches method to POST
+            when *method* is still the default ``GET``).
+        namespace: Kubernetes namespace for the ephemeral curl pod
+            (default: ``E2E_CURL_POD_NAMESPACE``).
+
+    Returns:
+        ``(status_code, response_body)``.  *status_code* is ``0`` on
+        infrastructure failure.
+    """
+    namespace = namespace or os.environ.get(
+        "E2E_CURL_POD_NAMESPACE", E2E_CURL_POD_NAMESPACE,
+    )
+    pod_name = f"test-curl-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    ca_cert_path, ca_bundle_content = get_curl_ca_bundle(namespace)
+
+    try:
+        # 1. Create an ephemeral pod (no credentials in spec)
+        create_cmd = [
+            "kubectl", "run", pod_name,
+            "--restart=Never",
+            f"--image={E2E_CURL_IMAGE}",
+            "-n", namespace,
+            "--command", "--", "sleep", "300",
+        ]
+        subprocess.run(create_cmd, capture_output=True, text=True, timeout=30, check=True)
+
+        # 2. Wait for pod readiness
+        wait_cmd = [
+            "kubectl", "wait", "--for=condition=Ready",
+            f"pod/{pod_name}", "-n", namespace, "--timeout=30s",
+        ]
+        subprocess.run(wait_cmd, capture_output=True, text=True, timeout=45, check=True)
+
+        # 2.5. Write custom CA bundle into the pod if configured
+        if ca_bundle_content:
+            _write_ca_to_pod(pod_name, namespace, ca_bundle_content)
+
+        # 3. Build a shell script that reads credentials from stdin
+        script_lines = []
+        stdin_lines = []
+
+        if headers:
+            for i, (key, value) in enumerate(headers.items()):
+                script_lines.append(f"IFS= read -r HDR{i}")
+                stdin_lines.append(f"{key}: {value}")
+
+        # If a JSON body is provided, read it from remaining stdin
+        if json_body is not None:
+            script_lines.append("BODY=$(cat)")
+
+        effective_method = method
+        if json_body is not None and effective_method == "GET":
+            effective_method = "POST"
+
+        curl_parts = [
+            "curl", "-s", "--proto", "=https",
+            "--cacert", ca_cert_path, "-m", "10",
+        ]
+        if effective_method != "GET":
+            curl_parts.extend(["-X", effective_method])
+        if headers:
+            for i in range(len(headers)):
+                curl_parts.append(f'-H "$HDR{i}"')
+        if json_body is not None:
+            has_ct = any(k.lower() == "content-type" for k in (headers or {}))
+            if not has_ct:
+                curl_parts.append('-H "Content-Type: application/json"')
+            curl_parts.append('-d "$BODY"')
+        curl_parts.append('-w "\\nHTTP_CODE:%{http_code}"')
+        curl_parts.append(shlex.quote(url))
+
+        script_lines.append(" ".join(curl_parts))
+        script = "\n".join(script_lines)
+
+        # Compose stdin: header lines followed by JSON body
+        if json_body is not None:
+            stdin_lines.append(json.dumps(json_body))
+        stdin_data = "\n".join(stdin_lines) + "\n" if stdin_lines else None
+
+        # 4. Execute via kubectl exec -i; credentials travel through stdin
+        exec_cmd = [
+            "kubectl", "exec", "-i", pod_name, "-n", namespace,
+            "--", "sh", "-c", script,
+        ]
+        result = subprocess.run(
+            exec_cmd, capture_output=True, text=True, timeout=60,
+            input=stdin_data,
+        )
+
+        # 5. Parse status code from output
+        output = result.stdout
+        if "HTTP_CODE:" in output:
+            body, code_line = output.rsplit("HTTP_CODE:", 1)
+            match = re.search(r"(\d{3})", code_line)
+            if match:
+                return int(match.group(1)), body.strip()
+            log.error("Could not parse HTTP code from: %s", code_line)
+            return 0, body.strip()
+        log.error("kubectl exec failed (returncode=%d)", result.returncode)
+        log.error("stdout: %s", output[:500])
+        log.error("stderr: %s", result.stderr[:500])
+        return 0, output
+    except Exception as e:
+        log.error("kubectl curl failed: %s", e)
+        return 0, str(e)
+    finally:
+        delete_cmd = [
+            "kubectl", "delete", "pod", pod_name, "-n", namespace,
+            "--grace-period=0", "--force", "--wait=false",
+        ]
+        subprocess.run(delete_cmd, capture_output=True, text=True, timeout=15)
+
+
+def _maas_api_url():
+    """Get the MaaS API base URL for API key operations."""
+    url = os.environ.get("MAAS_API_BASE_URL", "")
+    if not url:
+        host = os.environ.get("GATEWAY_HOST", "")
+        if not host:
+            raise RuntimeError("MAAS_API_BASE_URL or GATEWAY_HOST env var is required")
+        scheme = "http" if os.environ.get("INSECURE_HTTP", "").lower() == "true" else "https"
+        url = f"{scheme}://{host}/maas-api"
+    return url
+
+
+# ---------------------------------------------------------------------------
+# Authentication helpers
+# ---------------------------------------------------------------------------
+
+def _decode_jwt_payload(token: str) -> Optional[dict]:
+    """Decode JWT payload (no verification, for debugging). Returns claims dict or None."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload_bytes = base64.urlsafe_b64decode(payload_b64)
+        return json.loads(payload_bytes)
+    except Exception:
+        return None
+
+
+def _create_sa_token(sa_name, namespace=None, duration="10m"):
+    namespace = namespace or _ns()
+    sa_result = subprocess.run(
+        ["oc", "create", "sa", sa_name, "-n", namespace], capture_output=True, text=True
+    )
+    if sa_result.returncode != 0 and "already exists" not in sa_result.stderr:
+        raise RuntimeError(f"Failed to create SA {sa_name}: {sa_result.stderr}")
+    result = subprocess.run(
+        ["oc", "create", "token", sa_name, "-n", namespace, f"--duration={duration}"],
+        capture_output=True, text=True,
+    )
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError(f"Could not create token for SA {sa_name}: {result.stderr}")
+    return token
+
+
+def _delete_sa(sa_name, namespace=None):
+    """Delete a service account (best-effort, for cleanup)."""
+    namespace = namespace or _ns()
+    result = subprocess.run(
+        ["oc", "delete", "sa", sa_name, "-n", namespace, "--ignore-not-found"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        log.warning(
+            "Failed to delete serviceaccount/%s in %s: %s",
+            sa_name,
+            namespace,
+            result.stderr.strip(),
+        )
+
+
+def _sa_to_user(sa_name, namespace=None):
+    """Convert service account name to Kubernetes user principal."""
+    namespace = namespace or _ns()
+    return f"system:serviceaccount:{namespace}:{sa_name}"
+
+
+def _get_cluster_token():
+    """Get OC token for API key management operations (not for inference).
+
+    Priority:
+      1. TOKEN env var (set by prow script for regular user)
+      2. E2E_TEST_TOKEN_SA_* env vars (for SA-based tokens)
+      3. oc whoami -t (fallback for local testing)
+    """
+    token = os.environ.get("TOKEN", "")
+    if token:
+        log.info("Using TOKEN env var for API key operations")
+        return token
+
+    sa_ns = os.environ.get("E2E_TEST_TOKEN_SA_NAMESPACE")
+    sa_name = os.environ.get("E2E_TEST_TOKEN_SA_NAME")
+    if sa_ns and sa_name:
+        token = _create_sa_token(sa_name, namespace=sa_ns)
+    else:
+        token_result = subprocess.run(["oc", "whoami", "-t"], capture_output=True, text=True)
+        token = token_result.stdout.strip() if token_result.returncode == 0 else ""
+        if not token:
+            raise RuntimeError("Could not get cluster token via `oc whoami -t`; run with oc login first")
+    claims = _decode_jwt_payload(token)
+    if claims:
+        safe_keys = {k: v for k, v in claims.items() if k in ("iss", "aud", "exp", "iat")}
+        log.debug("Token claims (non-sensitive): %s", json.dumps(safe_keys))
+    return token
+
+
+# ---------------------------------------------------------------------------
+# API Key Management
+# ---------------------------------------------------------------------------
+
+def _request_with_gateway_retry(method, url, retries=None, delay=None, **kwargs):
+    """Make an HTTP request, retrying transient gateway/auth propagation errors.
+
+    Retries on:
+    - Empty 403 / empty 401: Envoy has not loaded the AuthPolicy yet (common after
+      MaaSAuthPolicy churn; some gateways return 401 instead of 403).
+    - 500 with AUTH_FAILURE: Authorino race while AuthConfig is updating.
+
+    Returns the last response — callers' assertions surface a permanent failure.
+    """
+    retries = GATEWAY_PROPAGATION_RETRIES if retries is None else retries
+    delay = GATEWAY_PROPAGATION_DELAY if delay is None else delay
+    timeout = kwargs.pop("timeout", TIMEOUT)
+    verify = kwargs.pop("verify", TLS_VERIFY)
+    r = None
+    for attempt in range(1, retries + 1):
+        r = method(url, timeout=timeout, verify=verify, **kwargs)
+        empty_auth_reject = r.status_code in (401, 403) and not r.text.strip()
+        retryable = empty_auth_reject or (
+            r.status_code == 500 and "AUTH_FAILURE" in r.text
+        )
+        if retryable and attempt < retries:
+            log.info(
+                "Gateway returned %d (attempt %d/%d), retrying in %ds...",
+                r.status_code,
+                attempt,
+                retries,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+        return r
+    return r
+
+
+def _create_api_key_raw(oc_token: str, name: str = None, subscription: str = None):
+    """Create an API key and return the raw response (for testing error cases).
+
+    Retries empty 403 / Authorino AUTH_FAILURE so callers see the real API
+    response after gateway AuthPolicy propagation, not a transient reject.
+
+    Args:
+        oc_token: OC token for authentication with maas-api
+        name: Optional name for the key (auto-generated if not provided)
+        subscription: Optional MaaSSubscription name to bind (highest-priority auto-bind if omitted)
+
+    Returns:
+        requests.Response object
+    """
+    url = f"{_maas_api_url()}/v1/api-keys"
+    key_name = name or f"e2e-test-{uuid.uuid4().hex[:8]}"
+
+    body = {"name": key_name}
+    if subscription:
+        body["subscription"] = subscription
+
+    return _request_with_gateway_retry(
+        requests.post,
+        url,
+        headers={
+            "Authorization": f"Bearer {oc_token}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=TIMEOUT,
+        verify=TLS_VERIFY,
+    )
+
+
+def _create_api_key(oc_token: str, name: str = None, subscription: str = None) -> str:
+    """Create an API key using the MaaS API and return the plaintext key.
+
+    Args:
+        oc_token: OC token for authentication with maas-api
+        name: Optional name for the key (auto-generated if not provided)
+        subscription: Optional MaaSSubscription name to bind (highest-priority auto-bind if omitted)
+
+    Returns:
+        The plaintext API key (sk-oai-xxx format)
+    """
+    r = _create_api_key_raw(oc_token, name, subscription)
+    if r.status_code not in (200, 201):
+        detail = r.text.strip() or (
+            "empty body (likely gateway AuthPolicy not yet Enforced / Envoy not loaded; "
+            f"check: oc get authpolicy {GATEWAY_AUTH_POLICY_NAME} -n {GATEWAY_NAMESPACE})"
+        )
+        raise RuntimeError(f"Failed to create API key: {r.status_code} {detail}")
+
+    data = r.json()
+    api_key = data.get("key")
+    if not api_key:
+        raise RuntimeError(f"API key response missing 'key' field: {data}")
+
+    log.info("Created API key '%s' bound to subscription '%s'", name, subscription)
+    return api_key
+
+
+def _revoke_api_key(oc_token: str, key_id: str):
+    """Revoke an API key (best-effort, for cleanup)."""
+    url = f"{_maas_api_url()}/v1/api-keys/{key_id}"
+    try:
+        r = requests.delete(
+            url,
+            headers={"Authorization": f"Bearer {oc_token}"},
+            timeout=TIMEOUT,
+            verify=TLS_VERIFY,
+        )
+        if r.status_code not in (200, 204, 404):
+            log.warning("Failed to revoke API key %s: %s %s", key_id, r.status_code, r.text[:200])
+    except requests.RequestException as e:
+        log.warning("Failed to revoke API key %s: %s", key_id, e)
+
+
+# ---------------------------------------------------------------------------
+# CR Management
+# ---------------------------------------------------------------------------
+
+def _apply_cr(cr_dict):
+    subprocess.run(["oc", "apply", "-f", "-"], input=json.dumps(cr_dict), capture_output=True, text=True, check=True)
+
+
+def _delete_cr(kind, name, namespace=None):
+    namespace = namespace or _ns()
+    result = subprocess.run(
+        ["oc", "delete", kind, name, "-n", namespace, "--ignore-not-found", "--timeout=30s"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log.warning("Failed to delete %s/%s in %s: %s", kind, name, namespace, result.stderr.strip())
+
+
+def _is_transient_kubectl_error(stderr):
+    """Check if kubectl error is likely transient (network, timeout)."""
+    transient_patterns = [
+        "TLS handshake timeout",
+        "connection refused",
+        "connection reset",
+        "i/o timeout",
+        "dial tcp",
+        "EOF",
+        "temporary failure",
+        "network is unreachable",
+    ]
+    stderr_lower = stderr.lower()
+    return any(pattern.lower() in stderr_lower for pattern in transient_patterns)
+
+
+def _is_not_found_error(stderr):
+    """Check if kubectl error indicates the resource was not found."""
+    stderr_lower = stderr.lower()
+    return "notfound" in stderr_lower or "not found" in stderr_lower
+
+
+def _get_cr(kind, name, namespace=None):
+    """Get a CR as dict, or None if not found. Retries on transient errors.
+
+    Returns None only when the resource genuinely does not exist (server NotFound).
+    Raises RuntimeError for other failures (RBAC, missing CRD, transport errors
+    that persist after retries) so callers can distinguish infrastructure issues
+    from true absence.
+    """
+    namespace = namespace or _ns()
+    max_retries = 3
+    retry_delay = 2
+
+    for attempt in range(max_retries):
+        result = subprocess.run(["oc", "get", kind, name, "-n", namespace, "-o", "json"], capture_output=True, text=True)
+
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+
+        if attempt < max_retries - 1 and _is_transient_kubectl_error(result.stderr):
+            log.warning(
+                f"Transient kubectl error getting {kind}/{name} (attempt {attempt + 1}/{max_retries}): {result.stderr.strip()}"
+            )
+            time.sleep(retry_delay * (attempt + 1))
+            continue
+
+        # Terminal failure — distinguish not-found from other errors
+        if _is_not_found_error(result.stderr):
+            return None
+
+        log.error(
+            f"Failed to get {kind}/{name} in namespace '{namespace}' after {attempt + 1} attempts. "
+            f"Last error: {result.stderr.strip()}"
+        )
+        raise RuntimeError(
+            f"Failed to get {kind}/{name} in namespace '{namespace}': {result.stderr.strip()}"
+        )
+
+
+def _snapshot_cr(kind, name, namespace=None):
+    """Capture a CR for later restoration (strips runtime metadata)."""
+    cr = _get_cr(kind, name, namespace)
+    if not cr:
+        return None
+    meta = cr.get("metadata", {})
+    for key in ("resourceVersion", "uid", "creationTimestamp", "generation", "managedFields"):
+        meta.pop(key, None)
+    annotations = meta.get("annotations", {})
+    annotations.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+    if not annotations:
+        meta.pop("annotations", None)
+    cr.pop("status", None)
+    return cr
+
+
+def _list_crs(kind, namespace=None):
+    """List all CRs of a given kind.
+
+    Args:
+        kind: CR kind (e.g., 'maasmodelref', 'maasauthpolicy')
+        namespace: Namespace to search (defaults to _ns())
+
+    Returns:
+        List of CR dictionaries
+
+    Raises:
+        RuntimeError: If kubectl command fails with contextual error details
+    """
+    namespace = namespace or _ns()
+    plural = {
+        "maasmodelref": "maasmodelrefs",
+        "maasauthpolicy": "maasauthpolicies",
+        "maassubscription": "maassubscriptions",
+    }.get(kind, f"{kind}s")
+
+    cmd = ["oc", "get", plural, "-n", namespace, "-o", "json"]
+
+    # Retry transient network errors with exponential backoff
+    max_retries = 3
+    retry_delay = 2  # seconds
+
+    for attempt in range(max_retries):
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        if result.returncode == 0:
+            return json.loads(result.stdout).get("items", [])
+
+        # Check if error is transient and we have retries left
+        if attempt < max_retries - 1 and _is_transient_kubectl_error(result.stderr):
+            log.warning(
+                f"Transient kubectl error (attempt {attempt + 1}/{max_retries}): {result.stderr.strip()}"
+            )
+            time.sleep(retry_delay * (attempt + 1))  # exponential backoff
+            continue
+
+        # Final attempt or non-transient error
+        raise RuntimeError(
+            f"Failed to list {plural} in namespace '{namespace}'.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Exit code: {result.returncode}\n"
+            f"Stderr: {result.stderr}\n"
+            f"Guidance: Ensure the CRD exists, namespace is correct, and you have permissions."
+        )
+
+    # Unreachable: loop always exits via return or raise
+    # Included for type checker and defensive programming
+    return []
+
+
+def _get_auth_policies_for_model(model_ref, namespace=None, model_namespace=None):
+    """Get all MaaSAuthPolicies that reference a model.
+
+    Args:
+        model_ref: Name of the MaaSModelRef
+        namespace: Namespace to search for policies (defaults to _ns())
+        model_namespace: Expected namespace of the modelRef (defaults to MODEL_NAMESPACE)
+
+    Returns:
+        List of auth policy names that reference the model
+    """
+    namespace = namespace or _ns()
+    model_namespace = model_namespace or MODEL_NAMESPACE
+    policies = _list_crs("maasauthpolicy", namespace)
+
+    matching = []
+    for policy in policies:
+        model_refs = policy.get("spec", {}).get("modelRefs", [])
+        for ref in model_refs:
+            if isinstance(ref, dict):
+                ref_name = ref.get("name")
+                ref_ns = ref.get("namespace")
+            else:
+                ref_name = ref
+                ref_ns = None
+            if ref_name == model_ref and ref_ns == model_namespace:
+                matching.append(policy["metadata"]["name"])
+                break
+    return matching
+
+
+def _get_auth_policies_authorizing_identity_for_model(
+    model_ref,
+    username,
+    groups,
+    namespace=None,
+    model_namespace=None,
+):
+    """Get policy names that authorize an identity for a model.
+
+    A policy authorizes the identity when it references the specified model
+    name and namespace, and it matches the username or one of the groups.
+
+    Args:
+        model_ref: Name of the MaaSModelRef
+        username: Kubernetes username to match
+        groups: Kubernetes groups to match
+        namespace: Namespace to search for policies (defaults to _ns())
+        model_namespace: Expected modelRef namespace (defaults to MODEL_NAMESPACE)
+
+    Returns:
+        List of matching MaaSAuthPolicy names
+    """
+    namespace = namespace or _ns()
+    model_namespace = model_namespace or MODEL_NAMESPACE
+    username = username.strip()
+    groups = {group.strip() for group in groups}
+
+    matching_policies = []
+    for policy in _list_crs("maasauthpolicy", namespace):
+        spec = policy.get("spec", {})
+        policy_models = spec.get("modelRefs", [])
+        references_model = any(
+            isinstance(ref, dict)
+            and ref.get("name") == model_ref
+            and ref.get("namespace") == model_namespace
+            for ref in policy_models
+        )
+        if not references_model:
+            continue
+
+        subjects = spec.get("subjects", {})
+        users = subjects.get("users", [])
+        policy_groups = subjects.get("groups", [])
+        matches_user = username and any(
+            isinstance(user, str) and user.strip() == username for user in users
+        )
+        matches_group = any(
+            isinstance(group, dict) and group.get("name", "").strip() in groups
+            for group in policy_groups
+        )
+        if matches_user or matches_group:
+            matching_policies.append(policy["metadata"]["name"])
+
+    return matching_policies
+
+
+def _get_subscriptions_for_model(model_ref, namespace=None, model_namespace=None):
+    """Get all MaaSSubscriptions that reference a model.
+
+    Args:
+        model_ref: Name of the MaaSModelRef
+        namespace: Namespace to search for subscriptions (defaults to _ns())
+        model_namespace: Expected namespace of the modelRef (defaults to MODEL_NAMESPACE)
+
+    Returns:
+        List of subscription names that reference the model
+    """
+    namespace = namespace or _ns()
+    model_namespace = model_namespace or MODEL_NAMESPACE
+    subs = _list_crs("maassubscription", namespace)
+
+    matching = []
+    for sub in subs:
+        model_refs = sub.get("spec", {}).get("modelRefs", [])
+        for ref in model_refs:
+            if isinstance(ref, dict):
+                ref_name = ref.get("name")
+                ref_ns = ref.get("namespace")
+            else:
+                ref_name = ref
+                ref_ns = None
+            if ref_name == model_ref and ref_ns == model_namespace:
+                matching.append(sub["metadata"]["name"])
+                break
+    return matching
+
+
+# ---------------------------------------------------------------------------
+# CR Creation Helpers
+# ---------------------------------------------------------------------------
+
+def _create_test_auth_policy(name, model_refs, users=None, groups=None, namespace=None):
+    """Create a MaaSAuthPolicy CR for testing.
+
+    Args:
+        name: Name of the auth policy
+        model_refs: Model ref(s) - can be string or list
+        users: List of user principals (e.g., ["system:serviceaccount:ns:sa"])
+        groups: List of group names (e.g., ["system:authenticated"])
+        namespace: Namespace for the auth policy (defaults to _ns())
+    """
+    namespace = namespace or _ns()
+    if not isinstance(model_refs, list):
+        model_refs = [model_refs]
+
+    model_refs_formatted = [{"name": ref, "namespace": MODEL_NAMESPACE} for ref in model_refs]
+    groups_formatted = [{"name": g} for g in (groups or [])]
+
+    log.info("Creating MaaSAuthPolicy: %s", name)
+    _apply_cr({
+        "apiVersion": "maas.opendatahub.io/v1alpha1",
+        "kind": "MaaSAuthPolicy",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "modelRefs": model_refs_formatted,
+            "subjects": {
+                "users": users or [],
+                "groups": groups_formatted
+            }
+        }
+    })
+
+
+def _create_test_subscription(
+    name,
+    model_refs,
+    users=None,
+    groups=None,
+    token_limit=100,
+    window="1m",
+    namespace=None,
+    priority=None,
+):
+    """Create a MaaSSubscription CR for testing.
+
+    Args:
+        name: Name of the subscription
+        model_refs: Model ref(s) - can be string or list
+        users: List of user principals
+        groups: List of group names
+        token_limit: Token rate limit (default: 100)
+        window: Rate limit window (default: "1m")
+        namespace: Namespace for the subscription (defaults to _ns())
+        priority: Optional spec.priority (higher wins for default API key binding)
+    """
+    namespace = namespace or _ns()
+    if not isinstance(model_refs, list):
+        model_refs = [model_refs]
+
+    groups_formatted = [{"name": g} for g in (groups or [])]
+
+    spec = {
+        "owner": {
+            "users": users or [],
+            "groups": groups_formatted,
+        },
+        "modelRefs": [
+            {
+                "name": ref,
+                "namespace": MODEL_NAMESPACE,
+                "tokenRateLimits": [{"limit": token_limit, "window": window}],
+            }
+            for ref in model_refs
+        ],
+    }
+    if priority is not None:
+        spec["priority"] = int(priority)
+
+    log.info("Creating MaaSSubscription: %s", name)
+    _apply_cr(
+        {
+            "apiVersion": "maas.opendatahub.io/v1alpha1",
+            "kind": "MaaSSubscription",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": spec,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inference Helpers
+# ---------------------------------------------------------------------------
+
+def _inference(api_key, path=None, extra_headers=None, model_name=None, max_tokens=3):
+    """POST completions using an API key only (subscription is bound at mint)."""
+    path = path or MODEL_PATH
+    if model_name is None:
+        if path == PREMIUM_MODEL_PATH:
+            model_name = PREMIUM_MODEL_NAME
+        elif path == UNCONFIGURED_MODEL_PATH:
+            model_name = UNCONFIGURED_MODEL_NAME
+        else:
+            model_name = MODEL_NAME
+    url = f"{_gateway_url()}{path}/v1/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    return requests.post(
+        url, headers=headers,
+        json={"model": model_name, "prompt": "Hello", "max_tokens": max_tokens},
+        timeout=TIMEOUT, verify=TLS_VERIFY,
+    )
+
+
+def _poll_status(api_key, expected, path=None, extra_headers=None, model_name=None, timeout=None, poll_interval=2, inference_fn=None):
+    """Poll inference endpoint until expected HTTP status or timeout."""
+    inference_fn = inference_fn or _inference
+    timeout = timeout or max(RECONCILE_WAIT * 3, 60)
+    deadline = time.time() + timeout
+    last = None
+    last_err = None
+    last_auth_recheck = 0.0
+    while time.time() < deadline:
+        try:
+            r = inference_fn(api_key, path=path, extra_headers=extra_headers, model_name=model_name)
+            last_err = None
+            ok = r.status_code == expected if isinstance(expected, int) else r.status_code in expected
+            if ok:
+                return r
+            last = r
+            # Parallel workers can churn maas-gateway-auth; empty 401/403 or
+            # AUTH_FAILURE usually means propagation, not a permanent deny.
+            if r.status_code in (401, 403, 500):
+                body = (r.text or "").strip()
+                transient = (
+                    r.status_code in (401, 403) and not body
+                ) or (r.status_code == 500 and "AUTH_FAILURE" in body)
+                if transient and time.time() - last_auth_recheck >= 10:
+                    remaining = max(0, int(deadline - time.time()))
+                    if remaining > 0:
+                        log.info(
+                            "Inference poll got transient %d; re-checking gateway AuthPolicy (%ds left)...",
+                            r.status_code,
+                            remaining,
+                        )
+                        try:
+                            _wait_for_gateway_auth_enforced(timeout=min(60, remaining))
+                        except TimeoutError:
+                            pass
+                        last_auth_recheck = time.time()
+        except requests.RequestException as exc:
+            last_err = exc
+            log.debug(f"Transient request error while polling: {exc}")
+        except Exception as exc:
+            log.exception(f"Non-transient error while polling, failing fast: {exc}")
+            raise
+        time.sleep(poll_interval)
+    exp_str = expected if isinstance(expected, int) else " or ".join(str(e) for e in expected)
+    err_msg = f"Expected {exp_str} within {timeout}s"
+    if last is not None:
+        err_msg += f", last status: {last.status_code}"
+        body_preview = (last.text or "").strip()[:200]
+        if body_preview:
+            err_msg += f", last body: {body_preview}"
+    if last_err is not None:
+        err_msg += f", last error: {last_err}"
+    if last is None and last_err is None:
+        err_msg += ", no response (all requests may have raised non-RequestException)"
+    raise AssertionError(err_msg)
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (used by test_smoke.py)
+# ---------------------------------------------------------------------------
+
+def _post(url: str, payload: dict, headers: dict, timeout_sec: int = 45) -> requests.Response:
+    return requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=(timeout_sec, timeout_sec),
+        verify=TLS_VERIFY,
+        stream=False,
+    )
+
+
+def chat(prompt: str, model_v1: str, headers: dict, model_name: str):
+    url = f"{model_v1}/chat/completions"
+    body = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
+    return requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY)
+
+
+def completions(prompt: str, model_v1: str, headers: dict, model_name: str):
+    url = f"{model_v1}/completions"
+    body = {"model": model_name, "prompt": prompt, "max_tokens": 16}
+    return requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY)
+
+
+def embeddings(text: str, model_v1: str, headers: dict, model_name: str):
+    url = f"{model_v1}/embeddings"
+    body = {"model": model_name, "input": text}
+    return requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY)
+
+
+def _embedding_inference(api_key, path=None, extra_headers=None, model_name=None):
+    """POST embeddings using an API key only (subscription is bound at mint)."""
+    path = path or MODEL_PATH
+    if model_name is None:
+        model_name = MODEL_NAME
+    url = f"{_gateway_url()}{path}/v1/embeddings"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    return requests.post(
+        url, headers=headers,
+        json={"model": model_name, "input": "Hello world"},
+        timeout=TIMEOUT, verify=TLS_VERIFY,
+    )
+
+
+# ---------------------------------------------------------------------------
+# IPP (Payload Processing) Helpers
+# ---------------------------------------------------------------------------
+
+def _ipp_resource_name(base_name: str, tenant_name: Optional[str] = None) -> str:
+    """Return IPP resource name for default (legacy) or suffixed AITenant stacks."""
+    if not tenant_name or tenant_name == "models-as-a-service":
+        return base_name
+    return f"{base_name}-{tenant_name}"
+
+
+def _check_ipp_pods_deployed(tenant_name: Optional[str] = None):
+    """Check if payload-processing (IPP) pods are deployed in the gateway namespace."""
+    for base_name in ("payload-pre-processing", "payload-processing"):
+        name = _ipp_resource_name(base_name, tenant_name)
+        result = subprocess.run(
+            ["oc", "get", "deployment", name, "-n", GATEWAY_NAMESPACE,
+             "-o", "jsonpath={.status.readyReplicas}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            log.debug("oc check for %s failed: %s", name, result.stderr.strip())
+            return False
+        ready = result.stdout.strip()
+        if not ready or ready == "0":
+            log.debug("Deployment %s has no ready replicas", name)
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Wait / Polling Helpers
+# ---------------------------------------------------------------------------
+
+def _authpolicy_conditions(cr, *types):
+    """Return {type: (status, reason, message)} for requested condition types (single pass)."""
+    wanted = set(types)
+    result = {t: (None, None, None) for t in wanted}
+    for condition in (cr or {}).get("status", {}).get("conditions", []):
+        ctype = condition.get("type")
+        if ctype in wanted:
+            result[ctype] = (
+                condition.get("status"),
+                condition.get("reason"),
+                condition.get("message"),
+            )
+    return result
+
+
+def _authpolicy_condition(cr, condition_type: str):
+    """Return (status, reason, message) for an AuthPolicy condition type, or (None, None, None)."""
+    return _authpolicy_conditions(cr, condition_type)[condition_type]
+
+
+def _truncate_auth_message(message: Optional[str], limit: int = 240) -> str:
+    """Shrink Kuadrant Enforced messages that list dozens of pending AuthConfigs."""
+    if not message:
+        return ""
+    if len(message) <= limit:
+        return message
+    # Prefer a compact count when Kuadrant dumps AuthConfig hashes.
+    authconfig_count = message.count("AuthConfig (")
+    if authconfig_count:
+        return f"{message[:limit]}… ({authconfig_count} AuthConfigs pending sync)"
+    return message[:limit] + "…"
+
+
+def _wait_for_gateway_auth_enforced(
+    name: Optional[str] = None,
+    namespace: Optional[str] = None,
+    timeout: Optional[int] = None,
+):
+    """Wait until the gateway Kuadrant AuthPolicy is Accepted and Enforced.
+
+    MaaSAuthPolicy phase Active only means the controller reconciled CRs.
+    HTTP calls through the gateway still need Kuadrant's AuthPolicy
+    (typically maas-gateway-auth) to report Enforced=True; otherwise Envoy
+    often returns an empty 403.
+
+    Default timeout is GATEWAY_ENFORCED_TIMEOUT (env E2E_GATEWAY_ENFORCED_TIMEOUT).
+    If the AuthPolicy CR is absent for GATEWAY_ENFORCED_MISSING_GRACE seconds,
+    fail early — that usually means a wrong name/namespace, not slow enforcement.
+
+    Raises:
+        TimeoutError: with Accepted/Enforced snapshot so failures are actionable
+    """
+    name = name or GATEWAY_AUTH_POLICY_NAME
+    namespace = namespace or GATEWAY_NAMESPACE
+    timeout = GATEWAY_ENFORCED_TIMEOUT if timeout is None else timeout
+    deadline = time.time() + timeout
+    last_snapshot = "AuthPolicy not found"
+    missing_since = None
+    warned_missing = False
+    log.info(
+        "Waiting for gateway AuthPolicy %s/%s Accepted+Enforced (timeout: %ds)...",
+        namespace,
+        name,
+        timeout,
+    )
+
+    while time.time() < deadline:
+        cr = _get_cr("authpolicy", name, namespace)
+        if cr is None:
+            last_snapshot = "AuthPolicy not found"
+            now = time.time()
+            if missing_since is None:
+                missing_since = now
+                if not warned_missing:
+                    log.warning(
+                        "Gateway AuthPolicy %s/%s not found yet; will fail after %ds if it never appears "
+                        "(check E2E_GATEWAY_AUTH_POLICY_NAME / GATEWAY_NAMESPACE)",
+                        namespace,
+                        name,
+                        GATEWAY_ENFORCED_MISSING_GRACE,
+                    )
+                    warned_missing = True
+            elif now - missing_since >= GATEWAY_ENFORCED_MISSING_GRACE:
+                raise TimeoutError(
+                    f"Gateway AuthPolicy {namespace}/{name} was not found within "
+                    f"{GATEWAY_ENFORCED_MISSING_GRACE}s (misconfigured name/namespace?). "
+                    f"Empty HTTP 403 from maas-api usually means Kuadrant has not finished "
+                    f"enforcing auth on the gateway after MaaSAuthPolicy changes."
+                )
+        else:
+            missing_since = None
+            conds = _authpolicy_conditions(cr, "Accepted", "Enforced")
+            accepted, a_reason, a_msg = conds["Accepted"]
+            enforced, e_reason, e_msg = conds["Enforced"]
+            last_snapshot = (
+                f"Accepted={accepted} reason={a_reason!r} message={_truncate_auth_message(a_msg)!r}; "
+                f"Enforced={enforced} reason={e_reason!r} message={_truncate_auth_message(e_msg)!r}"
+            )
+            if accepted == "True" and enforced == "True":
+                log.info("Gateway AuthPolicy %s/%s is Accepted and Enforced", namespace, name)
+                return cr
+            log.debug("Gateway AuthPolicy %s/%s not ready: %s", namespace, name, last_snapshot)
+        time.sleep(2)
+
+    raise TimeoutError(
+        f"Gateway AuthPolicy {namespace}/{name} was not Accepted+Enforced within {timeout}s "
+        f"(last status: {last_snapshot}). Empty HTTP 403 from maas-api usually means Kuadrant "
+        f"has not finished enforcing auth on the gateway after MaaSAuthPolicy changes."
+    )
+
+
+def _wait_for_token_rate_limit_policy(model_ref, model_namespace=MODEL_NAMESPACE, timeout=60):
+    """Wait for TokenRateLimitPolicy to be created and enforced for a model.
+
+    Args:
+        model_ref: Name of the model (e.g., "e2e-distinct-simulated")
+        model_namespace: Namespace where the TRLP should be created (default: MODEL_NAMESPACE)
+        timeout: Maximum wait time in seconds (default: 60)
+
+    Raises:
+        TimeoutError: If TRLP isn't created and enforced within timeout
+    """
+    trlp_name = f"maas-trlp-{model_ref}"
+    deadline = time.time() + timeout
+    log.info(f"Waiting for TokenRateLimitPolicy {trlp_name} in {model_namespace} (timeout: {timeout}s)...")
+
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["oc", "get", "tokenratelimitpolicy", trlp_name, "-n", model_namespace, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            try:
+                trlp = json.loads(result.stdout)
+                conditions = trlp.get("status", {}).get("conditions", [])
+                enforced = next((c for c in conditions if c.get("type") == "Enforced"), None)
+                if enforced and enforced.get("status") == "True":
+                    log.info(f"TokenRateLimitPolicy {trlp_name} is enforced")
+                    return
+                log.debug(f"TokenRateLimitPolicy {trlp_name} exists but not enforced yet")
+            except (json.JSONDecodeError, KeyError) as e:
+                log.debug(f"Failed to parse TRLP status: {e}")
+        elif _is_not_found_error(result.stderr):
+            log.debug(f"TokenRateLimitPolicy {trlp_name} not found yet...")
+        elif _is_transient_kubectl_error(result.stderr):
+            log.debug(
+                f"Transient error while reading TokenRateLimitPolicy {trlp_name}: {result.stderr.strip()}"
+            )
+        else:
+            raise RuntimeError(
+                f"Failed to get TokenRateLimitPolicy {trlp_name} in namespace '{model_namespace}': "
+                f"{result.stderr.strip()}"
+            )
+        time.sleep(3)
+
+    raise TimeoutError(
+        f"TokenRateLimitPolicy {trlp_name} was not created and enforced in {model_namespace} within {timeout}s"
+    )
+
+
+def _wait_for_maas_subscription_phase(name, expected_phase="Active", namespace=None, timeout=MAAS_SUBSCRIPTION_PHASE_TIMEOUT, require_model_statuses=False):
+    """Wait for MaaSSubscription to reach a specific phase.
+
+    Args:
+        name: Name of the MaaSSubscription
+        expected_phase: Phase to wait for (default: "Active")
+        namespace: Namespace (defaults to _ns())
+        timeout: Maximum wait time in seconds (default: 60)
+        require_model_statuses: If True, also requires modelRefStatuses to be populated
+                                (default: False). Set to True for status reporting tests.
+
+    Returns:
+        The subscription CR dict when the expected phase is reached
+
+    Raises:
+        TimeoutError: If MaaSSubscription doesn't reach expected phase within timeout
+    """
+    namespace = namespace or _ns()
+    deadline = time.time() + timeout
+    log.info(f"Waiting for MaaSSubscription {name} to reach phase '{expected_phase}' (timeout: {timeout}s)...")
+
+    while time.time() < deadline:
+        cr = _get_cr("maassubscription", name, namespace)
+        if cr:
+            status = cr.get("status", {})
+            phase = status.get("phase")
+            model_statuses = status.get("modelRefStatuses", [])
+
+            if phase == expected_phase:
+                if require_model_statuses:
+                    expected_count = len(cr.get("spec", {}).get("modelRefs", []))
+                    if len(model_statuses) >= expected_count:
+                        log.info(f"MaaSSubscription {name} reached phase '{expected_phase}' with {len(model_statuses)}/{expected_count} modelRefStatuses")
+                        return cr
+                else:
+                    log.info(f"MaaSSubscription {name} reached phase '{expected_phase}'")
+                    return cr
+            log.debug(f"MaaSSubscription {name}: phase={phase}, modelRefStatuses={len(model_statuses)}")
+        time.sleep(2)
+
+    # Timeout - return current state for debugging
+    cr = _get_cr("maassubscription", name, namespace)
+    status = cr.get("status", {}) if cr else {}
+    raise TimeoutError(
+        f"MaaSSubscription {name} did not reach phase '{expected_phase}' within {timeout}s "
+        f"(current: phase={status.get('phase')}, modelRefStatuses={len(status.get('modelRefStatuses', []))})"
+    )
+
+
+def _wait_for_subscription_trlp_status(name, expected_ready=True, namespace=None, timeout=60):
+    """Wait for MaaSSubscription's TokenRateLimitPolicy status to reach expected ready state.
+
+    Args:
+        name: Name of the MaaSSubscription
+        expected_ready: Expected ready state for all TRLPs (True or False)
+        namespace: Namespace (defaults to _ns())
+        timeout: Maximum wait time in seconds (default: 60)
+
+    Returns:
+        The subscription CR dict when all TRLPs reach the expected ready state
+
+    Raises:
+        TimeoutError: If TRLPs don't reach expected state within timeout
+    """
+    namespace = namespace or _ns()
+    deadline = time.time() + timeout
+    log.info(f"Waiting for MaaSSubscription {name} TRLP ready={expected_ready} (timeout: {timeout}s)...")
+
+    while time.time() < deadline:
+        cr = _get_cr("maassubscription", name, namespace)
+        if cr:
+            status = cr.get("status", {})
+            trlp_statuses = status.get("tokenRateLimitStatuses", [])
+
+            # If we expect ready and there are no TRLPs yet, keep waiting
+            if expected_ready and len(trlp_statuses) == 0:
+                log.debug(f"MaaSSubscription {name}: waiting for TRLP statuses to appear")
+                time.sleep(2)
+                continue
+
+            # Check if all TRLPs match expected ready state
+            if len(trlp_statuses) > 0:
+                all_match = all(trlp.get("ready") == expected_ready for trlp in trlp_statuses)
+                if all_match:
+                    log.info(f"✅ MaaSSubscription {name} has {len(trlp_statuses)} TRLP(s) with ready={expected_ready}")
+                    return cr
+                log.debug(f"MaaSSubscription {name}: TRLP statuses={trlp_statuses}")
+
+        time.sleep(2)
+
+    # Timeout - return current state for debugging
+    cr = _get_cr("maassubscription", name, namespace)
+    status = cr.get("status", {}) if cr else {}
+    trlp_statuses = status.get("tokenRateLimitStatuses", [])
+    raise TimeoutError(
+        f"MaaSSubscription {name} TRLPs did not reach ready={expected_ready} within {timeout}s "
+        f"(current TRLPs: {trlp_statuses})"
+    )
+
+
+def _wait_for_maas_auth_policy_phase(name, expected_phase="Active", namespace=None, timeout=AUTHPOLICY_PHASE_TIMEOUT,
+                                require_auth_policies=False, require_enforced=True):
+    """Wait for MaaSAuthPolicy to reach a specific phase.
+
+    Args:
+        name: Name of the MaaSAuthPolicy
+        expected_phase: Phase to wait for (default: "Active")
+        namespace: Namespace (defaults to _ns())
+        timeout: Maximum wait time in seconds (default: 60)
+        require_auth_policies: If True, requires authPolicies to be populated (default: False).
+                               Keep False for gateway-only AuthPolicy reconciliation.
+        require_enforced: If True (default):
+            - with require_auth_policies=True: all status.authPolicies entries must be ready
+            - with require_auth_policies=False and expected_phase Active: also wait for the
+              gateway Kuadrant AuthPolicy (maas-gateway-auth) to be Accepted+Enforced
+
+    Returns:
+        The auth policy CR dict when the expected phase is reached
+
+    Raises:
+        TimeoutError: If MaaSAuthPolicy doesn't reach expected phase within timeout
+    """
+    namespace = namespace or _ns()
+    deadline = time.time() + timeout
+    log.info(f"Waiting for MaaSAuthPolicy {name} to reach phase '{expected_phase}' (timeout: {timeout}s)...")
+
+    while time.time() < deadline:
+        cr = _get_cr("maasauthpolicy", name, namespace)
+        if cr:
+            status = cr.get("status", {})
+            phase = status.get("phase")
+            auth_policies = status.get("authPolicies", [])
+
+            if phase == expected_phase:
+                # No per-model auth policies required — phase match is sufficient for the CR,
+                # but gateway-only mode still needs Kuadrant Enforced before HTTP calls.
+                # Callers that intentionally stop Kuadrant (e.g. TRLP degraded tests) must
+                # pass require_enforced=False — Enforced cannot become True while Kuadrant is down.
+                if not require_auth_policies:
+                    if require_enforced and expected_phase == "Active":
+                        # Keep a floor so a slow phase wait does not starve Kuadrant Enforced.
+                        # AuthConfig backlog after policy churn often needs the full enforced timeout.
+                        remaining = max(GATEWAY_ENFORCED_TIMEOUT, int(deadline - time.time()))
+                        _wait_for_gateway_auth_enforced(timeout=remaining)
+                    log.info(f"MaaSAuthPolicy {name} reached phase '{expected_phase}'")
+                    return cr
+
+                # Auth policies required — check they exist
+                if len(auth_policies) > 0:
+                    if require_enforced:
+                        all_enforced = all(
+                            ap.get("ready") is True
+                            for ap in auth_policies
+                        )
+                        if all_enforced:
+                            log.info(f"MaaSAuthPolicy {name} reached phase '{expected_phase}' and all enforced")
+                            return cr
+                    else:
+                        log.info(f"MaaSAuthPolicy {name} reached phase '{expected_phase}' with {len(auth_policies)} auth policy status(es)")
+                        return cr
+
+            log.debug(f"MaaSAuthPolicy {name}: phase={phase}, authPolicies={len(auth_policies)}")
+        time.sleep(2)
+
+    # Timeout - return current state for debugging
+    cr = _get_cr("maasauthpolicy", name, namespace)
+    status = cr.get("status", {}) if cr else {}
+    raise TimeoutError(
+        f"MaaSAuthPolicy {name} did not reach phase '{expected_phase}' within {timeout}s "
+        f"(current: phase={status.get('phase')}, authPolicies={len(status.get('authPolicies', []))})"
+    )
+
+
+def _wait_for_model_ready(model_ref, namespace=MODEL_NAMESPACE, timeout=60):
+    """Wait for MaaSModelRef to reach Ready phase.
+
+    Args:
+        model_ref: Name of the MaaSModelRef
+        namespace: Namespace (default: MODEL_NAMESPACE)
+        timeout: Maximum wait time in seconds (default: 60)
+
+    Returns:
+        The MaaSModelRef CR dict when Ready
+
+    Raises:
+        TimeoutError: If MaaSModelRef doesn't reach Ready within timeout
+    """
+    deadline = time.time() + timeout
+    log.info(f"Waiting for MaaSModelRef {namespace}/{model_ref} to reach phase 'Ready' (timeout: {timeout}s)...")
+
+    while time.time() < deadline:
+        cr = _get_cr("maasmodelref", model_ref, namespace)
+        if cr:
+            status = cr.get("status", {})
+            phase = status.get("phase")
+            endpoint = status.get("endpoint")
+
+            if phase == "Ready" and endpoint:
+                log.info(f"MaaSModelRef {namespace}/{model_ref} is Ready with endpoint: {endpoint}")
+                return cr
+
+            log.debug(f"MaaSModelRef {namespace}/{model_ref}: phase={phase}, endpoint={endpoint or 'none'}")
+        time.sleep(2)
+
+    # Timeout - return current state for debugging
+    cr = _get_cr("maasmodelref", model_ref, namespace)
+    status = cr.get("status", {}) if cr else {}
+    conditions = status.get("conditions", [])
+    raise TimeoutError(
+        f"MaaSModelRef {namespace}/{model_ref} did not reach Ready within {timeout}s "
+        f"(current: phase={status.get('phase')}, endpoint={status.get('endpoint')}, "
+        f"conditions={[c.get('type') + '=' + str(c.get('status')) for c in conditions]})"
+    )
+
+
+def _wait_for_httproute_accepted(name, namespace=MODEL_NAMESPACE, timeout=60):
+    """Wait for an HTTPRoute to be Accepted by at least one parent Gateway.
+
+    The HTTPRoute object existing in the API server only proves the
+    reconciler created it — the Gateway controller still needs to program it
+    into the data plane before real HTTP traffic will match it. Requests
+    sent before that happens race the gateway and get a plain 404 ("no
+    route"), which is easy to mistake for an auth failure since callers
+    usually assert on 401/403. Waiting on the gateway-level AuthPolicy
+    Enforced condition does NOT prove this route is ready — that policy is
+    a fixed-size singleton unrelated to any single HTTPRoute.
+
+    Args:
+        name: Name of the HTTPRoute
+        namespace: Namespace (default: MODEL_NAMESPACE)
+        timeout: Maximum wait time in seconds (default: 60)
+
+    Returns:
+        The HTTPRoute CR dict once Accepted
+
+    Raises:
+        TimeoutError: If no parent reports Accepted=True within timeout
+    """
+    deadline = time.time() + timeout
+    log.info(f"Waiting for HTTPRoute {namespace}/{name} to be Accepted (timeout: {timeout}s)...")
+
+    while time.time() < deadline:
+        cr = _get_cr("httproute", name, namespace)
+        if cr:
+            parents = (cr.get("status") or {}).get("parents") or []
+            for parent in parents:
+                if any(
+                    c.get("type") == "Accepted" and c.get("status") == "True"
+                    for c in parent.get("conditions") or []
+                ):
+                    log.info(f"HTTPRoute {namespace}/{name} is Accepted")
+                    return cr
+            log.debug(f"HTTPRoute {namespace}/{name}: no parent Accepted=True yet ({len(parents)} parent(s))")
+        time.sleep(2)
+
+    cr = _get_cr("httproute", name, namespace)
+    parents = (cr.get("status") or {}).get("parents") if cr else None
+    raise TimeoutError(
+        f"HTTPRoute {namespace}/{name} did not report Accepted=True within {timeout}s "
+        f"(parents={parents!r})"
+    )
+
+
+def _wait_for_cr_absent(kind, name, namespace=None, timeout=30, poll_interval=2):
+    """Wait until a CR is deleted (no longer found by the API server)."""
+    namespace = namespace or _ns()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _get_cr(kind, name, namespace) is None:
+            return
+        time.sleep(poll_interval)
+    raise TimeoutError(
+        f"{kind}/{name} in {namespace} still exists after {timeout}s"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Controller scaling utilities
+# ---------------------------------------------------------------------------
+
+def _scale_controller(replicas, namespace=None, timeout=60):
+    """
+    Scale the maas-controller deployment.
+
+    Args:
+        replicas: Target replica count (0 to disable, 1+ to enable)
+        namespace: Deployment namespace (defaults to DEPLOYMENT_NAMESPACE env or 'opendatahub')
+        timeout: Max seconds to wait for scaling operation (default: 60)
+
+    Raises:
+        subprocess.CalledProcessError: If kubectl scale fails
+        TimeoutError: If pods don't reach desired state within timeout
+    """
+    namespace = namespace or os.environ.get("DEPLOYMENT_NAMESPACE", "opendatahub")
+
+    log.info(f"Scaling maas-controller to {replicas} replicas in namespace {namespace}...")
+
+    # Scale the deployment
+    result = subprocess.run(
+        ["oc", "scale", "deployment", "maas-controller",
+         f"--replicas={replicas}", "-n", namespace],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+
+    # Wait for pods to reach desired state
+    if replicas == 0:
+        # Wait for all pods to terminate
+        log.debug(f"Waiting for maas-controller pods to terminate (timeout: {timeout}s)...")
+        subprocess.run(
+            ["oc", "wait", "--for=delete", "pod",
+             "-l", "app=maas-controller", "-n", namespace,
+             f"--timeout={timeout}s"],
+            check=False,  # Don't fail if no pods exist
+            capture_output=True,
+            text=True
+        )
+        log.info("✓ maas-controller scaled down to 0 replicas")
+    else:
+        # Wait for pods to become ready
+        log.debug(f"Waiting for maas-controller pods to become ready (timeout: {timeout}s)...")
+        try:
+            subprocess.run(
+                ["oc", "wait", "--for=condition=ready", "pod",
+                 "-l", "app=maas-controller", "-n", namespace,
+                 f"--timeout={timeout}s"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            log.info(f"✓ maas-controller scaled to {replicas} replica(s)")
+        except subprocess.CalledProcessError as e:
+            # Log but don't fail - sometimes pods need extra time
+            log.warning(f"Pods may not be ready yet: {e.stderr}")
+            time.sleep(5)  # Give it a bit more time
+
+
+def _scale_controller_down(namespace=None, timeout=60):
+    """Scale maas-controller to 0 replicas (convenience wrapper)."""
+    _scale_controller(0, namespace, timeout)
+
+
+def _scale_controller_up(namespace=None, timeout=60):
+    """Scale maas-controller to 1 replica (convenience wrapper)."""
+    _scale_controller(1, namespace, timeout)
+
+
+def _scale_kuadrant_controller(replicas, namespace="kuadrant-system", timeout=60):
+    """
+    Scale the kuadrant-operator deployment.
+
+    Args:
+        replicas: Target replica count (0 to disable, 1+ to enable)
+        namespace: Deployment namespace (default: kuadrant-system)
+        timeout: Max seconds to wait for scaling operation (default: 60)
+
+    Raises:
+        subprocess.CalledProcessError: If kubectl scale fails
+        TimeoutError: If pods don't reach desired state within timeout
+    """
+    log.info(f"Scaling kuadrant-operator to {replicas} replicas in namespace {namespace}...")
+
+    # Scale the deployment
+    result = subprocess.run(
+        ["oc", "scale", "deployment", "kuadrant-operator-controller-manager",
+         f"--replicas={replicas}", "-n", namespace],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+
+    # Wait for pods to reach desired state
+    if replicas == 0:
+        # Wait for all pods to terminate
+        log.debug(f"Waiting for kuadrant-operator pods to terminate (timeout: {timeout}s)...")
+        subprocess.run(
+            ["oc", "wait", "--for=delete", "pod",
+             "-l", "control-plane=controller-manager", "-n", namespace,
+             f"--timeout={timeout}s"],
+            check=False,  # Don't fail if no pods exist
+            capture_output=True,
+            text=True
+        )
+        log.info("✓ kuadrant-operator scaled down to 0 replicas")
+    else:
+        # Wait for pods to become ready
+        log.debug(f"Waiting for kuadrant-operator pods to become ready (timeout: {timeout}s)...")
+        try:
+            subprocess.run(
+                ["oc", "wait", "--for=condition=ready", "pod",
+                 "-l", "control-plane=controller-manager", "-n", namespace,
+                 f"--timeout={timeout}s"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            log.info(f"✓ kuadrant-operator scaled to {replicas} replica(s)")
+        except subprocess.CalledProcessError:
+            log.warning(f"Pods may not be ready yet (timeout: {timeout}s)")
+            raise
+
+
+def _scale_kuadrant_controller_down(namespace="kuadrant-system", timeout=60):
+    """Scale kuadrant-operator to 0 replicas (convenience wrapper)."""
+    _scale_kuadrant_controller(0, namespace, timeout)
+
+
+def _scale_kuadrant_controller_up(namespace="kuadrant-system", timeout=60):
+    """Scale kuadrant-operator to 1 replica (convenience wrapper)."""
+    _scale_kuadrant_controller(1, namespace, timeout)
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant model helpers
+# ---------------------------------------------------------------------------
+
+def _create_llmis(
+    name: str,
+    namespace: str,
+    gateway_name: str,
+    gateway_namespace: str = "openshift-ingress",
+    model_name: str = "facebook/opt-125m",
+):
+    """Create a simulated LLMInferenceService pointing to a specific gateway.
+
+    Args:
+        name: LLMIS name
+        namespace: Namespace to create LLMIS in
+        gateway_name: Gateway name to route through
+        gateway_namespace: Gateway namespace (default: openshift-ingress)
+        model_name: spec.model.name (the model identity used for BBR/ResolvedModelAlias).
+            Defaults to "facebook/opt-125m"; override to test model-identity-collision
+            scenarios where two LLMISs intentionally share a model name.
+    """
+    _apply_cr({
+        "apiVersion": "serving.kserve.io/v1alpha1",
+        "kind": "LLMInferenceService",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+        },
+        "spec": {
+            "model": {
+                "name": model_name,
+                # uri is required by the LLMIS schema but not used by llm-d-inference-sim.
+                "uri": "hf://placeholder/no-model",
+            },
+            # Skip storage-initializer; simulator generates responses without model weights.
+            "storageInitializer": {
+                "enabled": False,
+            },
+            "replicas": 1,
+            "router": {
+                "gateway": {
+                    "refs": [
+                        {
+                            "name": gateway_name,
+                            "namespace": gateway_namespace,
+                        }
+                    ]
+                },
+                "route": {},  # Required for KServe to create HTTPRoute
+            },
+            "template": {
+                "containers": [
+                    {
+                        "name": "main",
+                        "image": "ghcr.io/llm-d/llm-d-inference-sim@sha256:c3ba435081a4d032676b218ea34eb3a1c54507da0fade2f6297f9c37894fe0d1",
+                        "command": ["/app/llm-d-inference-sim"],
+                        "args": [
+                            "--port", "8000",
+                            "--model", model_name,
+                            "--mode", "random",
+                            "--no-mm-encoder-only",
+                            "--ssl-certfile", "/var/run/kserve/tls/tls.crt",
+                            "--ssl-keyfile", "/var/run/kserve/tls/tls.key",
+                        ],
+                        "ports": [
+                            {
+                                "containerPort": 8000,
+                                "name": "https",
+                                "protocol": "TCP",
+                            }
+                        ],
+                        "livenessProbe": {
+                            "httpGet": {
+                                "path": "/health",
+                                "port": "https",
+                                "scheme": "HTTPS",
+                            }
+                        },
+                        "readinessProbe": {
+                            "httpGet": {
+                                "path": "/ready",
+                                "port": "https",
+                                "scheme": "HTTPS",
+                            }
+                        },
+                    }
+                ]
+            },
+        },
+    })
+
+
+def _create_maas_model_ref(name: str, namespace: str, llmis_name: str):
+    """Create a MaaSModelRef pointing to an LLMInferenceService.
+
+    Args:
+        name: MaaSModelRef name
+        namespace: Namespace to create MaaSModelRef in
+        llmis_name: LLMInferenceService name to reference
+    """
+    _apply_cr({
+        "apiVersion": "maas.opendatahub.io/v1alpha1",
+        "kind": "MaaSModelRef",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+        },
+        "spec": {
+            "modelRef": {
+                "kind": "LLMInferenceService",
+                "name": llmis_name,
+            }
+        },
+    })
