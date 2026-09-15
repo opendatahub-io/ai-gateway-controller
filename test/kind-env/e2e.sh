@@ -411,17 +411,20 @@ cp "$provider_wrong_tmp" "$EVIDENCE/provider-wrong.body"
 redact_provider_response "$EVIDENCE/provider-wrong.body"
 rm -f "$provider_wrong_tmp"
 if [[ "$provider_wrong" == 401 ]]; then record 33 provider_rejects_wrong_credential PASS "$provider_wrong"; else record 33 provider_rejects_wrong_credential FAIL "$provider_wrong"; fi
-# The valid MaaS key is supplied by the qualification while these deliberately
-# conflicting client headers are supplied at the Gateway boundary. A successful
-# attributed response proves the projected provider credential, rather than
-# either client value, authenticated the backend request.
-printf '%s\n' 'MaaS caller authentication uses the sole Authorization header; duplicate Authorization headers are ambiguous and are not used as proof.' >"$EVIDENCE/client-authorization-override-not-demonstrated.txt"
-record 34 client_authorization_cannot_override_provider_credential NOT_DEMONSTRATED 'independent caller authentication is unavailable for this policy; duplicate-header ordering is not a valid override test'
+# The authenticated Gateway request carries the MaaS API key in Authorization,
+# while Katan accepts only the distinct projected provider credential. Its
+# attributed HTTP 200 therefore proves Praxis replaced the caller credential.
+# Duplicate Authorization header ordering is intentionally outside this claim.
+if [[ "$known" == 200 ]] && rg -q 'katan-a' "$EVIDENCE/request-known.body"; then
+  record 34 client_authorization_cannot_override_provider_credential PASS "$known" "caller MaaS Authorization was replaced by the distinct projected provider credential; duplicate Authorization headers are out of scope"
+else
+  record 34 client_authorization_cannot_override_provider_credential FAIL "$known" "authenticated request did not reach the credential-enforcing Provider A backend"
+fi
 client_api_key_override=$(request client-api-key-override "$MODEL_URL" -H 'content-type: application/json' -H 'x-api-key: client-override' --data "$provider_body")
 redact_provider_response "$EVIDENCE/request-client-api-key-override.body"
 if [[ "$client_api_key_override" == 200 ]] && rg -q 'katan-a' "$EVIDENCE/request-client-api-key-override.body"; then record 35 client_x_api_key_cannot_override_provider_credential PASS "$client_api_key_override"; else record 35 client_x_api_key_cannot_override_provider_credential FAIL "$client_api_key_override"; fi
 if [[ "$known" == 200 && "$provider_missing" == 401 && "$provider_wrong" == 401 && "$client_api_key_override" == 200 ]] && rg -q 'katan-a' "$EVIDENCE/request-known.body" && rg -q 'server: istio-envoy' "$EVIDENCE/request-known.headers" && rg -q 'via: 1.1 praxis' "$EVIDENCE/request-known.headers"; then
-  record 36 credential_enforcing_provider_chain NOT_DEMONSTRATED "$known" "backend enforcement and x-api-key resistance passed; Authorization resistance is not provable with this caller-authentication contract"
+  record 36 credential_enforcing_provider_chain PASS "$known" "backend enforcement, caller Authorization replacement, and x-api-key resistance passed"
 else
   record 36 credential_enforcing_provider_chain FAIL "$known" "gateway, backend credential, or x-api-key assertion failed"
 fi

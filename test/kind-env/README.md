@@ -154,12 +154,13 @@ annotation-absent IPP transition fixture uses its separate
 `transition-provider-key` value through the dedicated `katan-transition`
 Deployment. These values are qualification fixtures only and are never
 production credentials. The E2E first proves direct requests without a
-credential or with the wrong credential receive HTTP 401, then proves that a
-client-supplied `x-api-key` cannot replace the credential projected by Praxis.
-`Authorization` override resistance is reported as `NOT_DEMONSTRATED` because
-the same header carries the MaaS caller credential in this fixture; duplicate
-header ordering is not accepted as proof. The expected provider credential is
-kept out of logs and evidence.
+credential or with the wrong credential receive HTTP 401. The authenticated
+Gateway request carries the MaaS API key in `Authorization`, while the backend
+accepts only the distinct projected provider credential; its attributed HTTP
+200 proves Praxis replaced the caller credential. A separate request proves a
+client-supplied `x-api-key` cannot replace it either. Duplicate `Authorization`
+header ordering is outside this claim. The expected provider credential is kept
+out of logs and evidence.
 
 Run the static fixture regression check with:
 

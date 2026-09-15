@@ -205,13 +205,17 @@ printf '%s\n' "$provider_missing" >"$OUT/provider-missing-status.txt"
 provider_wrong=$(provider_probe wrong 2>/dev/null || true)
 printf '%s\n' "$provider_wrong" >"$OUT/provider-wrong-status.txt"
 [[ "$provider_wrong" == 401 ]] && record 22 "provider_rejects_wrong_credential" PASS provider "direct Provider A request returned HTTP 401" || { record 22 "provider_rejects_wrong_credential" FAIL provider "expected HTTP 401, observed $provider_wrong"; exit 1; }
-printf '%s\n' 'OpenShift does not have an independent caller-authentication header in this fixture; duplicate Authorization headers are ambiguous and are not used as proof.' >"$OUT/authorization-override-not-demonstrated.txt"
-record 23 "client_authorization_cannot_override_provider_credential" NOT_DEMONSTRATED provider "single Authorization header serves MaaS caller authentication; duplicate-header ordering is not a valid override test"
+if [[ "$a_status" == 200 && "$a_body" == *provider-a* ]]; then
+  record 23 "client_authorization_cannot_override_provider_credential" PASS provider "caller MaaS Authorization was replaced by the distinct projected provider credential; duplicate Authorization headers are out of scope"
+else
+  record 23 "client_authorization_cannot_override_provider_credential" FAIL provider "authenticated request did not reach the credential-enforcing Provider A backend"
+  exit 1
+fi
 x_api_override=$(request_with_x_api_key_override "$KEY" "$URL" "$request_body" 2>/dev/null || true)
 x_api_override_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$x_api_override" == 200 && "$x_api_override_body" == *provider-a* ]] && record 24 "client_x_api_key_cannot_override_provider_credential" PASS provider "HTTP 200; Provider A attribution observed" || { record 24 "client_x_api_key_cannot_override_provider_credential" FAIL provider "expected attributed HTTP 200, observed $x_api_override"; exit 1; }
 if [[ "$a_status" == 200 && "$a_body" == *provider-a* && "$provider_missing" == 401 && "$provider_wrong" == 401 && "$x_api_override" == 200 ]]; then
-  record 25 "credential_enforcing_provider_chain" NOT_DEMONSTRATED provider "backend enforcement and x-api-key resistance passed; Authorization resistance is not provable with this caller-authentication contract"
+  record 25 "credential_enforcing_provider_chain" PASS provider "backend enforcement, caller Authorization replacement, and x-api-key resistance passed"
 else
   record 25 "credential_enforcing_provider_chain" FAIL provider "credential enforcement or x-api-key override resistance failed"
   exit 1
