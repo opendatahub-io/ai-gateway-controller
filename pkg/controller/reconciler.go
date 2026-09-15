@@ -19,6 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -44,6 +45,7 @@ const (
 	providerServicePrefix       = "provider-"
 	modelRoutePrefix            = "external-model-"
 	defaultPraxisService        = "praxis"
+	externalModelFinalizer      = "inference.opendatahub.io/external-model-cleanup"
 )
 
 // Reconciler is the sole writer for the ExternalModel transport plane and the
@@ -159,8 +161,9 @@ func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace s
 }
 
 // providerInputs validates providers and applies the persisted readiness gate.
-// An empty phase is the bootstrap state; subsequent non-Ready phases are
-// excluded until the owning readiness producer restores Ready.
+// An empty phase is the bootstrap state. Failed is revalidated on every
+// dependent event so a recovered Secret or transient transport can restore a
+// provider without a manual status edit; other phases remain gated.
 func (r *Reconciler) providerInputs(ctx context.Context, namespace string) (
 	v1alpha1.ExternalProviderList, []*v1alpha1.ExternalProvider,
 	[]*v1alpha1.ExternalProvider, error,
@@ -179,11 +182,11 @@ func (r *Reconciler) providerInputs(ctx context.Context, namespace string) (
 			}
 			continue
 		}
-		if p.Status.Phase != "" && p.Status.Phase != resolver.PhaseReady {
+		if p.Status.Phase != "" && p.Status.Phase != resolver.PhaseReady && p.Status.Phase != "Failed" {
 			continue
 		}
 		ready := p.DeepCopy()
-		if ready.Status.Phase == "" {
+		if ready.Status.Phase == "" || ready.Status.Phase == "Failed" {
 			ready.Status.Phase = resolver.PhaseReady
 		}
 		providerPtrs = append(providerPtrs, ready)
@@ -202,28 +205,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, err
 	}
-	if !model.DeletionTimestamp.IsZero() {
-		// HTTPRoute ownership is garbage-collected from the ExternalModel;
-		// provider transport objects are owned by ExternalProvider and may be
-		// shared by other models. No controller finalizer is required.
-		return reconcile.Result{}, nil
-	}
 	ait, found, err := r.praxisTenantForNamespace(ctx, req.Namespace)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 	if !found {
-		// A tenant without the Praxis opt-in belongs to IPP (or to no tenant), so this
-		// controller must not contend for its resources. If this model used to
-		// be selected for Praxis, remove only this controller's labeled
-		// transport objects; MaaS-owned IPP objects are never targeted.
-		if err := r.cleanupTransport(ctx, req.Namespace, nil); err != nil {
-			return reconcile.Result{}, err
-		}
-		if err := r.cleanupOverlay(ctx, req.Namespace); err != nil {
+		if err := r.cleanupUnselectedModel(ctx, &model); err != nil {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
+	}
+	if handled, err := r.handleModelLifecycle(ctx, &model, ait); handled {
+		return reconcile.Result{}, err
+	} else if err != nil {
+		return reconcile.Result{}, err
 	}
 	if !tenant.IsActive(ait) {
 		if err := r.updateModelStatus(ctx, &model, false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
@@ -338,6 +333,124 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	return reconcile.Result{}, nil
 }
 
+// cleanupUnselectedModel releases only resources owned by this controller when
+// the tenant no longer selects Praxis. The default IPP path is not targeted.
+func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	if err := r.cleanupTransport(ctx, model.Namespace, nil); err != nil {
+		return err
+	}
+	if err := r.cleanupOverlay(ctx, model.Namespace); err != nil {
+		return err
+	}
+	if controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+		return r.removeExternalModelFinalizer(ctx, model)
+	}
+	return nil
+}
+
+func (r *Reconciler) handleModelLifecycle(ctx context.Context, model *v1alpha1.ExternalModel, ait *unstructured.Unstructured) (bool, error) {
+	if !controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+		if !model.DeletionTimestamp.IsZero() {
+			return true, nil
+		}
+		controllerutil.AddFinalizer(model, externalModelFinalizer)
+		if err := r.Update(ctx, model); err != nil {
+			return true, fmt.Errorf("add ExternalModel cleanup finalizer: %w", err)
+		}
+	}
+	if model.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	return true, r.reconcileDeletedModel(ctx, model, ait)
+}
+
+// reconcileDeletedModel republishes the namespace's remaining route set before
+// releasing the ExternalModel finalizer. Deletion therefore does not depend on
+// an unrelated sibling watch to remove stale transport or overlay state.
+func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha1.ExternalModel, ait *unstructured.Unstructured) error {
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
+		return fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
+	}
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
+	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
+	for i := range models.Items {
+		m := &models.Items[i]
+		if m.Name == deleted.Name || !m.DeletionTimestamp.IsZero() {
+			continue
+		}
+		modelPtrs = append(modelPtrs, m)
+		modelOwners[m.Name] = m
+	}
+	providers, providerPtrs, _, err := r.providerInputs(ctx, deleted.Namespace)
+	if err != nil {
+		return err
+	}
+	providerOwners := make(map[string]*v1alpha1.ExternalProvider, len(providers.Items))
+	for i := range providers.Items {
+		providerOwners[providers.Items[i].Name] = &providers.Items[i]
+	}
+	set, err := resolver.Resolve(modelPtrs, providerPtrs)
+	if errors.Is(err, resolver.ErrNoRoutes) {
+		// A sibling still exists but is temporarily unroutable: retain the
+		// last-known-good transport and overlay and retry. Only final-model
+		// deletion is allowed to remove the shared serving state.
+		if len(modelPtrs) > 0 {
+			return err
+		}
+		if err := r.cleanupTransport(ctx, deleted.Namespace, nil); err != nil {
+			return err
+		}
+		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
+			return err
+		}
+		return r.removeExternalModelFinalizer(ctx, deleted)
+	}
+	if err != nil {
+		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
+	}
+	if len(r.KnownClusters) == 0 {
+		return errors.New("no Praxis load_balancer clusters are configured while deleting ExternalModel")
+	}
+	gatewayName, gatewayNamespace := r.gatewayName(), r.gatewayNamespace()
+	if selectedGateway, selectedNamespace, ok := tenant.GatewayRef(ait); ok {
+		gatewayName, gatewayNamespace = selectedGateway, selectedNamespace
+	}
+	praxisService := tenant.ResourceName(defaultPraxisService, tenant.ID(ait.GetName()))
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, gatewayName, gatewayNamespace, praxisService, modelOwners, providerOwners); err != nil {
+		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
+	}
+	if err := r.cleanupTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
+		return err
+	}
+	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
+	if err != nil {
+		return err
+	}
+	publish := r.PublishOverlay
+	if publish == nil {
+		publish = pub.Publish
+	}
+	if _, err := publish(ctx, set, envelope.Scope{
+		Network: r.Network, Gateway: gatewayName, Namespace: deleted.Namespace, LocalSite: r.localSite(),
+	}, envelope.Options{
+		KnownClusters: r.KnownClusters, SourceUID: string(modelPtrs[0].UID), ProducerVersion: "dev",
+	}); err != nil {
+		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
+	}
+	return r.removeExternalModelFinalizer(ctx, deleted)
+}
+
+func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	if !controllerutil.RemoveFinalizer(model, externalModelFinalizer) {
+		return nil
+	}
+	if err := r.Update(ctx, model); err != nil {
+		return fmt.Errorf("remove ExternalModel cleanup finalizer: %w", err)
+	}
+	return nil
+}
+
 func (r *Reconciler) cleanupTransport(ctx context.Context, namespace string, routes []resolver.Route) error {
 	providers := map[string]bool{}
 	models := map[string]bool{}
@@ -408,6 +521,13 @@ func (r *Reconciler) praxisTenantForNamespace(ctx context.Context, namespace str
 }
 
 func (r *Reconciler) validateProvider(ctx context.Context, p *v1alpha1.ExternalProvider) error {
+	authType := strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type))
+	if authType != "apikey" {
+		if authType == "" {
+			return errors.New("auth.type is required; supported strategy is apikey")
+		}
+		return fmt.Errorf("unsupported authentication strategy %q; only apikey is supported", p.Spec.Auth.Type)
+	}
 	if p.Spec.Auth.SecretRef.Name == "" {
 		return errors.New("auth.secretRef.name is required")
 	}
@@ -635,6 +755,10 @@ func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS, praxisService 
 					"timeouts":    map[string]any{"request": "300s"},
 				},
 				map[string]any{
+					// This body-routing rule intentionally matches the model header
+					// on any Gateway path. ExtProc extracts the client model identity
+					// from the request body/header, while the path rule above preserves
+					// the normal URL-based contract and rewrite.
 					"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
 					"backendRefs": []any{map[string]any{"name": praxisService, "port": int64(8080)}},
 					"timeouts":    map[string]any{"request": "300s"},

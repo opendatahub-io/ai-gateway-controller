@@ -16,6 +16,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
@@ -103,6 +104,66 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	value := nestedString(t, nestedMapAt(t, headers, 0), "value")
 	if name != "X-Gateway-Model-Name" || value != "client-model" {
 		t.Fatalf("body route header = %q=%q", name, value)
+	}
+	if _, found, err := unstructured.NestedMap(nestedMapAt(t, bodyMatches, 0), "path"); err != nil || found {
+		t.Fatalf("body route must intentionally be path-independent: found=%v err=%v", found, err)
+	}
+}
+
+func TestCandidateIdentityUsesClientModelName(t *testing.T) {
+	route := resolver.Route{
+		Model: "external-model-name", ClientName: "client-visible-model",
+		Cluster: "provider-provider", Namespace: "tenant-a", Provider: "provider",
+		ProviderType: "openai", Endpoint: "api.example.com", APIFormat: "openai-chat",
+		AuthType: "apikey", SecretName: "credentials", SecretKey: "api-key",
+	}
+	set := &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{ModelRef: "tenant-a/external-model-name", Routes: []resolver.Route{route}}}}
+	env, err := envelope.Render(set, envelope.Scope{Network: "network", Gateway: "gateway", Namespace: "tenant-a", LocalSite: "local"}, envelope.Revision{}, envelope.Options{KnownClusters: []string{"provider-provider"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].Name != "client-visible-model" {
+		t.Fatalf("candidate identity = %#v, want client-visible-model", env.Overlay.Candidates)
+	}
+	obj := modelHTTPRoute(route, "tenant-a", "gateway", "tenant-a", "praxis")
+	rules := nestedSlice(t, obj.Object, "spec", "rules")
+	path := nestedString(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "matches"), 0), "path", "value")
+	if path != "/tenant-a/client-visible-model" {
+		t.Fatalf("HTTPRoute path = %q, want client-visible-model path", path)
+	}
+}
+
+func TestValidateProviderAuthenticationStrategies(t *testing.T) {
+	tests := []struct {
+		name       string
+		authType   string
+		secretData map[string][]byte
+		want       string
+	}{
+		{name: "apikey", authType: "apikey", secretData: map[string][]byte{"api-key": []byte("fixture")}},
+		{name: "missing api key", authType: "apikey", secretData: map[string][]byte{"other": []byte("fixture")}, want: "missing key api-key"},
+		{name: "sigv4 unsupported", authType: "sigv4", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
+		{name: "oauth2 unsupported", authType: "oauth2", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
+		{name: "unknown unsupported", authType: "custom", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{
+				Auth: v1alpha1.AuthConfig{Type: tc.authType, SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+			}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: tc.secretData}
+			r := controllerTestClient(t, provider, secret)
+			err := r.validateProvider(context.Background(), provider)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("validateProvider() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateProvider() = %v, want error containing %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -316,9 +377,15 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
 		t.Fatalf("switch-away overlay error = %v, want NotFound", err)
 	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gotModel); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&gotModel, externalModelFinalizer) {
+		t.Fatalf("switch-away retained controller finalizer: %v", gotModel.Finalizers)
+	}
 }
 
-func TestReconcileExcludesProviderAfterReadinessLossAndRecovers(t *testing.T) {
+func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
 		Spec: v1alpha1.ExternalProviderSpec{
@@ -354,16 +421,11 @@ func TestReconcileExcludesProviderAfterReadinessLossAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var stored v1alpha1.ExternalProvider
-	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &stored); err != nil {
-		t.Fatal(err)
-	}
-	stored.Status.Phase = "Failed"
-	if err := r.Status().Update(context.Background(), &stored); err != nil {
+	if err := r.Delete(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Reconcile(context.Background(), req); !errors.Is(err, resolver.ErrNoRoutes) {
-		t.Fatalf("readiness-loss reconcile error = %v, want %v", err, resolver.ErrNoRoutes)
+		t.Fatalf("missing-secret reconcile error = %v, want %v", err, resolver.ErrNoRoutes)
 	}
 	var after corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &after); err != nil {
@@ -377,11 +439,11 @@ func TestReconcileExcludesProviderAfterReadinessLossAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	if failed.Status.Phase != "Failed" || !hasConditionReason(failed.Status.Conditions, conditionReady, reasonProviderNotReady) {
-		t.Fatalf("readiness-loss status = %#v", failed.Status)
+		t.Fatalf("missing-secret status = %#v", failed.Status)
 	}
 
-	stored.Status.Phase = resolver.PhaseReady
-	if err := r.Status().Update(context.Background(), &stored); err != nil {
+	secret.ResourceVersion = ""
+	if err := r.Create(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -393,6 +455,198 @@ func TestReconcileExcludesProviderAfterReadinessLossAndRecovers(t *testing.T) {
 	}
 	if recovered.Status.Phase != resolver.PhaseReady || recovered.Status.OverlayDigest == "" || recovered.Status.OverlayGeneration == 0 {
 		t.Fatalf("recovery status = %#v", recovered.Status)
+	}
+}
+
+func TestReconcileRecoversProviderAfterTransientTransportFailure(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	r.ApplyResource = func(context.Context, client.Client, unstructured.Unstructured) error {
+		return errors.New("transient transport failure")
+	}
+	if _, err := r.Reconcile(context.Background(), req); err == nil || !strings.Contains(err.Error(), "transient transport failure") {
+		t.Fatalf("transport failure = %v", err)
+	}
+	var failedProvider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &failedProvider); err != nil {
+		t.Fatal(err)
+	}
+	if failedProvider.Status.Phase != "Failed" {
+		t.Fatalf("provider phase after transport failure = %q, want Failed", failedProvider.Status.Phase)
+	}
+	r.ApplyResource = nil
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("recovery reconcile = %v", err)
+	}
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase after transport recovery = %q, want Ready", provider.Status.Phase)
+	}
+}
+
+func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	sibling := model.DeepCopy()
+	sibling.Name = "sibling"
+	sibling.UID = "sibling-uid"
+	sibling.ResourceVersion = ""
+	sibling.Finalizers = []string{externalModelFinalizer}
+	sibling.Status.Phase = resolver.PhaseReady
+	if err := r.Create(context.Background(), sibling); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	deletedRoute := &unstructured.Unstructured{}
+	deletedRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); !apierrors.IsNotFound(err) {
+		t.Fatalf("deleted model route = %v, want NotFound", err)
+	}
+	remainingRoute := &unstructured.Unstructured{}
+	remainingRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(sibling.Name)}, remainingRoute); err != nil {
+		t.Fatalf("remaining sibling route = %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(overlay.Data["routing-overlay.json"], "sibling") {
+		t.Fatal("remaining overlay does not contain sibling model")
+	}
+}
+
+func TestFinalExternalModelDeletionRemovesOwnedTransportAndOverlay(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("final overlay = %v, want NotFound", err)
+	}
+	for _, key := range []client.ObjectKey{{Namespace: "tenant-a", Name: "provider-provider"}, {Namespace: "tenant-a", Name: "external-model-model"}} {
+		for _, gvk := range []schema.GroupVersionKind{{Version: "v1", Kind: "Service"}, {Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}} {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(gvk)
+			if err := r.Get(context.Background(), key, obj); !apierrors.IsNotFound(err) {
+				t.Fatalf("final deletion left %s/%s: %v", gvk.Kind, key.Name, err)
+			}
+		}
+	}
+}
+
+func TestConcurrentExternalModelDeletionCleansNamespaceState(t *testing.T) {
+	r, first := reconcilerFixture(t)
+	firstKey := client.ObjectKeyFromObject(first)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: firstKey}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := first.DeepCopy()
+	second.Name = "second"
+	second.UID = "second-uid"
+	second.ResourceVersion = ""
+	second.ManagedFields = nil
+	second.Finalizers = []string{externalModelFinalizer}
+	second.Status = v1alpha1.ExternalModelStatus{}
+	if err := r.Create(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	secondKey := client.ObjectKeyFromObject(second)
+
+	if err := r.Delete(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: firstKey}); err != nil {
+		t.Fatal(err)
+	}
+
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("concurrent deletion overlay = %v, want NotFound", err)
+	}
+	for _, key := range []client.ObjectKey{
+		{Namespace: "tenant-a", Name: "provider-provider"},
+		{Namespace: "tenant-a", Name: "external-model-model"},
+		{Namespace: "tenant-a", Name: "external-model-second"},
+	} {
+		for _, gvk := range []schema.GroupVersionKind{{Version: "v1", Kind: "Service"}, {Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}} {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(gvk)
+			if err := r.Get(context.Background(), key, obj); !apierrors.IsNotFound(err) {
+				t.Fatalf("concurrent deletion left %s/%s: %v", gvk.Kind, key.Name, err)
+			}
+		}
+	}
+
+	var pending v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), secondKey, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&pending, externalModelFinalizer) {
+		t.Fatalf("sibling deletion unexpectedly removed by another reconcile: %v", pending.Finalizers)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: secondKey}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []client.ObjectKey{firstKey, secondKey} {
+		var deleted v1alpha1.ExternalModel
+		if err := r.Get(context.Background(), key, &deleted); !apierrors.IsNotFound(err) {
+			t.Fatalf("deleted ExternalModel %s remains: %v", key.Name, err)
+		}
+	}
+}
+
+type failingDeleteClient struct {
+	client.Client
+	err error
+}
+
+func (c failingDeleteClient) Delete(context.Context, client.Object, ...client.DeleteOption) error {
+	return c.err
+}
+
+func TestExternalModelDeletionRetainsFinalizerWhenCleanupFails(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	r.Client = failingDeleteClient{Client: r.Client, err: errors.New("injected cleanup delete failure")}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err == nil || !strings.Contains(err.Error(), "injected cleanup delete failure") {
+		t.Fatalf("cleanup failure = %v", err)
+	}
+	var pending v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &pending); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&pending, externalModelFinalizer) {
+		t.Fatalf("cleanup failure removed finalizer: %v", pending.Finalizers)
 	}
 }
 
