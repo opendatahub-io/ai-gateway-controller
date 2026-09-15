@@ -1,0 +1,41 @@
+# Creates run-owned ExternalProvider and ExternalModel references; credential Secret creation remains opaque and in shell.
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: provider-a
+  namespace: ${OPENSHIFT_E2E_TENANT_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  provider: openai
+  endpoint: provider-a.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: provider-b
+  namespace: ${OPENSHIFT_E2E_TENANT_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  provider: openai
+  endpoint: provider-b.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: demo-model
+  namespace: ${OPENSHIFT_E2E_TENANT_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  modelName: demo
+  externalProviderRefs:
+  - ref: {name: provider-a}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions
+  - ref: {name: provider-b}
+    weight: 0
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions

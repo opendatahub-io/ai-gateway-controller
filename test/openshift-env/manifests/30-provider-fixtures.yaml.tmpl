@@ -1,0 +1,70 @@
+# Creates the two run-owned credential-enforcing Katan test endpoints used by the routing qualification.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-a
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: provider-a}}
+  template:
+    metadata: {labels: {app: provider-a}}
+    spec:
+      containers:
+      - name: provider
+        image: ${KATAN_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys]
+        env: [{name: HOME, value: /tmp}]
+        ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: writable-home, mountPath: /tmp}]
+      volumes: [{name: writable-home, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-a
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  selector: {app: provider-a}
+  ports:
+  - {name: http, port: 8000, targetPort: http}
+  - {name: https, port: 443, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-b
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: provider-b}}
+  template:
+    metadata: {labels: {app: provider-b}}
+    spec:
+      containers:
+      - name: provider
+        image: ${KATAN_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys]
+        env: [{name: HOME, value: /tmp}]
+        ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: writable-home, mountPath: /tmp}]
+      volumes: [{name: writable-home, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-b
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  selector: {app: provider-b}
+  ports:
+  - {name: http, port: 8000, targetPort: http}
+  - {name: https, port: 443, targetPort: http}

@@ -31,6 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/controller"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
 
@@ -38,14 +40,22 @@ var setupLog = ctrl.Log.WithName("setup")
 
 func main() {
 	var (
-		metricsAddr          string
-		probeAddr            string
-		enableLeaderElection bool
-		image                string
-		manifestPath         string
-		maasAPIRouteName     string
-		resyncInterval       time.Duration
-		deletionTimeout      time.Duration
+		metricsAddr           string
+		probeAddr             string
+		enableLeaderElection  bool
+		image                 string
+		praxisImage           string
+		praxisImagePullPolicy string
+		manifestPath          string
+		maasAPIRouteName      string
+		resyncInterval        time.Duration
+		deletionTimeout       time.Duration
+		externalNamespace     string
+		gatewayName           string
+		gatewayNamespace      string
+		network               string
+		localSite             string
+		knownClusters         []string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -53,7 +63,11 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
 	flag.StringVar(&image, "image", "quay.io/opendatahub/odh-praxis-extproc:odh-stable",
-		"Container image for the payload-processing and payload-pre-processing Deployments.")
+		"Container image for the payload-processing and payload-pre-processing Deployments. Release packaging should replace this default with an immutable digest.")
+	flag.StringVar(&praxisImage, "praxis-image", "quay.io/opendatahub/praxis-ai:odh-stable",
+		"Container image for the tenant-scoped standalone Praxis Deployment. Release packaging should replace this default with an immutable digest.")
+	flag.StringVar(&praxisImagePullPolicy, "praxis-image-pull-policy", "IfNotPresent",
+		"Image pull policy for the tenant-scoped standalone Praxis Deployment.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/praxis-extproc/overlays/odh",
 		"Path to the vendored praxis-extproc kustomize overlay.")
 	flag.StringVar(&maasAPIRouteName, "maas-api-route-name", "maas-api-route",
@@ -66,6 +80,15 @@ func main() {
 		"Maximum time to retry praxis-extproc cleanup for a tenant switching away from praxis or "+
 			"being deleted before force-removing this controller's cleanup finalizer without "+
 			"confirming cleanup succeeded. Zero disables the timeout and retries indefinitely.")
+	flag.StringVar(&externalNamespace, "external-model-namespace", "", "Optional namespace scope for ExternalModels; empty watches all namespaces and publishes each overlay in its model namespace.")
+	flag.StringVar(&gatewayName, "gateway-name", "maas-default-gateway", "Gateway parent name for ExternalModel HTTPRoutes.")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "openshift-ingress", "Gateway parent namespace for ExternalModel HTTPRoutes.")
+	flag.StringVar(&network, "routing-network", "external-model", "Routing overlay network scope.")
+	flag.StringVar(&localSite, "routing-local-site", "local", "Routing overlay local-site scope.")
+	flag.Func("known-cluster", "Predeclared Praxis load_balancer cluster; repeat for each provider cluster.", func(value string) error {
+		knownClusters = append(knownClusters, value)
+		return nil
+	})
 
 	opts := zap.Options{}
 	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
@@ -75,6 +98,10 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	if err := inferencev1alpha1.AddToScheme(clientgoscheme.Scheme); err != nil {
+		setupLog.Error(err, "unable to register inference API scheme")
+		os.Exit(1)
+	}
 
 	if image == "" {
 		setupLog.Error(errors.New("missing required flag"), "--image must be non-empty")
@@ -105,16 +132,29 @@ func main() {
 	}
 
 	reconciler := &tenant.Reconciler{
-		Client:               mgr.GetClient(),
-		ManifestPath:         manifestPath,
-		Image:                image,
-		MaaSAPIRouteNameBase: maasAPIRouteName,
-		ResyncInterval:       resyncInterval,
-		DeletionTimeout:      deletionTimeout,
-		Log:                  ctrl.Log.WithName("tenant"),
+		Client:                mgr.GetClient(),
+		ManifestPath:          manifestPath,
+		Image:                 image,
+		PraxisImage:           praxisImage,
+		PraxisImagePullPolicy: praxisImagePullPolicy,
+		MaaSAPIRouteNameBase:  maasAPIRouteName,
+		ResyncInterval:        resyncInterval,
+		DeletionTimeout:       deletionTimeout,
+		Log:                   ctrl.Log.WithName("tenant"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AITenant reconciler")
+		os.Exit(1)
+	}
+
+	modelReconciler := &controller.Reconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Namespace: externalNamespace,
+		GatewayName: gatewayName, GatewayNamespace: gatewayNamespace, Network: network,
+		LocalSite: localSite, KnownClusters: knownClusters,
+		Log: ctrl.Log.WithName("external-model"),
+	}
+	if err := modelReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up ExternalModel reconciler")
 		os.Exit(1)
 	}
 

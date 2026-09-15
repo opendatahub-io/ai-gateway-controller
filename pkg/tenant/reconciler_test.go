@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -51,7 +52,7 @@ func aitenantSchemeForTests() *runtime.Scheme {
 }
 
 // newAITenant builds an unstructured AITenant fixture. payloadProcessingType
-// set to "" omits AnnotationPayloadProcessingType entirely; phase set to ""
+// set to "" omits MaaS's selector annotation; phase set to ""
 // omits status.phase.
 func newAITenant(name, payloadProcessingType, phase, gatewayName, gatewayNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
@@ -65,6 +66,7 @@ func newAITenant(name, payloadProcessingType, phase, gatewayName, gatewayNamespa
 	}
 	if gatewayName != "" || gatewayNamespace != "" {
 		status["gatewayRef"] = map[string]any{"name": gatewayName, "namespace": gatewayNamespace}
+		status["tenantNamespace"] = gatewayNamespace
 	}
 	u.Object["status"] = status
 	return u
@@ -142,6 +144,74 @@ func TestReconcileSkipsWhenAITenantNotFound(t *testing.T) {
 	}
 }
 
+func TestWaitForForeignOwnershipDoesNotTakeOverExistingObject(t *testing.T) {
+	deployment := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]any{
+			"name":      "payload-processing-transition",
+			"namespace": "maas-system",
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by": "ipp-external-model-reconciler",
+			},
+		},
+	}}
+	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(deployment).Build()
+	r := &Reconciler{Client: fakeClient}
+	desired := deployment.DeepCopy()
+	desired.SetLabels(map[string]string{"app.kubernetes.io/managed-by": render.FieldOwner})
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*desired}); err == nil {
+		t.Fatal("waitForForeignOwnership accepted an object owned by the IPP reconciler")
+	}
+}
+
+func TestWaitForForeignOwnershipAcceptsReleasedPluginConfigMap(t *testing.T) {
+	configMap := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      PayloadProcessingPluginsConfigMapName,
+			"namespace": "maas-system",
+			"annotations": map[string]any{
+				"opendatahub.io/managed": "false",
+			},
+		},
+	}}
+	configMap.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(configMap).Build()
+	r := &Reconciler{Client: fakeClient}
+	desired := configMap.DeepCopy()
+	desired.SetAnnotations(nil)
+	desired.SetLabels(map[string]string{"app.kubernetes.io/managed-by": render.FieldOwner})
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*desired}); err != nil {
+		t.Fatalf("waitForForeignOwnership rejected the explicitly released plugin ConfigMap: %v", err)
+	}
+}
+
+func TestWaitForForeignOwnershipDoesNotTreatOtherUnmanagedObjectsAsReleased(t *testing.T) {
+	configMap := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      "other-config",
+			"namespace": "maas-system",
+			"annotations": map[string]any{
+				"opendatahub.io/managed": "false",
+			},
+		},
+	}}
+	configMap.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(configMap).Build()
+	r := &Reconciler{Client: fakeClient}
+	desired := configMap.DeepCopy()
+	desired.SetAnnotations(nil)
+	desired.SetLabels(map[string]string{"app.kubernetes.io/managed-by": render.FieldOwner})
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*desired}); err == nil {
+		t.Fatal("waitForForeignOwnership accepted an unrelated unmanaged ConfigMap")
+	}
+}
+
 func TestReconcileSkipsWhenNotUsingPraxis(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", "", "", "", "")
@@ -211,6 +281,27 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
 		t.Fatalf("expected no resource applies/deletes until status.gatewayRef is populated, got patched=%v deleted=%v", patched, deleted)
+	}
+}
+
+func TestReconcileWaitsForResolvedTenantNamespace(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "gateway-ns")
+	unstructured.RemoveNestedField(aitenant.Object, "status", "tenantNamespace")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no resource changes before status.tenantNamespace, got patched=%v deleted=%v", patched, deleted)
 	}
 }
 

@@ -51,3 +51,29 @@ fetch_praxis_extproc() {
 }
 
 fetch_praxis_extproc
+
+# The vendored ExtProc workload reads routing ConfigMaps and inference CRs but
+# does not consume provider Secrets. Credentials are projected only into the
+# tenant-local standalone Praxis workload. Keep this downstream least-privilege
+# adjustment deterministic so regeneration cannot silently restore Secret API
+# access to ExtProc.
+cluster_role="${DST_ROOT}/overlays/odh/rbac/clusterrole.yaml"
+tmp_cluster_role=$(mktemp)
+awk '
+  $0 == "  - apiGroups: [\"\"]" {
+    first = $0
+    if ((getline second) <= 0 || (getline third) <= 0) {
+      print first
+      if (second != "") print second
+      if (third != "") print third
+      next
+    }
+    if (second == "    resources: [\"secrets\"]" && third == "    verbs: [\"get\"]") next
+    print first
+    print second
+    print third
+    next
+  }
+  { print }
+' "${cluster_role}" >"${tmp_cluster_role}"
+mv "${tmp_cluster_role}" "${cluster_role}"

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package tenant watches AITenant CRs (owned by maas-controller) and, for
-// every tenant whose spec.payloadProcessing.type is "praxis", renders and
+// every tenant whose payload-processing annotation is "praxis", renders and
 // SSA-applies a dedicated per-tenant copy of the vendored praxis-extproc
 // manifests into that tenant's Gateway namespace.
 //
@@ -40,16 +40,13 @@ var AITenantGVK = schema.GroupVersionKind{
 }
 
 const (
-	// AnnotationPayloadProcessingType is the AITenant annotation that
-	// selects the tenant's payload-processing dataplane (mirrors
-	// maas-controller's tenantreconcile.AnnotationPayloadProcessingType.
-	// Absent, empty, or any value other than PayloadProcessingBackendPraxis
-	// means IPP (maas-controller), out of scope for this controller.
+	// AnnotationPayloadProcessingType is MaaS's current public selector for
+	// the payload-processing backend. It is intentionally annotation-based;
+	// introducing a typed API field requires a separate API proposal.
 	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
 
-	// PayloadProcessingBackendPraxis is the only AnnotationPayloadProcessingType
-	// value that opts a tenant into this controller (mirrors
-	// maas-controller's tenantreconcile.PayloadProcessingTypePraxis).
+	// PayloadProcessingBackendPraxis is the only annotation value that opts
+	// this tenant into the controller.
 	PayloadProcessingBackendPraxis = "praxis"
 
 	// AITenantPhaseActive is the AITenant status.phase value maas-controller's
