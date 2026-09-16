@@ -1,0 +1,15 @@
+# Pinned models-as-a-service commit for ai-gateway-controller e2e.
+#
+# Policy: CI and local prow runs fetch THIS commit (not rolling main).
+# Pin: jland-redhat fork until upstream merges aigc e2e fixes (praxis log skip, poll flakes).
+# Base: opendatahub-io main 53fdb8a1 + aigc-e2e-praxis-and-poll-fixes (630e7b5).
+# TODO: switch maas_repo back to opendatahub-io after upstream merge.
+#
+# Bump pin deliberately after validating e2e on the new MaaS revision:
+#   MAAS_UPDATE_LOCK=true bash test/e2e/scripts/fetch-maas-e2e.sh
+# Override for one-off runs without editing this file:
+#   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+maas_repo=https://github.com/jland-redhat/models-as-a-service
+maas_commit=630e7b50303688a6e3f25cd039e32822f38d6e28
+maas_ref=aigc-e2e-praxis-and-poll-fixes
+updated_at=2026-09-14T21:30:00Z
