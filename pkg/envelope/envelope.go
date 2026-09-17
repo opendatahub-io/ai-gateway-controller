@@ -253,11 +253,14 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	}, nil
 }
 
-// checkUniformWeights enforces the R1 guard for one model group.
-// strategyFor maps only the currently qualified OpenAI chat API-key contract
-// to Praxis's bearer_token strategy. Provider API keys are not interchangeable:
-// other provider/API-format combinations fail closed until their header
-// semantics are explicitly supported.
+// strategyFor maps only the currently qualified provider API-key contracts to
+// Praxis wire strategies: openai + openai-chat maps to bearer_token
+// (Authorization: Bearer at the provider boundary) and anthropic + messages
+// maps to apikey (the credential_inject filter injects the Secret value into
+// its configured header, x-api-key by default). The wire stays reference-only
+// either way. Provider API keys are not interchangeable: other provider/
+// API-format combinations fail closed until their header semantics are
+// explicitly supported.
 func strategyFor(route resolver.Route) (string, error) {
 	switch route.AuthType {
 	case "":
@@ -265,6 +268,9 @@ func strategyFor(route resolver.Route) (string, error) {
 	case "apikey":
 		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
 			return "bearer_token", nil
+		}
+		if route.ProviderType == "anthropic" && route.APIFormat == "messages" {
+			return "apikey", nil
 		}
 		return "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
 	case "sigv4", "oauth2":
@@ -281,6 +287,7 @@ func CredentialStrategy(route resolver.Route) (string, error) {
 	return strategyFor(route)
 }
 
+// checkUniformWeights enforces the R1 guard for one model group.
 func checkUniformWeights(m resolver.ModelRoutes) error {
 	if len(m.Routes) == 0 {
 		return nil // model renders no candidates; skips are the record
