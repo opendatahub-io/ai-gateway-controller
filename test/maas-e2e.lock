@@ -1,0 +1,14 @@
+# Pinned models-as-a-service commit for ai-gateway-controller e2e.
+#
+# Policy: CI and local prow runs fetch THIS commit (not rolling main).
+# Pin: opendatahub-io/models-as-a-service @ 3255890 (PR #1505 — skip praxis-owned
+# writer pods during IPP migration cleanup in ensureIPPWritersStopped).
+#
+# Bump pin deliberately after validating e2e on the new MaaS revision:
+#   MAAS_UPDATE_LOCK=true bash test/e2e/scripts/fetch-maas-e2e.sh
+# Override for one-off runs without editing this file:
+#   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+maas_repo=https://github.com/opendatahub-io/models-as-a-service
+maas_commit=3255890af899e396831d221ca8e66e72246b345f
+maas_ref=fix/praxis-ipp-writer-pod-skip
+updated_at=2026-09-17T02:50:00Z
