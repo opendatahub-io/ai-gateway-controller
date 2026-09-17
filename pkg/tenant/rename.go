@@ -107,6 +107,9 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	if err := addPodTemplateLabel(u, LabelTenantInstance, newName); err != nil {
 		return fmt.Errorf("tenant-instance label: %w", err)
 	}
+	if err := stampAIGCManagedByOnDeployment(u); err != nil {
+		return err
+	}
 	if tenantID != "" {
 		// Never mutate the default Deployment's spec.selector: it is
 		// immutable on upgrade, and the default tenant's Service selector
@@ -131,6 +134,9 @@ func renamePayloadPreProcessingDeployment(u *unstructured.Unstructured, tenantID
 	}
 	if err := addPodTemplateLabel(u, LabelTenantInstance, newName); err != nil {
 		return fmt.Errorf("tenant-instance label: %w", err)
+	}
+	if err := stampAIGCManagedByOnDeployment(u); err != nil {
+		return err
 	}
 	if tenantID != "" {
 		if err := setSelectorMatchLabels(u, map[string]string{"app": PayloadPreProcessingName, LabelTenantInstance: newName}); err != nil {
@@ -342,6 +348,19 @@ func setClusterUpstreamAddress(value map[string]any, fqdn string) error {
 
 func serviceFQDN(serviceName, namespace string) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace)
+}
+
+func stampAIGCManagedByOnDeployment(u *unstructured.Unstructured) error {
+	if err := addPodTemplateLabel(u, LabelManagedBy, ManagedByAIGC); err != nil {
+		return fmt.Errorf("managed-by pod label: %w", err)
+	}
+	labels := u.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[LabelManagedBy] = ManagedByAIGC
+	u.SetLabels(labels)
+	return nil
 }
 
 func addPodTemplateLabel(u *unstructured.Unstructured, key, value string) error {

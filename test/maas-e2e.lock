@@ -1,0 +1,14 @@
+# Pinned models-as-a-service commit for ai-gateway-controller e2e.
+#
+# Policy: CI and local prow runs fetch THIS commit (not rolling main).
+# Pin: opendatahub-io/models-as-a-service main @ 5ece7d3 (PR #1493 — praxis IPP log
+# checks + poll flake hardening).
+#
+# Bump pin deliberately after validating e2e on the new MaaS revision:
+#   MAAS_UPDATE_LOCK=true bash test/e2e/scripts/fetch-maas-e2e.sh
+# Override for one-off runs without editing this file:
+#   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+maas_repo=https://github.com/opendatahub-io/models-as-a-service
+maas_commit=5ece7d3d6749bde119bade95235a3c072ba42589
+maas_ref=main
+updated_at=2026-09-17T01:10:00Z
