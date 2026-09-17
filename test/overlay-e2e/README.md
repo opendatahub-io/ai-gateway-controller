@@ -68,6 +68,12 @@ cluster and cached images. All kubectl calls are pinned to
   overlap. `envelope.strategyFor` therefore renders no credential for every
   CRD auth type today; the fix is either a wider praxis strategy enum or
   moving credentials out of the envelope. Needs a decision at the freeze.
+  **Resolution:** the wider-praxis-enum path was taken. `strategyFor` now
+  maps only explicitly qualified provider/API-format pairs to a wire strategy
+  (`openai`+`openai-chat` -> `bearer_token`, `anthropic`+`messages` ->
+  `apikey`); everything else still fails closed. `apikey` is a praxis-side
+  strategy (praxis-ai) that injects the Secret value into a configured
+  header; it must not be emitted until that strategy is deployed.
 - **In-cluster backends need `allow_private_endpoints`.** Praxis refuses
   `load_balancer` endpoints that resolve into pod/service CIDRs unless
   `insecure_options.allow_private_endpoints: true`. Dogfood never hit this
