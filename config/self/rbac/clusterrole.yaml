@@ -11,14 +11,14 @@ metadata:
 rules:
 # Primary watch target: MaasTenantConfig carries
 # maas.opendatahub.io/payload-processing-type and
-# maas.opendatahub.io/ipp-migration-cleanup-complete (the payload-processing
+# maas.opendatahub.io/payload-processing-status (the payload-processing
 # backend swap handshake with maas-controller — see pkg/tenant/migration.go),
 # plus the aitenant-name/aitenant-namespace annotations used to resolve the
 # owning AITenant. This controller writes metadata.finalizers
-# (PraxisCleanupFinalizer) and the migration-marker annotation only, hence
-# update/patch (and get/list/watch) here but no separate status subresource
-# rule. patch is additionally required by the escalation check for the
-# resourceVersion-checked marker claim, which uses update.
+# (PraxisCleanupFinalizer) and the payload-processing-status annotation only,
+# hence update/patch (and get/list/watch) here but no separate status
+# subresource rule. patch is additionally required by the escalation check
+# for the resourceVersion-checked status claim, which uses update.
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["maastenantconfigs"]
   verbs: ["get", "list", "watch", "update", "patch"]

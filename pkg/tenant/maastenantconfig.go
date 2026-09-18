@@ -61,6 +61,9 @@ func TenantIdentifierFor(mtc *unstructured.Unstructured) string {
 // OwningAITenantRef reads the AnnotationAITenantName / AnnotationAITenantNamespace
 // annotations maas-controller's AITenantReconciler stamps onto every
 // AITenant-managed MaasTenantConfig. ok is false until both are populated.
+// Callers must not treat these annotations as proof of ownership: tenant
+// users can patch them, so resolveOwningAITenant also checks
+// status.tenantNamespace against the MaasTenantConfig's namespace.
 func OwningAITenantRef(mtc *unstructured.Unstructured) (name, namespace string, ok bool) {
 	annotations := mtc.GetAnnotations()
 	if annotations == nil {

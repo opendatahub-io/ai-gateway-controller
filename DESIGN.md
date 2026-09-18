@@ -185,40 +185,30 @@ Gateway-namespace resource names (`payload-processing`,
 `payload-pre-processing`, etc.), so switching a tenant's
 `payload-processing-type` annotation hands the same names off between two
 independent controllers. Without coordination this is racy — see
-`maas-controller`'s `tenantreconcile.AnnotationIPPMigrationCleanupComplete`
+`maas-controller`'s `tenantreconcile.AnnotationPayloadProcessingStatus`
 doc comment for the full state machine this mirrors. In short:
 
-- The marker (`maas.opendatahub.io/ipp-migration-cleanup-complete`, also
-  living only on `MaasTenantConfig`) has exactly one "clear to deploy"
-  value, `"true"`; **absent means blocked** — a cleanup is in flight, or
-  was just claimed. This is deliberately the safer default: any tenant that
-  predates this handshake is guaranteed to already have a bundle deployed
-  (nothing previously gated that), so an absent marker on such a tenant's
-  first-ever swap correctly means "wait for the switch-off cleanup", not
-  "proceed immediately" (which would race it). A brand-new tenant instead
-  gets the marker seeded to `"true"` by maas-controller at
-  `MaasTenantConfig` creation time
-  (`AITenantReconciler.seedIPPMigrationCleanupCompleteOnCreate`), so its
-  first-ever deploy is never blocked either.
-- The marker is consulted **only** when this controller is selected **and**
-  its own bundle does not yet exist for the tenant (see
-  `PraxisBundleExists`). Once the bundle exists, steady-state /
-  crash-recovery reconciles skip the marker entirely — otherwise its normal
-  absent resting value while deployed would permanently stop routine drift
-  correction.
-- Claiming the marker (`ClaimIPPMigrationMarker`) deletes the annotation
-  (returning it to its blocked resting state) via an optimistic-concurrency
-  `Update`, not a blind merge patch: if maas-controller is concurrently
-  attempting the mirror-image claim for the same tenant at nearly the same
-  time (e.g. a rapid praxis→legacy→praxis flip before the original
-  cleanup's signal has been consumed), only one of the two controllers can
-  win the `Update`; the other observes a `Conflict`, backs off, and
-  re-evaluates on its next reconcile — closing the window where both could
-  otherwise apply/delete the same resource names at once.
+- The status annotation (`maas.opendatahub.io/payload-processing-status`)
+  lives only on `MaasTenantConfig` and has three meaningful states:
+  - `cleanup-complete`: clear to claim. The party currently selected by
+    `payload-processing-type` may CAS-claim and start deploying.
+  - `steady`: praxis owns the dataplane and may resume/apply. Legacy must
+    wait until praxis switch-off writes `cleanup-complete`.
+  - **absent**: legacy steady when legacy is selected (existing tenants are
+    assumed to run legacy IPP); blocked when praxis is selected (wait for
+    legacy cleanup). Brand-new tenants are seeded with `cleanup-complete`
+    at `MaasTenantConfig` creation time so their first deploy is never
+    blocked by absent.
+- Claiming for praxis (`EnsurePraxisMayDeploy` / `claimPraxisSteady`) writes
+  `steady` via an optimistic-concurrency `Update`. Legacy's mirror claim
+  deletes the annotation back to absent. Concurrent claims on the same
+  `cleanup-complete` value: only one `Update` wins; the other observes
+  `Conflict` and re-evaluates.
+- Status itself is the durable claim — apply failures after a successful
+  claim resume on the next reconcile because status is already `steady`.
 - After a full, successful switch-off cleanup (`Reconciler.cleanup`), this
-  controller marks the swap complete (`MarkIPPMigrationCleanupComplete`,
-  writing `"true"`) so maas-controller may (re)deploy legacy IPP — the
-  mirror image of what it already does for the opposite direction.
+  controller writes `cleanup-complete` (`MarkPayloadProcessingCleanupComplete`)
+  so maas-controller may claim to absent and (re)deploy legacy IPP.
 
 ## Scope
 

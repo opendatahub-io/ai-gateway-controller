@@ -154,11 +154,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return r.reconcilePraxis(ctx, log, mtc, tenantID)
 }
 
-// resolveOwningAITenant Gets the AITenant that owns mtc (via
-// OwningAITenantRef) and reports whether it is Active. A false ready with a
+// resolveOwningAITenant Gets the AITenant named by OwningAITenantRef and
+// reports whether it is Active. Annotations alone are not proof of
+// ownership: after Get, status.tenantNamespace must equal mtc's namespace
+// (controller-authored; see TenantConfigNamespace). A false ready with a
 // nil error and nil aitenant means the annotations aren't populated yet, or
 // the AITenant is gone/not found — a normal transient state during
-// bootstrap or teardown, not an error the caller should fail on.
+// bootstrap or teardown, not an error the caller should fail on. A
+// namespace mismatch is an error so deploy and cleanup paths both refuse
+// to use a spoofed peer AITenant's gatewayRef.
 func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
 	name, namespace, ok := OwningAITenantRef(mtc)
 	if !ok {
@@ -170,6 +174,12 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("get owning AITenant %s/%s: %w", namespace, name, err)
+	}
+	ownedNS, ownedOK := TenantConfigNamespace(aitenant)
+	if !ownedOK || ownedNS != mtc.GetNamespace() {
+		return nil, false, fmt.Errorf(
+			"AITenant %s/%s status.tenantNamespace %q does not own MaasTenantConfig in %q; refusing spoofed owning-AITenant annotations",
+			namespace, name, ownedNS, mtc.GetNamespace())
 	}
 	if !IsActive(aitenant) {
 		return aitenant, false, nil
@@ -201,28 +211,16 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
-	// If our own bundle already exists for this tenant, this is steady-state
-	// (or a crash/restart mid-deploy): keep applying/self-healing
-	// unconditionally and never consult the migration marker — otherwise a
-	// marker left in its "blocked" resting value would permanently stop
-	// routine drift-correction resyncs. Only when our bundle does NOT exist
-	// yet (a genuine transition-in, e.g. after switching away from legacy
-	// IPP) do we need to claim the marker first, so a rapid
-	// praxis→legacy→praxis flip cannot let both controllers deploy at once
-	// (see ClaimIPPMigrationMarker).
-	bundleExists, err := PraxisBundleExists(ctx, r.Client, tenantID, gatewayNamespace)
+	// Handshake: claim cleanup-complete → steady. Absent means wait (existing
+	// tenants are assumed to still run legacy IPP until they signal
+	// cleanup-complete). Status itself is the durable claim — no bundleExists gate.
+	ready, err = EnsurePraxisMayDeploy(ctx, r.Client, mtc)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("check praxis-extproc bundle existence: %w", err)
+		return ctrl.Result{}, fmt.Errorf("ensure praxis may deploy: %w", err)
 	}
-	if !bundleExists {
-		claimed, err := ClaimIPPMigrationMarker(ctx, r.Client, mtc)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("claim IPP migration marker: %w", err)
-		}
-		if !claimed {
-			log.Info("waiting for the legacy IPP cleanup to finish before applying praxis-extproc")
-			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
-		}
+	if !ready {
+		log.Info("waiting for the legacy IPP cleanup to finish before applying praxis-extproc")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -288,7 +286,7 @@ func (r *Reconciler) deleteStandalonePraxis(ctx context.Context, tenantID, tenan
 // praxis. If our finalizer is present, this tenant previously opted in and
 // has since switched away (or dropped the annotation): clean up whatever
 // was applied, signal maas-controller that it may now (re)deploy legacy IPP
-// (see MarkIPPMigrationCleanupComplete), then release the finalizer.
+// (see MarkPayloadProcessingCleanupComplete), then release the finalizer.
 // Otherwise this tenant never used praxis and there is nothing to do.
 func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(mtc, PraxisCleanupFinalizer) {
@@ -300,23 +298,29 @@ func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mt
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if ready {
-		if _, gatewayNamespace, gwReady := GatewayRef(aitenant); gwReady {
-			if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {
-				log.Error(err, "praxis-extproc cleanup failed after switching away from praxis; will retry", "namespace", gatewayNamespace)
-				return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
-			}
-			if tenantNamespace, ok := TenantConfigNamespace(aitenant); ok {
-				if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
-					return ctrl.Result{}, fmt.Errorf("cleanup standalone praxis: %w", err)
-				}
-			}
-			if err := MarkIPPMigrationCleanupComplete(ctx, r.Client, mtc); err != nil {
-				return ctrl.Result{}, fmt.Errorf("mark IPP migration cleanup complete: %w", err)
-			}
-			log.Info("praxis-extproc resources cleaned up after switching away from praxis", "tenantID", tenantID, "namespace", gatewayNamespace)
+	if !ready {
+		log.Info("waiting for owning AITenant to be Active before praxis-extproc cleanup after switch-away")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
+	if !gwReady {
+		log.Info("waiting for status.gatewayRef before praxis-extproc cleanup after switch-away")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+
+	if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {
+		log.Error(err, "praxis-extproc cleanup failed after switching away from praxis; will retry", "namespace", gatewayNamespace)
+		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
+	}
+	if tenantNamespace, ok := TenantConfigNamespace(aitenant); ok {
+		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cleanup standalone praxis: %w", err)
 		}
 	}
+	if err := MarkPayloadProcessingCleanupComplete(ctx, r.Client, mtc); err != nil {
+		return ctrl.Result{}, fmt.Errorf("mark payload-processing cleanup complete: %w", err)
+	}
+	log.Info("praxis-extproc resources cleaned up after switching away from praxis", "tenantID", tenantID, "namespace", gatewayNamespace)
 
 	if err := r.removeFinalizer(ctx, mtc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
@@ -343,16 +347,14 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		// Never got far enough to have a validated Gateway namespace, so
-		// nothing was ever applied for this tenant.
-		log.Info("MaasTenantConfig deleted before owning AITenant was ever Active; skipping cleanup")
-		return ctrl.Result{}, r.removeFinalizer(ctx, mtc)
+		log.Info("MaasTenantConfig deleting but owning AITenant is not Active yet; will retry cleanup")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
 	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
-		log.Info("MaasTenantConfig deleted before status.gatewayRef was ever populated; skipping cleanup")
-		return ctrl.Result{}, r.removeFinalizer(ctx, mtc)
+		log.Info("MaasTenantConfig deleting but status.gatewayRef is not populated; will retry cleanup")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
 	if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {

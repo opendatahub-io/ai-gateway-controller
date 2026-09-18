@@ -65,29 +65,30 @@ const (
 	// (maas-controller), out of scope for this controller.
 	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
 
-	// AnnotationIPPMigrationCleanupComplete coordinates the payload-processing
+	// AnnotationPayloadProcessingStatus coordinates the payload-processing
 	// backend swap handshake with maas-controller. It lives only on
 	// MaasTenantConfig (mirrors maas-controller's tenantreconcile.
-	// AnnotationIPPMigrationCleanupComplete — see that constant's doc for the
-	// full state machine). Semantics: IPPMigrationMarkerClearValue ("true")
-	// means clear to deploy; absent (or any other value) means blocked — a
-	// cleanup is in flight, or was just claimed by maas-controller (claiming
-	// deletes the annotation rather than writing a sentinel value, returning
-	// it to its blocked resting state — see ClaimIPPMigrationMarker). Every
-	// new MaasTenantConfig is seeded with the clear value at creation time by
-	// maas-controller (AITenantReconciler.seedIPPMigrationCleanupCompleteOnCreate),
-	// so a brand-new tenant's first-ever deploy is never blocked; this
-	// controller never creates MaasTenantConfig itself, so it has no
-	// equivalent seeding step. This controller only ever consults the marker
-	// via PraxisBundleExists + ClaimIPPMigrationMarker when transitioning in,
-	// and only ever writes it via MarkIPPMigrationCleanupComplete after a
-	// full, successful switch-off cleanup.
-	AnnotationIPPMigrationCleanupComplete = "maas.opendatahub.io/ipp-migration-cleanup-complete"
+	// AnnotationPayloadProcessingStatus). Semantics:
+	//
+	//   - PayloadProcessingStatusCleanupComplete ("cleanup-complete"): clear
+	//     to claim. The party currently selected by AnnotationPayloadProcessingType
+	//     may CAS-claim and start deploying.
+	//   - PayloadProcessingStatusSteady ("steady"): praxis owns / may resume
+	//     apply. Legacy must wait until praxis switch-off writes cleanup-complete.
+	//   - absent: legacy steady when legacy is selected (existing tenants are
+	//     assumed to run legacy IPP); blocked when praxis is selected (wait
+	//     for legacy cleanup to write cleanup-complete). New MaasTenantConfigs
+	//     are seeded with cleanup-complete at creation time by maas-controller
+	//     so a brand-new tenant's first deploy is never blocked by absent.
+	AnnotationPayloadProcessingStatus = "maas.opendatahub.io/payload-processing-status"
 
-	// IPPMigrationMarkerClearValue is the only AnnotationIPPMigrationCleanupComplete
-	// value that means "clear to deploy" (mirrors maas-controller's
-	// tenantreconcile.IPPMigrationMarkerClearValue).
-	IPPMigrationMarkerClearValue = "true"
+	// PayloadProcessingStatusCleanupComplete means peer cleanup finished; the
+	// selected party may claim.
+	PayloadProcessingStatusCleanupComplete = "cleanup-complete"
+
+	// PayloadProcessingStatusSteady means praxis has claimed and may
+	// deploy/resume. Legacy treats this as blocked.
+	PayloadProcessingStatusSteady = "steady"
 
 	// AnnotationAITenantName and AnnotationAITenantNamespace identify the
 	// AITenant that owns a MaasTenantConfig (mirrors maas-controller's
