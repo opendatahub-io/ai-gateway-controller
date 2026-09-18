@@ -114,7 +114,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // enqueueMaasTenantConfigForAITenant maps an AITenant event to the
 // MaasTenantConfig it owns, via status.tenantNamespace (see
-// TenantConfigNamespace) — avoiding any need to duplicate maas-controller's
+// ConfigNamespace) — avoiding any need to duplicate maas-controller's
 // TenantNamespaceForAITenant naming convention, which depends on a
 // configurable default tenant namespace this controller does not know.
 func (r *Reconciler) enqueueMaasTenantConfigForAITenant(_ context.Context, obj client.Object) []reconcile.Request {
@@ -122,7 +122,7 @@ func (r *Reconciler) enqueueMaasTenantConfigForAITenant(_ context.Context, obj c
 	if !ok {
 		return nil
 	}
-	namespace, ok := TenantConfigNamespace(u)
+	namespace, ok := ConfigNamespace(u)
 	if !ok {
 		return nil
 	}
@@ -146,7 +146,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("get MaasTenantConfig %s: %w", req.NamespacedName, err)
 	}
 
-	tenantID := TenantIdentifierFor(mtc)
+	tenantID := IdentifierFor(mtc)
 
 	if !mtc.GetDeletionTimestamp().IsZero() {
 		return r.reconcileDelete(ctx, log, mtc, tenantID)
@@ -162,7 +162,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 // resolveOwningAITenant Gets the AITenant named by OwningAITenantRef and
 // reports whether it is Active. Annotations alone are not proof of
 // ownership: after Get, status.tenantNamespace must equal mtc's namespace
-// (controller-authored; see TenantConfigNamespace). A false ready with a
+// (controller-authored; see ConfigNamespace). A false ready with a
 // nil error and nil aitenant means the annotations aren't populated yet, or
 // the AITenant is gone/not found — a normal transient state during
 // bootstrap or teardown, not an error the caller should fail on. A
@@ -180,7 +180,7 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 		}
 		return nil, false, fmt.Errorf("get owning AITenant %s/%s: %w", namespace, name, err)
 	}
-	ownedNS, ownedOK := TenantConfigNamespace(aitenant)
+	ownedNS, ownedOK := ConfigNamespace(aitenant)
 	if !ownedOK || ownedNS != mtc.GetNamespace() {
 		return nil, false, fmt.Errorf(
 			"AITenant %s/%s status.tenantNamespace %q does not own MaasTenantConfig in %q; refusing spoofed owning-AITenant annotations",
@@ -267,7 +267,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
 	// releases. ExtProc is the dataplane; ExternalModel routes backend to
 	// provider ExternalName Services directly.
-	if tenantNamespace, ok := TenantConfigNamespace(aitenant); ok {
+	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
 		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -327,7 +327,7 @@ func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mt
 		log.Error(err, "praxis-extproc cleanup failed after switching away from praxis; will retry", "namespace", gatewayNamespace)
 		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
 	}
-	if tenantNamespace, ok := TenantConfigNamespace(aitenant); ok {
+	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
 		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
 			return ctrl.Result{}, fmt.Errorf("cleanup standalone praxis: %w", err)
 		}
@@ -376,7 +376,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *
 		log.Error(err, "praxis-extproc cleanup failed for deleted tenant; will retry", "namespace", gatewayNamespace)
 		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
 	}
-	if tenantNamespace, ok := TenantConfigNamespace(aitenant); ok {
+	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
 		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
 			return ctrl.Result{}, fmt.Errorf("cleanup standalone praxis: %w", err)
 		}

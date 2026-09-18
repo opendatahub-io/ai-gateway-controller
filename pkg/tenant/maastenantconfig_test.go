@@ -91,7 +91,7 @@ func TestUsesPraxis(t *testing.T) {
 	}
 }
 
-func TestTenantIdentifierFor(t *testing.T) {
+func TestIdentifierFor(t *testing.T) {
 	cases := []struct {
 		name       string
 		tenantName string
@@ -103,8 +103,8 @@ func TestTenantIdentifierFor(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := TenantIdentifierFor(mtcFixture("praxis", "", "", c.tenantName)); got != c.want {
-				t.Errorf("TenantIdentifierFor(tenantName=%q) = %q, want %q", c.tenantName, got, c.want)
+			if got := IdentifierFor(mtcFixture("praxis", "", "", c.tenantName)); got != c.want {
+				t.Errorf("IdentifierFor(tenantName=%q) = %q, want %q", c.tenantName, got, c.want)
 			}
 		})
 	}

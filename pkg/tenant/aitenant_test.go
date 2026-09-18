@@ -91,11 +91,11 @@ func TestGatewayRefReady(t *testing.T) {
 	}
 }
 
-func TestTenantConfigNamespace(t *testing.T) {
+func TestConfigNamespace(t *testing.T) {
 	t.Run("absent", func(t *testing.T) {
 		u := NewAITenant()
 		u.Object["status"] = map[string]any{}
-		if _, ok := TenantConfigNamespace(u); ok {
+		if _, ok := ConfigNamespace(u); ok {
 			t.Fatal("ok = true, want false when status.tenantNamespace is unset")
 		}
 	})
@@ -103,7 +103,7 @@ func TestTenantConfigNamespace(t *testing.T) {
 	t.Run("present", func(t *testing.T) {
 		u := NewAITenant()
 		u.Object["status"] = map[string]any{"tenantNamespace": "ai-tenant-redteam"}
-		ns, ok := TenantConfigNamespace(u)
+		ns, ok := ConfigNamespace(u)
 		if !ok {
 			t.Fatal("ok = false, want true")
 		}

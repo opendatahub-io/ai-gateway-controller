@@ -40,13 +40,13 @@ func UsesPraxis(mtc *unstructured.Unstructured) bool {
 	return PayloadProcessingType(mtc) == PayloadProcessingBackendPraxis
 }
 
-// TenantIdentifierFor derives the per-tenant resource-naming identifier from
+// IdentifierFor derives the per-tenant resource-naming identifier from
 // a MaasTenantConfig's labels, mirroring maas-controller's
 // tenantreconcile.TenantIdentifierFor: the default/legacy tenant (unlabeled,
 // or labeled with DefaultAITenantName) returns "" so its resources keep the
 // unsuffixed names Phase 1 always used; every other AITenant-managed tenant
 // returns its tenant name for "{base}-{tenantID}" naming.
-func TenantIdentifierFor(mtc *unstructured.Unstructured) string {
+func IdentifierFor(mtc *unstructured.Unstructured) string {
 	labels := mtc.GetLabels()
 	if labels == nil || labels[LabelManagedByAITenant] != "true" {
 		return ""
@@ -74,7 +74,7 @@ func OwningAITenantRef(mtc *unstructured.Unstructured) (name, namespace string, 
 	return name, namespace, name != "" && namespace != ""
 }
 
-// TenantConfigNamespace reads status.tenantNamespace from an AITenant —
+// ConfigNamespace reads status.tenantNamespace from an AITenant —
 // the namespace where maas-controller creates/adopts that tenant's
 // MaasTenantConfig/default-tenant object (mirrors maas-controller's
 // AITenantReconciler setting aitenant.Status.TenantNamespace). Used to map
@@ -82,7 +82,7 @@ func OwningAITenantRef(mtc *unstructured.Unstructured) (name, namespace string, 
 // primarily reconciles, without needing to duplicate maas-controller's
 // TenantNamespaceForAITenant naming convention (which depends on a
 // configurable default tenant namespace this controller does not know).
-func TenantConfigNamespace(aitenant *unstructured.Unstructured) (namespace string, ok bool) {
+func ConfigNamespace(aitenant *unstructured.Unstructured) (namespace string, ok bool) {
 	namespace, _, _ = unstructured.NestedString(aitenant.Object, "status", "tenantNamespace")
 	return namespace, namespace != ""
 }
