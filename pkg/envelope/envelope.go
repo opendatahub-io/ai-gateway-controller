@@ -72,7 +72,7 @@ type Credential struct {
 //
 // Credential is optional: the overlay consumer treats an absent credential as
 // "no reference" (validate_credential in praxis-ai descriptor.rs), and the
-// wire vocabulary cannot yet express every CRD auth type (see strategyFor),
+// wire vocabulary cannot yet express every CRD auth type (see StrategyFor),
 // so mislabeling would be a lie the digest happily hashes.
 type Candidate struct {
 	Cluster    string      `json:"cluster"`
@@ -191,7 +191,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				Site:    scope.LocalSite,
 				Fresh:   true,
 			}
-			strategy, err := strategyFor(r)
+			strategy, err := StrategyFor(r)
 			if err != nil {
 				return Envelope{}, fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
 			}
@@ -248,7 +248,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	}, nil
 }
 
-// strategyFor maps only the currently qualified provider API-key contracts to
+// StrategyFor maps only the currently qualified provider API-key contracts to
 // Praxis wire strategies: openai + openai-chat maps to bearer_token
 // (Authorization: Bearer at the provider boundary) and anthropic + messages
 // maps to apikey (the credential_inject filter injects the Secret value into
@@ -256,7 +256,13 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 // either way. Provider API keys are not interchangeable: other provider/
 // API-format combinations fail closed until their header semantics are
 // explicitly supported.
-func strategyFor(route resolver.Route) (string, error) {
+//
+// This is the single qualification authority: pkg/tenant renders the
+// credential_inject entries of the static Praxis config with the strategy
+// this function returns, because the consumer rejects an overlay candidate
+// whose strategy differs from the configured credential entry (praxis-ai
+// #1172). Both planes must agree or live traffic fails closed with a 503.
+func StrategyFor(route resolver.Route) (string, error) {
 	switch route.AuthType {
 	case "":
 		return "", nil

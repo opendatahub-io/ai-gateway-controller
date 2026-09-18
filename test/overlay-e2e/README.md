@@ -18,6 +18,13 @@ data plane consumes:
 3. **Unknown model → 404** from `intelligent_route` (no backend involved).
 4. **Last-known-good retention** — a corrupted `content_digest` is rejected on
    reload and the previously serving snapshot keeps routing.
+5. **Credential injection** — clients send no `x-api-key`; Praxis injects the
+   projected-Secret value with `strategy: apikey` (mirroring what
+   `pkg/tenant/praxis.go` renders), strips a caller-supplied `x-api-key`,
+   and a rotated Secret value is rejected by the backend (401) and recovers
+   when restored — proving the injected value is the live projected value.
+   The two backends validate **different** keys, so serving 200 after the
+   hot-swap also proves per-route credential selection.
 
 ## Layout
 
@@ -54,6 +61,11 @@ cluster and cached images. All kubectl calls are pinned to
   the projected volume's `..data` symlink replacement.
 - `source_generation` must strictly increase on content change; `run.sh`
   chains generation 1 → 2 through `render-overlay` prev-revision flags.
+- Credential entries in `20-praxis-config.yaml` must carry the same strategy
+  the overlay candidates resolve to; praxis rejects a mismatch with a 503
+  (praxis-ai #1172 cross-check). The `e2e-injected-key-*` values are
+  non-secret fixtures for these local echo backends and are deliberately
+  duplicated in `run.sh` (Secrets) and `10-backends.yaml` (validation).
 - Rust tolerates unknown additive envelope/candidate fields but rejects
   unknown fields inside `credential`, and recomputes the digest over the
   **raw** wire value (filtered to `candidates`/`local_site`/`network`/
@@ -74,11 +86,14 @@ cluster and cached images. All kubectl calls are pinned to
   `apikey`); everything else still fails closed. `apikey` is a praxis-side
   strategy (praxis-ai) that injects the Secret value into a configured
   header; it must not be emitted until that strategy is deployed.
-- **In-cluster backends need `allow_private_endpoints`.** Praxis refuses
-  `load_balancer` endpoints that resolve into pod/service CIDRs unless
-  `insecure_options.allow_private_endpoints: true`. Dogfood never hit this
-  because every cluster there is a public hostname; any gateway fronting
-  in-cluster model servers will.
+- **In-cluster backends need both private-address flags.** Praxis gates
+  `load_balancer` endpoints twice: `insecure_options.allow_private_endpoints`
+  covers config-time endpoint checks, and `allow_private_upstreams` gates
+  hostnames that *resolve* into private/reserved ranges at connect time
+  (DNS-rebinding/SSRF protection, praxis core `connectivity::peer`).
+  In-cluster service DNS names hit the runtime gate, so both are set.
+  Dogfood never hit either because every cluster there is a public hostname;
+  any gateway fronting in-cluster model servers will.
 
 ## M1 golden vectors
 

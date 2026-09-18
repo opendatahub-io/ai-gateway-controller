@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 const (
@@ -30,7 +32,18 @@ type praxisCredential struct {
 	Namespace string
 	Key       string
 	Path      string
+	// Strategy is the credential_inject wire strategy for this entry
+	// (bearer_token|apikey). The Praxis consumer rejects an overlay
+	// candidate whose strategy differs from the configured entry, so it
+	// must be the same strategy envelope.StrategyFor derives for the
+	// provider/model contract that references this Secret.
+	Strategy string
 }
+
+// defaultCredentialStrategy matches the credential_inject filter's own
+// default, keeping entries that no resolved route touches byte-compatible
+// with configs rendered before strategy mapping existed.
+const defaultCredentialStrategy = "bearer_token"
 
 // PraxisTransportOptions contains explicit transport exceptions for test
 // fixtures. Providers use verified TLS by default; a plaintext cluster must
@@ -42,13 +55,17 @@ type PraxisTransportOptions struct {
 // StandalonePraxisResources renders the tenant-owned Praxis proxy and its
 // reference-only configuration. Secret bytes are never read or copied; the
 // projected volume is populated by kubelet from the provider namespace.
-func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy string, providers []v1alpha1.ExternalProvider) ([]unstructured.Unstructured, error) {
-	return StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullPolicy, providers, PraxisTransportOptions{})
+func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy string, providers []v1alpha1.ExternalProvider, routes []resolver.Route) ([]unstructured.Unstructured, error) {
+	return StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullPolicy, providers, routes, PraxisTransportOptions{})
 }
 
 // StandalonePraxisResourcesWithOptions renders the tenant-owned Praxis proxy
-// with the explicit transport exceptions supplied by the caller.
-func StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullPolicy string, providers []v1alpha1.ExternalProvider, transport PraxisTransportOptions) ([]unstructured.Unstructured, error) {
+// with the explicit transport exceptions supplied by the caller. routes is
+// the resolved provider/model contract (resolver.Resolve output): it is what
+// the routing overlay will describe, so credential_inject entries must carry
+// the strategy those routes resolve to or the consumer rejects the mismatch
+// with a 503 on every credentialed request.
+func StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullPolicy string, providers []v1alpha1.ExternalProvider, routes []resolver.Route, transport PraxisTransportOptions) ([]unstructured.Unstructured, error) {
 	if namespace == "" {
 		return nil, errors.New("praxis namespace is required")
 	}
@@ -61,7 +78,7 @@ func StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullP
 	if imagePullPolicy != "IfNotPresent" && imagePullPolicy != "Never" && imagePullPolicy != "Always" {
 		return nil, fmt.Errorf("unsupported Praxis imagePullPolicy %q", imagePullPolicy)
 	}
-	credentials, err := praxisCredentials(namespace, providers)
+	credentials, err := praxisCredentials(namespace, providers, routes)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +155,39 @@ func parsePraxisEndpoint(endpoint string) (praxisEndpoint, error) {
 	}, nil
 }
 
-func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider) ([]praxisCredential, error) {
+func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider, routes []resolver.Route) ([]praxisCredential, error) {
+	// Derive each credential's wire strategy from the resolved provider/model
+	// contract, not from providers alone: apiFormat lives on the model
+	// reference, and envelope.StrategyFor qualifies the provider/API-format
+	// pair the overlay candidates will carry. An entry configured with a
+	// different strategy than its candidates is a runtime 503 (praxis-ai
+	// #1172 cross-check), so unqualified or contradictory contracts must
+	// fail closed here instead of rendering a config that cannot serve.
+	strategies := map[string]string{}
+	for _, route := range routes {
+		if route.SecretName == "" {
+			continue
+		}
+		strategy, err := envelope.StrategyFor(route)
+		if err != nil {
+			return nil, fmt.Errorf("model %s provider %s: %w", route.Model, route.Provider, err)
+		}
+		if strategy == "" {
+			// auth.type "": the candidate carries no credential, so the
+			// entry keeps the filter default and nothing can contradict it.
+			continue
+		}
+		key := route.SecretKey
+		if key == "" {
+			key = "api-key"
+		}
+		identity := namespace + "/" + route.SecretName + "/" + key
+		if prev, ok := strategies[identity]; ok && prev != strategy {
+			return nil, fmt.Errorf("credential Secret %s requires conflicting strategies %q and %q across providers; it cannot back both wire formats", route.SecretName, prev, strategy)
+		}
+		strategies[identity] = strategy
+	}
+
 	seen := map[string]bool{}
 	credentials := make([]praxisCredential, 0, len(providers))
 	for _, provider := range providers {
@@ -160,7 +209,19 @@ func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider) 
 		seen[identity] = true
 		hash := sha256.Sum256([]byte(identity))
 		pathID := name + "-" + hex.EncodeToString(hash[:])[:12] + "/" + key
-		credentials = append(credentials, praxisCredential{Name: name, Namespace: namespace, Key: key, Path: praxisCredentialDir + "/" + pathID})
+		strategy := defaultCredentialStrategy
+		if s, ok := strategies[identity]; ok {
+			strategy = s
+		}
+		credentials = append(credentials, praxisCredential{Name: name, Namespace: namespace, Key: key, Path: praxisCredentialDir + "/" + pathID, Strategy: strategy})
+	}
+	for identity, strategy := range strategies {
+		if !seen[identity] {
+			// A resolved route references a Secret no provider declares as
+			// its auth credential; the overlay candidate would then find no
+			// configured entry and every request through it fails closed.
+			return nil, fmt.Errorf("resolved route requires credential %s (strategy %q) that no provider declares", identity, strategy)
+		}
 	}
 	sort.Slice(credentials, func(i, j int) bool { return credentials[i].Name < credentials[j].Name })
 	return credentials, nil
@@ -178,7 +239,7 @@ func praxisConfig(credentials []praxisCredential, providers []v1alpha1.ExternalP
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")
 		for _, credential := range credentials {
-			fmt.Fprintf(&b, "          - name: %s\n            namespace: %s\n            key: %s\n            file: %s\n", credential.Name, credential.Namespace, credential.Key, credential.Path)
+			fmt.Fprintf(&b, "          - name: %s\n            namespace: %s\n            key: %s\n            file: %s\n            strategy: %s\n", credential.Name, credential.Namespace, credential.Key, credential.Path, credential.Strategy)
 		}
 	}
 	b.WriteString("      - filter: load_balancer\n        clusters:\n")
