@@ -393,7 +393,7 @@ func (r *Reconciler) ensureFinalizer(ctx context.Context, mtc *unstructured.Unst
 	}
 	base := mtc.DeepCopy()
 	controllerutil.AddFinalizer(mtc, PraxisCleanupFinalizer)
-	if err := r.Client.Patch(ctx, mtc, client.MergeFrom(base)); err != nil {
+	if err := r.Client.Patch(ctx, mtc, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
 	return nil
@@ -406,7 +406,7 @@ func (r *Reconciler) removeFinalizer(ctx context.Context, mtc *unstructured.Unst
 	}
 	base := mtc.DeepCopy()
 	controllerutil.RemoveFinalizer(mtc, PraxisCleanupFinalizer)
-	if err := r.Client.Patch(ctx, mtc, client.MergeFrom(base)); err != nil {
+	if err := r.Client.Patch(ctx, mtc, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
 	return nil

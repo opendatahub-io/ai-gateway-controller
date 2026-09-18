@@ -56,15 +56,18 @@ func EnsurePraxisMayDeploy(ctx context.Context, c client.Client, mtc *unstructur
 
 // claimPraxisSteady atomically consumes cleanup-complete by writing
 // AnnotationPayloadProcessingStatus=steady via an optimistic-concurrency
-// Update. A false return means another party claimed first, or the status
-// is no longer clear — caller must wait.
+// Update. Re-validates UsesPraxis on the fresh read so a legacy switch that
+// landed before this Get (same resourceVersion as the claim write) cannot
+// produce a praxis claim. A false return means another party claimed first,
+// the backend is no longer praxis, or the status is no longer clear — caller
+// must wait.
 func claimPraxisSteady(ctx context.Context, c client.Client, mtc *unstructured.Unstructured) (claimed bool, err error) {
 	latest := &unstructured.Unstructured{}
 	latest.SetGroupVersionKind(mtc.GroupVersionKind())
 	if err := c.Get(ctx, client.ObjectKeyFromObject(mtc), latest); err != nil {
 		return false, fmt.Errorf("get MaasTenantConfig for payload-processing status claim: %w", err)
 	}
-	if PayloadProcessingStatus(latest) != PayloadProcessingStatusCleanupComplete {
+	if !UsesPraxis(latest) || PayloadProcessingStatus(latest) != PayloadProcessingStatusCleanupComplete {
 		return false, nil
 	}
 	setPayloadProcessingStatus(latest, PayloadProcessingStatusSteady)

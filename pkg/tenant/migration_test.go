@@ -69,7 +69,10 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 	})
 
 	t.Run("cleanup-complete claims to steady", func(t *testing.T) {
-		mtc := newMTCFixture("ns-claim", map[string]string{AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete})
+		mtc := newMTCFixture("ns-claim", map[string]string{
+			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
+			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+		})
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).Build()
 		ready, err := EnsurePraxisMayDeploy(context.Background(), cl, mtc)
 		if err != nil {
@@ -101,7 +104,10 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 	})
 
 	t.Run("concurrent claim attempts", func(t *testing.T) {
-		mtc := newMTCFixture("ns-race", map[string]string{AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete})
+		mtc := newMTCFixture("ns-race", map[string]string{
+			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
+			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+		})
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).Build()
 
 		readerA := mtc.DeepCopy()
@@ -113,6 +119,36 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 		}
 		if claimedA == claimedB {
 			t.Fatalf("exactly one claimer should win, got claimedA=%v claimedB=%v", claimedA, claimedB)
+		}
+	})
+
+	t.Run("refuses claim when backend flipped to legacy before Get", func(t *testing.T) {
+		// Caller's reconcile snapshot still looks like praxis + cleanup-complete,
+		// but the live object already selected legacy (same RV until claim Update).
+		caller := newMTCFixture("ns-flip", map[string]string{
+			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
+			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+		})
+		live := caller.DeepCopy()
+		annotations := live.GetAnnotations()
+		delete(annotations, AnnotationPayloadProcessingType) // legacy selection
+		live.SetAnnotations(annotations)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
+
+		claimed, err := claimPraxisSteady(context.Background(), cl, caller)
+		if err != nil {
+			t.Fatalf("claimPraxisSteady: %v", err)
+		}
+		if claimed {
+			t.Fatal("claimed = true, want false when live object no longer selects praxis")
+		}
+		var got unstructured.Unstructured
+		got.SetGroupVersionKind(MaasTenantConfigGVK)
+		if err := cl.Get(context.Background(), client.ObjectKeyFromObject(live), &got); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if PayloadProcessingStatus(&got) != PayloadProcessingStatusCleanupComplete {
+			t.Fatalf("status = %q, want %q (must not write steady for legacy)", PayloadProcessingStatus(&got), PayloadProcessingStatusCleanupComplete)
 		}
 	})
 }
