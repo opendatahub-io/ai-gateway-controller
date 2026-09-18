@@ -71,6 +71,11 @@ type Reconciler struct {
 	ManifestPath string
 	// Image replaces the vendored overlay's placeholder container image.
 	Image string
+	// SkipNetworkPolicy omits the controller-managed payload-processing
+	// NetworkPolicy when an installation supplies equivalent networking and the
+	// target namespace disallows this controller from creating policies. It is
+	// false by default and must be set explicitly by the installer.
+	SkipNetworkPolicy bool
 	// MaaSAPIRouteNameBase is the base name used to disable ext_proc on
 	// maas-api's own HTTPRoute rules; suffixed per tenant like every other
 	// resource this package renames.
@@ -242,6 +247,16 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		// change re-triggers reconciliation via the watch.
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the tenant changes")
 		return ctrl.Result{}, nil
+	}
+	if r.SkipNetworkPolicy {
+		filtered := make([]unstructured.Unstructured, 0, len(resources))
+		for _, resource := range resources {
+			if resource.GetKind() != "NetworkPolicy" {
+				filtered = append(filtered, resource)
+			}
+		}
+		resources = filtered
+		log.Info("omitting controller-managed NetworkPolicy by explicit configuration", "namespace", gatewayNamespace)
 	}
 
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
