@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.19.0
-  name: aiguardrails.inference.opendatahub.io
+  name: aiguardrails.aigateway.opendatahub.io
 spec:
-  group: inference.opendatahub.io
+  group: aigateway.opendatahub.io
   names:
     kind: AIGuardrail
     listKind: AIGuardrailList

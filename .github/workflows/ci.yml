@@ -115,15 +115,11 @@ jobs:
       - name: Verify generated API artifacts
         run: |
           make manifests
-          if ! git diff --quiet -- api/inference/v1alpha1/zz_generated.deepcopy.go config/crd/bases; then
+          if ! git diff --quiet -- . || [ -n "$(git status --short --untracked-files=all)" ]; then
             echo "ERROR: generated API artifacts are out of date." >&2
             echo "Run 'make manifests' locally and commit the generated changes." >&2
-            git diff --stat -- api/inference/v1alpha1/zz_generated.deepcopy.go config/crd/bases
-            exit 1
-          fi
-          if [ -n "$(git status --short --untracked-files=all -- api/inference/v1alpha1 config/crd/bases)" ]; then
-            echo "ERROR: generated API artifacts are missing from git." >&2
-            git status --short --untracked-files=all -- api/inference/v1alpha1 config/crd/bases
+            git diff --stat -- .
+            git status --short --untracked-files=all
             exit 1
           fi
 

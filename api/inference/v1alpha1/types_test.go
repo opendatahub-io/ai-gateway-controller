@@ -39,31 +39,6 @@ func TestSchemeRegistration(t *testing.T) {
 	obj, err = scheme.New(gvk)
 	require.NoError(t, err)
 	assert.IsType(t, &ExternalModel{}, obj)
-
-	gvk.Kind = "AIGuardrail"
-	obj, err = scheme.New(gvk)
-	require.NoError(t, err)
-	assert.IsType(t, &AIGuardrail{}, obj)
-}
-
-func TestAIGuardrailDeepCopy(t *testing.T) {
-	original := &AIGuardrail{
-		Spec: AIGuardrailSpec{
-			Provider: AIGuardrailProvider{
-				Nemo: AIGuardrailNemoProvider{
-					Ref: AIGuardrailNamespacedReference{Name: "tenant-nemo", Namespace: "guardrails"},
-				},
-			},
-			Checks: []AIGuardrailCheck{{
-				Name: "sensitive-data", ConfigID: "pii", Phases: []GuardrailPhase{GuardrailPhaseInput, GuardrailPhaseOutput},
-			}},
-		},
-	}
-
-	copied := original.DeepCopy()
-	assert.Equal(t, original.Spec, copied.Spec)
-	copied.Spec.Checks[0].Phases[0] = GuardrailPhaseOutput
-	assert.Equal(t, GuardrailPhaseInput, original.Spec.Checks[0].Phases[0])
 }
 
 func TestExternalProviderDeepCopy(t *testing.T) {
