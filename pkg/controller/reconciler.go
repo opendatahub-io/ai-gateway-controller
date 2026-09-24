@@ -785,8 +785,9 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 							// re-enable the filter.
 							"overrides": map[string]any{
 								"processing_mode": map[string]any{
-									"request_header_mode":   "SEND",
-									"request_body_mode":     "NONE",
+									"request_header_mode": "SEND",
+									// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
+									"request_body_mode":     "STREAMED",
 									"response_header_mode":  "SEND",
 									"response_body_mode":    "NONE",
 									"request_trailer_mode":  "SKIP",
