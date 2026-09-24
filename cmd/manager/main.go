@@ -141,6 +141,7 @@ func main() {
 
 	reconciler := &tenant.Reconciler{
 		Client:               mgr.GetClient(),
+		APIReader:            mgr.GetAPIReader(),
 		ManifestPath:         manifestPath,
 		Image:                image,
 		SkipNetworkPolicy:    skipNetworkPolicy,
