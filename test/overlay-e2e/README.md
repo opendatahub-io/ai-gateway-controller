@@ -21,8 +21,9 @@ data plane consumes:
 5. **Credential injection** — clients send no `x-api-key`; Praxis injects the
    projected-Secret value with `strategy: apikey` (mirroring what
    `pkg/tenant/extproc.go` renders), strips a caller-supplied `x-api-key`,
-   and a rotated Secret value is rejected by the backend (401) and recovers
-   when restored — proving the injected value is the live projected value.
+   and a rotated Secret value is rejected by the backend (401) — proving the
+   injected value is the live projected value. (The rotation-*recovery* leg
+   is deliberately held out: see the praxis-ai #1136 note in `run.sh`.)
    The two backends validate **different** keys, so serving 200 after the
    hot-swap also proves per-route credential selection.
 
