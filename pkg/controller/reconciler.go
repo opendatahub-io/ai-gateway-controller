@@ -383,8 +383,9 @@ func (r *Reconciler) handleModelLifecycle(ctx context.Context, model *v1alpha1.E
 		if !model.DeletionTimestamp.IsZero() {
 			return true, nil
 		}
+		base := model.DeepCopy()
 		controllerutil.AddFinalizer(model, externalModelFinalizer)
-		if err := r.Update(ctx, model); err != nil {
+		if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return true, fmt.Errorf("add ExternalModel cleanup finalizer: %w", err)
 		}
 	}
@@ -475,10 +476,11 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	base := model.DeepCopy()
 	if !controllerutil.RemoveFinalizer(model, externalModelFinalizer) {
 		return nil
 	}
-	if err := r.Update(ctx, model); err != nil {
+	if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("remove ExternalModel cleanup finalizer: %w", err)
 	}
 	return nil
