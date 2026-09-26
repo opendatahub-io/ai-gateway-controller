@@ -68,6 +68,6 @@ Some fixes landed in upstream MaaS `main` @ `5ece7d3` (#1493); IPP backend-swap 
 ## ai-gateway-controller repo gaps (not MaaS)
 
 - [ ] `RELATED_IMAGE_ODH_AI_GATEWAY_CONTROLLER_IMAGE` — operator still installs via kustomize in CI
-- [ ] Merge [odh-konflux-central](https://github.com/jland-redhat/odh-konflux-central) group-test pipeline upstream
+- [x] Merge [odh-konflux-central](https://github.com/opendatahub-io/odh-konflux-central) group-test pipeline upstream
 - [x] Praxis stable default (`quay.io/opendatahub/odh-praxis-extproc:odh-stable`, praxis-extproc#79 @ `9872fc9`)
-- [ ] Point `.tekton/ai-gateway-controller-group-test.yaml` at upstream konflux-central after merge
+- [x] Point `.tekton/ai-gateway-controller-group-test.yaml` at upstream konflux-central after merge
