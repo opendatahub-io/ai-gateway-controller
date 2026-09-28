@@ -46,6 +46,38 @@ func TestNewAITenantSetsGVK(t *testing.T) {
 	}
 }
 
+func TestAgenticBackendRef(t *testing.T) {
+	for _, tc := range []struct {
+		ref, namespace, name string
+		configured, valid    bool
+	}{
+		{"", "", "", false, true},
+		{"ogx", "models-as-a-service", "ogx", true, true},
+		{"applications:ogx", "applications", "ogx", true, true},
+		{"OGXServer::ogx", "models-as-a-service", "ogx", true, true},
+		{"OGXServer:applications:ogx", "applications", "ogx", true, true},
+		{"OGXServer:ogx", "", "", true, false},
+		{"Other::ogx", "", "", true, false},
+		{"applications::ogx", "", "", true, false},
+		{"OGXServer::", "", "", true, false},
+		{":ogx", "", "", true, false},
+		{"OGXServer:applications:ogx:extra", "", "", true, false},
+		{"applications:UPPER", "", "", true, false},
+	} {
+		t.Run(tc.ref, func(t *testing.T) {
+			u := NewAITenant()
+			u.SetNamespace("ai-tenants")
+			if tc.ref != "" {
+				u.Object["spec"] = map[string]any{"agenticBackendRef": tc.ref}
+			}
+			namespace, name, configured, err := AgenticBackendRef(u, "models-as-a-service")
+			if namespace != tc.namespace || name != tc.name || configured != tc.configured || (err == nil) != tc.valid {
+				t.Fatalf("AgenticBackendRef(%q) = (%q, %q, %v, %v)", tc.ref, namespace, name, configured, err)
+			}
+		})
+	}
+}
+
 func TestIsActive(t *testing.T) {
 	cases := []struct {
 		name  string

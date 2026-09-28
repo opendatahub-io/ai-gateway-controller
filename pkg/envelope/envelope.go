@@ -263,7 +263,7 @@ func strategyFor(route resolver.Route) (string, error) {
 	case "":
 		return "", nil
 	case "apikey":
-		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
+		if route.ProviderType == "openai" && (route.APIFormat == "openai-chat" || route.APIFormat == "openai-responses") {
 			return "bearer_token", nil
 		}
 		return "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)

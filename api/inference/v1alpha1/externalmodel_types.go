@@ -72,6 +72,7 @@ type ExternalProviderRef struct {
 	// APIFormat determines how requests/responses are translated for this provider.
 	// Supported values:
 	//   - "openai-chat": OpenAI Chat Completions API (/v1/chat/completions)
+	//   - "openai-responses": OpenAI Responses API (/v1/responses)
 	//   - "messages": Anthropic Messages API (/v1/messages)
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1

@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -34,16 +35,17 @@ type extprocCredential struct {
 }
 
 // configureExternalModelExtProc completes the dedicated ExternalModel ExtProc
-// render with tenant-specific routing and credential references. The upstream
-// MaaS/KServe post-auth workload is intentionally not modified. Secret values
-// are never read: kubelet projects the referenced Secret into this workload and
-// credential_inject reads the mounted file at request time.
-func configureExternalModelExtProc(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate) error {
+// render with tenant-specific routing, agentic API endpoints, and credential
+// references. The upstream MaaS/KServe post-auth workload is intentionally not
+// modified. Secret values are never read: kubelet projects the referenced
+// Secret into this workload and credential_inject reads the mounted file at
+// request time.
+func configureExternalModelExtProc(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate, filesURL, vectorStoresURL string) error {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return err
 	}
-	config := extprocPostAuthConfig(candidates, credentials)
+	config := extprocPostAuthConfig(namespace, candidates, credentials, filesURL, vectorStoresURL)
 
 	var configMap *unstructured.Unstructured
 	var deployment *unstructured.Unstructured
@@ -164,7 +166,7 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 	return credentials, nil
 }
 
-func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential) string {
+func extprocPostAuthConfig(namespace string, candidates []envelope.Candidate, credentials []extprocCredential, filesURL, vectorStoresURL string) string {
 	clusterSet := make(map[string]bool, len(candidates))
 	for _, candidate := range candidates {
 		clusterSet[candidate.Cluster] = true
@@ -177,7 +179,11 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n  tls:\n    mode: self_signed\n\n")
-	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
+	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n")
+	writeBackendBypass(&b, namespace, "/v1/files", "files-api", filesURL)
+	writeBackendBypass(&b, namespace, "/v1/vector_stores", "vector-stores-backend", vectorStoresURL)
+	b.WriteString("      - filter: path_rewrite\n        replace:\n          pattern: \"^.*(/v1/.*)$\"\n          replacement: \"$1\"\n")
+	b.WriteString("      - filter: intelligent_route\n")
 	b.WriteString("        overlay_file: /etc/praxis/routing/routing-overlay.json\n")
 	b.WriteString("        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [")
 	for i, cluster := range clusters {
@@ -187,6 +193,18 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		fmt.Fprintf(&b, "%q", cluster)
 	}
 	b.WriteString("]\n        reload: {enabled: true, debounce_ms: 500}\n")
+	b.WriteString("      - filter: header_copy\n        mappings:\n")
+	b.WriteString("          - from: x-maas-username\n            to: x-user-id\n")
+	b.WriteString("          - from: x-maas-subscription\n            to: x-tenant-id\n")
+	if filesURL != "" {
+		b.WriteString("      - filter: openai_file_resolve\n")
+		b.WriteString("        allow_pre_security_callout: true\n")
+		fmt.Fprintf(&b, "        files_api_url: %q\n", filesURL)
+	}
+	if vectorStoresURL != "" {
+		b.WriteString("      - filter: openai_file_search_callout\n")
+		fmt.Fprintf(&b, "        vector_store_url: %q\n", vectorStoresURL)
+	}
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")
 		for _, credential := range credentials {
@@ -196,6 +214,28 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	}
 	b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
 	return b.String()
+}
+
+func writeBackendBypass(b *strings.Builder, namespace, apiPath, cluster, rawURL string) {
+	if rawURL == "" {
+		return
+	}
+	pathPrefix := "/" + namespace + apiPath
+	fmt.Fprintf(b, "      - filter: headers\n        conditions:\n          - when:\n              path_prefix: %q\n", pathPrefix)
+	fmt.Fprintf(b, "        branch_chains:\n          - name: bypass-irr-%s\n            rejoin: terminal\n", cluster)
+	b.WriteString("            chains:\n              - name: bypass-chain\n                filters:\n")
+	b.WriteString("                  - filter: header_copy\n                    mappings:\n                      - from: x-maas-username\n                        to: x-user-id\n                      - from: x-maas-subscription\n                        to: x-tenant-id\n")
+	fmt.Fprintf(b, "                  - filter: router\n                    routes:\n                      - path_prefix: %q\n                        cluster: %q\n", pathPrefix, cluster)
+	fmt.Fprintf(b, "                  - filter: path_rewrite\n                    replace:\n                      pattern: %q\n                      replacement: \"$1\"\n", "^/"+namespace+"(/.*)$")
+	fmt.Fprintf(b, "                  - filter: load_balancer\n                    clusters:\n                      - name: %q\n                        endpoints: [%q]\n", cluster, endpointHost(rawURL))
+}
+
+func endpointHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Host
 }
 
 func appendOrReplaceNamedVolume(items []any, name string, value map[string]any) []any {

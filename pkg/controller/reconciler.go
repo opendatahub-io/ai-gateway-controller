@@ -737,8 +737,10 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 	kept := make([]any, 0, len(routes)*2+2)
 
 	byModel := map[string]int{}
+	responsesModel := map[string]bool{}
 	for _, route := range routes {
 		byModel[route.Model]++
+		responsesModel[route.Model] = responsesModel[route.Model] || route.APIFormat == "openai-responses"
 	}
 	models := make([]string, 0, len(byModel))
 	for model := range byModel {
@@ -746,6 +748,10 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 	}
 	sort.Strings(models)
 	for _, model := range models {
+		requestBodyMode, responseBodyMode := "STREAMED", "NONE"
+		if responsesModel[model] {
+			requestBodyMode, responseBodyMode = "BUFFERED", "BUFFERED"
+		}
 		// modelHTTPRouteSet emits two provider rules per route plus the
 		// canonical and header-only fail-closed sink rules.
 		count := byModel[model]*2 + 2
@@ -785,10 +791,11 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 							// re-enable the filter.
 							"overrides": map[string]any{
 								"processing_mode": map[string]any{
-									"request_header_mode":   "SEND",
-									"request_body_mode":     "NONE",
+									"request_header_mode": "SEND",
+									// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
+									"request_body_mode":     requestBodyMode,
 									"response_header_mode":  "SEND",
-									"response_body_mode":    "NONE",
+									"response_body_mode":    responseBodyMode,
 									"request_trailer_mode":  "SKIP",
 									"response_trailer_mode": "SKIP",
 								},
@@ -1047,20 +1054,34 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 		})
 	}
 	sinkName := providerSelectionSinkName(route.Model)
-	rules = append(rules, map[string]any{
+	fallback := map[string]any{"name": sinkName, "port": int64(443)}
+	var fallbackFilters []any
+	if len(routes) == 1 && route.APIFormat == "openai-responses" && route.ProviderType == "openai" {
+		fallback = map[string]any{"name": providerServicePrefix + route.Provider, "port": providerPort(route)}
+		fallbackFilters = []any{providerHostnameRewrite(providerEndpointForRoute(route))}
+	}
+	pathFallback := map[string]any{
 		"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": path}}},
-		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
+		"backendRefs": []any{fallback},
 		"timeouts":    map[string]any{"request": "300s"},
-	})
+	}
+	if fallbackFilters != nil {
+		pathFallback["filters"] = fallbackFilters
+	}
+	rules = append(rules, pathFallback)
 	// Keep the body-routing rule for requests whose path is not the canonical
 	// model path. The post-auth ExtProc selection header is authoritative for
 	// provider choice and the route-cache clear causes Envoy to reselect one of
 	// the header rules above.
-	rules = append(rules, map[string]any{
+	headerFallback := map[string]any{
 		"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
-		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
+		"backendRefs": []any{fallback},
 		"timeouts":    map[string]any{"request": "300s"},
-	})
+	}
+	if fallbackFilters != nil {
+		headerFallback["filters"] = fallbackFilters
+	}
+	rules = append(rules, headerFallback)
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
 		"metadata": labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model),
