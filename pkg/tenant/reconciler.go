@@ -227,6 +227,60 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 	return aitenant, true, nil
 }
 
+type ogxBackend struct {
+	namespace string
+	server    string
+	service   string
+	port      int64
+	url       string
+}
+
+// Resolve only an operator-owned Service referenced by the tenant's OGXServer.
+func (r *Reconciler) resolveOGXBackend(ctx context.Context, aitenant *unstructured.Unstructured, tenantNamespace string) (*ogxBackend, error) {
+	namespace, name, configured, err := AgenticBackendRef(aitenant, tenantNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("AITenant %s/%s: %w", aitenant.GetNamespace(), aitenant.GetName(), err)
+	}
+	if !configured {
+		return nil, nil
+	}
+	server := &unstructured.Unstructured{}
+	server.SetGroupVersionKind(schema.GroupVersionKind{Group: "ogx.io", Version: "v1beta1", Kind: "OGXServer"})
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, server); err != nil {
+		return nil, fmt.Errorf("get OGXServer %s/%s: %w", namespace, name, err)
+	}
+	phase, _, _ := unstructured.NestedString(server.Object, "status", "phase")
+	if phase != "Ready" {
+		return nil, fmt.Errorf("OGXServer %s/%s is not Ready (phase %q)", namespace, name, phase)
+	}
+	serviceName := name + "-service"
+	var service corev1.Service
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: serviceName}, &service); err != nil {
+		return nil, fmt.Errorf("get OGXServer Service %s/%s: %w", namespace, serviceName, err)
+	}
+	owned := false
+	for _, owner := range service.OwnerReferences {
+		if owner.UID == server.GetUID() && owner.Kind == "OGXServer" && owner.Name == name {
+			owned = true
+		}
+	}
+	if !owned || server.GetUID() == "" {
+		return nil, fmt.Errorf("Service %s/%s is not owned by OGXServer %s", namespace, serviceName, name)
+	}
+	var port int64
+	for _, servicePort := range service.Spec.Ports {
+		if servicePort.Name == "http" && servicePort.Protocol == corev1.ProtocolTCP {
+			port = int64(servicePort.Port)
+			break
+		}
+	}
+	if port < 1 {
+		return nil, fmt.Errorf("OGXServer Service %s/%s must expose a valid HTTP port", namespace, serviceName)
+	}
+	return &ogxBackend{namespace: namespace, server: name, service: serviceName, port: port,
+		url: fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, namespace, port)}, nil
+}
+
 // reconcilePraxis is the steady-state path for a tenant that currently
 // opts into praxis: ensure the cleanup finalizer is present (before doing
 // anything else, so even a partially-applied tenant is guaranteed a
@@ -249,6 +303,18 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if !gwReady {
 		log.Info("owning AITenant is Active but status.gatewayRef is not populated; will retry")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+	backend, err := r.resolveOGXBackend(ctx, aitenant, mtc.GetNamespace())
+	if err != nil {
+		if cleanupErr := r.cleanupOGXResources(ctx, tenantID, mtc.GetNamespace(), gatewayNamespace, ""); cleanupErr != nil {
+			return ctrl.Result{}, cleanupErr
+		}
+		log.Info("waiting for referenced OGXServer", "error", err)
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+	filesURL, vectorStoresURL := "", ""
+	if backend != nil {
+		filesURL, vectorStoresURL = backend.url, backend.url
 	}
 
 	// Handshake: claim cleanup-complete → steady. Absent means wait (existing
@@ -289,6 +355,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	var runtimeCandidates []envelope.Candidate
+	var responseRoute *resolver.Route
 	if hasModels {
 		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace)
 		if providerErr != nil {
@@ -302,9 +369,28 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
 			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 		}
-		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace)
+		var runtimeRoutes []resolver.Route
+		runtimeCandidates, runtimeRoutes, err = r.runtimeCandidates(ctx, tenantNamespace)
 		if err != nil {
 			return ctrl.Result{}, err
+		}
+		for i := range runtimeRoutes {
+			if runtimeRoutes[i].APIFormat != "openai-responses" {
+				continue
+			}
+			if backend == nil {
+				if err := r.cleanupOGXResources(ctx, tenantID, tenantNamespace, gatewayNamespace, ""); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, fmt.Errorf("model %s requires AITenant.spec.agenticBackendRef for Responses", runtimeRoutes[i].Model)
+			}
+			if runtimeRoutes[i].ProviderType != "openai" {
+				return ctrl.Result{}, fmt.Errorf("model %s Responses provider %s is not OpenAI", runtimeRoutes[i].Model, runtimeRoutes[i].Provider)
+			}
+			if responseRoute != nil && responseRoute.Provider != runtimeRoutes[i].Provider {
+				return ctrl.Result{}, fmt.Errorf("Responses models in tenant %s must use the same provider", tenantNamespace)
+			}
+			responseRoute = &runtimeRoutes[i]
 		}
 	} else if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
 		return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
@@ -315,8 +401,18 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
 	if hasModels {
-		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
+		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates, filesURL, vectorStoresURL); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
+		}
+		if responseRoute != nil {
+			if err := configureResponsesExtProc(resources, tenantNamespace, runtimeCandidates, *responseRoute, backend); err != nil {
+				return ctrl.Result{}, fmt.Errorf("configure Responses ExtProc: %w", err)
+			}
+			authEnforced, err := r.ogxAuthEnforced(ctx, tenantID, tenantNamespace)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("check OGX AuthPolicy: %w", err)
+			}
+			resources = append(resources, ogxAPIResources(tenantID, tenantNamespace, gatewayName, gatewayNamespace, backend, authEnforced)...)
 		}
 	} else {
 		resources = RemoveExternalModelResources(resources, tenantID)
@@ -347,6 +443,15 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
+	}
+	// Remove stale backend grants only after the new route has been applied.
+	// Without a Responses model, remove the route before its authorization is removed.
+	backendNamespace := ""
+	if responseRoute != nil {
+		backendNamespace = backend.namespace
+	}
+	if err := r.cleanupOGXResources(ctx, tenantID, tenantNamespace, gatewayNamespace, backendNamespace); err != nil {
+		return ctrl.Result{}, fmt.Errorf("clean up OGX resources: %w", err)
 	}
 
 	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
@@ -397,6 +502,9 @@ func (r *Reconciler) hasActiveExternalModels(ctx context.Context, namespace stri
 }
 
 func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
+	if err := r.cleanupOGXResources(ctx, tenantID, tenantNamespace, gatewayNamespace, ""); err != nil {
+		return err
+	}
 	targets := []struct {
 		gvk             schema.GroupVersionKind
 		name, namespace string
@@ -450,14 +558,14 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace string) (
 	return result, required, nil
 }
 
-func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, error) {
+func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, []resolver.Route, error) {
 	var models v1alpha1.ExternalModelList
 	if err := r.Client.List(ctx, &models, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("list ExternalModels for ExtProc runtime configuration: %w", err)
+		return nil, nil, fmt.Errorf("list ExternalModels for ExtProc runtime configuration: %w", err)
 	}
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
+		return nil, nil, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
 	for i := range models.Items {
@@ -469,13 +577,13 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([
 	}
 	runtimeSet, err := resolver.ResolveAll(modelPtrs, providerPtrs)
 	if err != nil {
-		return nil, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+		return nil, nil, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
 	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
 	for _, route := range runtimeSet.Routes() {
 		strategy, err := envelope.CredentialStrategy(route)
 		if err != nil {
-			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
+			return nil, nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}
 		candidate := envelope.Candidate{
 			Cluster: route.Cluster, StableID: "provider-" + route.Provider,
@@ -489,7 +597,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([
 		}
 		candidates = append(candidates, candidate)
 	}
-	return candidates, nil
+	return candidates, runtimeSet.Routes(), nil
 }
 
 func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
@@ -689,6 +797,9 @@ func (r *Reconciler) removeFinalizer(ctx context.Context, mtc *unstructured.Unst
 // references that one role, so deleting it would break every other
 // praxis tenant sharing the cluster.
 func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
+	if err := r.cleanupOGXResources(ctx, tenantID, tenantNamespace, gatewayNamespace, ""); err != nil {
+		return err
+	}
 	type target struct {
 		gvk       schema.GroupVersionKind
 		name      string

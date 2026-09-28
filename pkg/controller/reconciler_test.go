@@ -240,6 +240,38 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	}
 }
 
+func TestResponsesRouteBuffersBodiesAndUsesSingleProviderFallback(t *testing.T) {
+	route := resolver.Route{Model: "model", ClientName: "gpt-4o-mini", Provider: "openai", ProviderType: "openai", Endpoint: "api.openai.com:443", APIFormat: "openai-responses"}
+	obj := modelHTTPRoute(route, "tenant-a", "gateway", "gateway-system")
+	rules := nestedSlice(t, obj.Object, "spec", "rules")
+	for _, index := range []int{2, 3} {
+		fallback := nestedMapAt(t, rules, index)
+		backend := nestedMapAt(t, nestedSlice(t, fallback, "backendRefs"), 0)
+		if got := nestedString(t, backend, "name"); got != "provider-openai" {
+			t.Fatalf("fallback %d backend = %q", index, got)
+		}
+		if got := nestedString(t, nestedMapAt(t, nestedSlice(t, fallback, "filters"), 0), "urlRewrite", "hostname"); got != "api.openai.com" {
+			t.Fatalf("fallback %d host = %q", index, got)
+		}
+	}
+	r := controllerTestClient(t)
+	var applied unstructured.Unstructured
+	r.ApplyResource = func(_ context.Context, _ client.Client, object unstructured.Unstructured) error {
+		applied = object
+		return nil
+	}
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "gateway", "gateway-system", []resolver.Route{route}); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range nestedSlice(t, applied.Object, "spec", "configPatches") {
+		patch := raw.(map[string]any)
+		mode, _, _ := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", externalModelExtProcFilter, "overrides", "processing_mode")
+		if mode["request_body_mode"] != "BUFFERED" || mode["response_body_mode"] != "BUFFERED" {
+			t.Fatalf("response route processing mode = %#v", mode)
+		}
+	}
+}
+
 func TestModelHTTPRouteHasOneTrustedRulePerProviderBeforeFallback(t *testing.T) {
 	routes := []resolver.Route{
 		{Model: "model", ClientName: "chat", Provider: "provider-b"},

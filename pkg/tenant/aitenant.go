@@ -16,7 +16,13 @@ limitations under the License.
 
 package tenant
 
-import "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+import (
+	"fmt"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
+)
 
 // NewAITenant returns an empty unstructured object with the AITenant GVK
 // set, ready for Get. This controller only ever Gets a specific AITenant by
@@ -26,6 +32,39 @@ func NewAITenant() *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(AITenantGVK)
 	return u
+}
+
+// AgenticBackendRef resolves the configured backend against the workload namespace.
+func AgenticBackendRef(aitenant *unstructured.Unstructured, tenantNamespace string) (namespace, name string, configured bool, err error) {
+	ref, found, err := unstructured.NestedString(aitenant.Object, "spec", "agenticBackendRef")
+	if err != nil || !found || ref == "" {
+		return "", "", false, err
+	}
+	parts := strings.Split(ref, ":")
+	namespace = tenantNamespace
+	switch len(parts) {
+	case 1:
+		name = parts[0]
+	case 2:
+		namespace, name = parts[0], parts[1]
+	case 3:
+		if parts[0] != "OGXServer" {
+			return "", "", true, fmt.Errorf("unsupported agenticBackendRef type %q", parts[0])
+		}
+		if parts[1] != "" {
+			namespace = parts[1]
+		}
+		name = parts[2]
+	default:
+		return "", "", true, fmt.Errorf("invalid agenticBackendRef %q", ref)
+	}
+	if errs := validation.IsDNS1123Label(namespace); len(errs) > 0 {
+		return "", "", true, fmt.Errorf("invalid agenticBackendRef namespace %q: %s", namespace, strings.Join(errs, "; "))
+	}
+	if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+		return "", "", true, fmt.Errorf("invalid agenticBackendRef name %q: %s", name, strings.Join(errs, "; "))
+	}
+	return namespace, name, true, nil
 }
 
 // IsActive reports whether maas-controller's AITenant reconciler has

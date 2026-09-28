@@ -62,6 +62,129 @@ func mtcSchemeForTests() *runtime.Scheme {
 	return scheme
 }
 
+func TestResolveOGXBackendRequiresReadyOwnedService(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	gvk := schema.GroupVersionKind{Group: "ogx.io", Version: "v1beta1", Kind: "OGXServer"}
+	scheme.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+	server := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "ogx.io/v1beta1", "kind": "OGXServer",
+		"metadata": map[string]any{"name": "ogx", "namespace": "applications", "uid": "owner-uid"},
+		"status":   map[string]any{"phase": "Ready"},
+	}}
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "ogx-service", Namespace: "applications", OwnerReferences: []metav1.OwnerReference{{APIVersion: "ogx.io/v1beta1", Kind: "OGXServer", Name: "ogx", UID: "owner-uid"}}},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 8321, Protocol: corev1.ProtocolTCP}, {Name: "metrics", Port: 9464, Protocol: corev1.ProtocolTCP}}}}
+	aitenant := NewAITenant()
+	aitenant.Object["spec"] = map[string]any{"agenticBackendRef": "OGXServer:applications:ogx"}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(server, service).Build()}
+	backend, err := r.resolveOGXBackend(context.Background(), aitenant, "models-as-a-service")
+	if err != nil || backend == nil || backend.service != "ogx-service" || backend.port != 8321 || backend.url != "http://ogx-service.applications.svc.cluster.local:8321" {
+		t.Fatalf("backend = %#v, err = %v", backend, err)
+	}
+	service.OwnerReferences = nil
+	r.Client = fake.NewClientBuilder().WithScheme(scheme).WithObjects(server, service).Build()
+	if _, err := r.resolveOGXBackend(context.Background(), aitenant, "models-as-a-service"); err == nil {
+		t.Fatal("unowned Service must not be used as an OGX backend")
+	}
+}
+
+func TestOGXRouteRequiresEnforcedAuthPolicy(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	policyGVK := schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
+	scheme.AddKnownTypeWithName(policyGVK, &unstructured.Unstructured{})
+	policy := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "kuadrant.io/v1", "kind": "AuthPolicy",
+		"metadata": map[string]any{"name": "ogx-api-auth-team-a", "namespace": "ai-tenant-team-a", "generation": int64(2),
+			"labels": map[string]any{"app.kubernetes.io/part-of": "ogx-api-auth"}},
+		"spec": map[string]any{"targetRef": map[string]any{"name": "ogx-api-team-a"}},
+		"status": map[string]any{"observedGeneration": int64(1), "conditions": []any{
+			map[string]any{"type": "Accepted", "status": "True"},
+			map[string]any{"type": "Enforced", "status": "True"},
+		}},
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).Build()
+	r := &Reconciler{Client: c}
+	backend := &ogxBackend{namespace: "applications", service: "ogx-service", server: "ogx", port: 8321}
+	checkRoute := func(ready bool) {
+		t.Helper()
+		resources := ogxAPIResources("team-a", "ai-tenant-team-a", "gateway", "ingress", backend, ready)
+		rules, _, err := unstructured.NestedSlice(resources[0].Object, "spec", "rules")
+		if err != nil || len(rules) == 0 {
+			t.Fatalf("OGX route rules: %v", err)
+		}
+		for _, item := range rules {
+			_, routesToBackend := item.(map[string]any)["backendRefs"]
+			if routesToBackend != ready {
+				t.Fatalf("OGX rule has backend = %v, enforced = %v", routesToBackend, ready)
+			}
+		}
+	}
+	ready, err := r.ogxAuthEnforced(context.Background(), "team-a", "ai-tenant-team-a")
+	if err != nil || ready {
+		t.Fatalf("stale policy is ready = %v, error = %v", ready, err)
+	}
+	checkRoute(ready)
+	_ = unstructured.SetNestedField(policy.Object, int64(2), "status", "observedGeneration")
+	if err := c.Update(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	ready, err = r.ogxAuthEnforced(context.Background(), "team-a", "ai-tenant-team-a")
+	if err != nil || !ready {
+		t.Fatalf("enforced policy is ready = %v, error = %v", ready, err)
+	}
+	checkRoute(ready)
+}
+
+func TestCleanupOGXResourcesOnBackendChangeAndDeletion(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	owned := func(gvk schema.GroupVersionKind, name, namespace, tenantNamespace string) client.Object {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		u.SetName(name)
+		u.SetNamespace(namespace)
+		u.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController, ogxTenantNamespaceLabel: tenantNamespace})
+		return u
+	}
+	const tenant = "ai-tenant-team-a"
+	objects := []client.Object{
+		owned(gvkHTTPRoute, "ogx-api-team-a", tenant, tenant),
+		owned(gvkEnvoyFilter, "ogx-api-extproc-team-a", "ingress", tenant),
+		owned(gvkNetworkPolicy, "ogx-callouts-team-a", tenant, tenant),
+		owned(gvkReferenceGrant, "ogx-gateway-team-a", "old-backend", tenant),
+		owned(gvkNetworkPolicy, "ogx-gateway-ingress-team-a", "old-backend", tenant),
+		owned(gvkReferenceGrant, "ogx-gateway-team-a", "new-backend", tenant),
+		owned(gvkNetworkPolicy, "ogx-gateway-ingress-team-a", "new-backend", tenant),
+		owned(gvkReferenceGrant, "ogx-gateway-team-a", "other-backend", "other-tenant"),
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	r := &Reconciler{Client: c}
+	ctx := context.Background()
+	if err := r.cleanupOGXResources(ctx, "team-a", tenant, "ingress", "new-backend"); err != nil {
+		t.Fatal(err)
+	}
+	for i, obj := range objects {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+		err := c.Get(ctx, client.ObjectKeyFromObject(obj), got)
+		if i == 3 || i == 4 {
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("old backend resource remains: %v", err)
+			}
+		} else if err != nil {
+			t.Fatalf("resource unexpectedly deleted: %v", err)
+		}
+	}
+	if err := r.cleanupOGXResources(ctx, "team-a", tenant, "ingress", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, obj := range objects[:7] {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+		if err := c.Get(ctx, client.ObjectKeyFromObject(obj), got); !apierrors.IsNotFound(err) {
+			t.Fatalf("OGX resource remains after deletion: %s/%s (%v)", obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+}
+
 func TestMaasTenantConfigForNamespaceMapsExternalModelEvents(t *testing.T) {
 	r := &Reconciler{}
 	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "tenant-a"}}
