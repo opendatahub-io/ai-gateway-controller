@@ -274,6 +274,13 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 		}
 		return false, fmt.Errorf("re-read owning AITenant %s/%s: %w", namespace, name, err)
 	}
+	// Terminating: the owner's delete/cleanup is already in flight, so a fresh
+	// apply would provision for a tenant on its way out. deletionTimestamp is the
+	// only signal that flips here — uid/bind/active/current/gatewayRef can all
+	// still pass while the object is finalizing.
+	if !aitenant.GetDeletionTimestamp().IsZero() {
+		return false, nil
+	}
 	// Identity: the same object, not a delete+recreate that reused the name.
 	if aitenant.GetUID() != wantUID {
 		return false, nil
