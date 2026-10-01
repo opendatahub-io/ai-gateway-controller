@@ -480,7 +480,7 @@ func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1
 	if !controllerutil.RemoveFinalizer(model, externalModelFinalizer) {
 		return nil
 	}
-	if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("remove ExternalModel cleanup finalizer: %w", err)
 	}
 	return nil

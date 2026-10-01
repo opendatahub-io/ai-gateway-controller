@@ -999,6 +999,17 @@ func TestExternalModelDeletionRetainsFinalizerWhenCleanupFails(t *testing.T) {
 	}
 }
 
+func TestRemoveExternalModelFinalizerIgnoresDeletedModel(t *testing.T) {
+	r := controllerTestClient(t)
+	// A stale cached copy still carries the finalizer after the API server removed the object.
+	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{
+		Name: "model", Namespace: "tenant", ResourceVersion: "1", Finalizers: []string{externalModelFinalizer},
+	}}
+	if err := r.removeExternalModelFinalizer(t.Context(), model); err != nil {
+		t.Fatalf("removing the finalizer from a deleted model = %v", err)
+	}
+}
+
 func hasConditionReason(conditions []metav1.Condition, typ, reason string) bool {
 	for _, condition := range conditions {
 		if condition.Type == typ && condition.Reason == reason && condition.Status == metav1.ConditionFalse {
