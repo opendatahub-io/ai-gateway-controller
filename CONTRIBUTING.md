@@ -62,8 +62,9 @@ this file only covers process (PR/CI conventions), not design decisions.
    the PR for a `Signed-off-by` trailer; apply the `skip/dco` label to bypass
    for an exception.
 4. **Keep PRs under the 750-line size cap.** CI counts added production lines
-   (excluding `*_test.go`, `*.md`, `go.sum`, and `config/manifests/**`
-   vendored content) and fails above 750. Split into a stack of smaller PRs,
+   (excluding `*_test.go`, `*.md`, `go.sum`, `config/manifests/**`, and
+   vendored YAML under `test/envtest/testdata/crds/`) and fails above 750.
+   Split into a stack of smaller PRs,
    or apply the `skip/pr-conventions` label if a maintainer approves an
    exception.
 5. **Keep changes focused** and make sure CI passes (see below) before
@@ -75,7 +76,8 @@ this file only covers process (PR/CI conventions), not design decisions.
 |---|---|---|
 | `ci.yml` / `lint` | PR + push to `main` | `golangci-lint`, version kept in sync with `tools.mk` |
 | `ci.yml` / `govulncheck` | PR + push to `main` | Known-CVE scan via `govulncheck` |
-| `ci.yml` / `test` | PR + push to `main` | `make test`; uploads coverage as an artifact |
+| `ci.yml` / `test` | PR + push to `main` | `make test-unit`; uploads coverage as an artifact |
+| `ci.yml` / `test-envtest` | PR + push to `main` | Runs controller scenarios through a real manager with shipped CRDs and RBAC |
 | `ci.yml` / `build` | PR + push to `main` | `make binary` compiles |
 | `ci.yml` / `verify-manifests` | PR + push to `main` | Re-runs `hack/scripts/get-manifests.sh` and fails if `config/manifests/praxis-extproc` drifts from the pinned commit — see "Development setup" |
 | `ci.yml` / `typos` | PR + push to `main` | `crate-ci/typos` spell check |
@@ -91,6 +93,14 @@ this file only covers process (PR/CI conventions), not design decisions.
 - `shellcheck hack/scripts/*.sh` if you touched vendoring scripts
 
 ## Testing
+
+`make test` runs both unit tests and control-plane scenarios. Use `make test-unit`
+for the fast loop, or `make test-envtest` to exercise controller watches and
+reconciliation with shipped permissions. The latter uses vendored dependency
+CRDs and downloads pinned control-plane binaries; it needs no cluster or
+container runtime. Sources and
+refresh instructions live beside the [vendored schemas](test/envtest/testdata/crds/README.md).
+See [the envtest guide](test/envtest/README.md) for focused runs and fixtures.
 
 New functionality should include tests. `pkg/render` is the reference for
 coverage expectations in this repo — its test suite runs against the real
