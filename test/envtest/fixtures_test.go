@@ -60,7 +60,7 @@ func aiGuardrail(name, namespace string) *aigatewayv1alpha1.AIGuardrail {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: aigatewayv1alpha1.AIGuardrailSpec{
 			Provider: aigatewayv1alpha1.AIGuardrailProvider{
-				Nemo: aigatewayv1alpha1.AIGuardrailNemoProvider{
+				Nemo: &aigatewayv1alpha1.AIGuardrailNemoProvider{
 					Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{Name: "guardrails"},
 				},
 				Timeout: metav1.Duration{Duration: 30 * time.Second},

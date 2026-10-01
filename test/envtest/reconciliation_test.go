@@ -16,6 +16,10 @@ func TestControlPlane(t *testing.T) {
 		testGuardrailTimeoutAdmission(t, c)
 	})
 
+	t.Run("guardrails require exactly one provider", func(t *testing.T) {
+		testGuardrailProviderAdmission(t, c)
+	})
+
 	t.Run("shipped permissions cover credential copies and reference grants", func(t *testing.T) {
 		testShippedPermissions(t, c)
 	})

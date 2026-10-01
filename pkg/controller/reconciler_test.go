@@ -54,7 +54,7 @@ func TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "tenant-a", Generation: 1},
 		Spec: aigatewayv1alpha1.AIGuardrailSpec{
 			Provider: aigatewayv1alpha1.AIGuardrailProvider{
-				Nemo: aigatewayv1alpha1.AIGuardrailNemoProvider{Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{Name: "nemo"}},
+				Nemo: &aigatewayv1alpha1.AIGuardrailNemoProvider{Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{Name: "nemo"}},
 			},
 			Checks: []aigatewayv1alpha1.AIGuardrailCheck{{
 				Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput},

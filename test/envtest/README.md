@@ -47,6 +47,7 @@ API server, including on failure. The current kubeconfig is never used.
   non-positive values. Accepted values remain readable by typed Get/List.
   A typed fixture is converted to unstructured input and only its timeout is
   replaced with a raw string, so validation happens on the server.
+- Guardrail admission rejects a guardrail that sets no provider.
 
 Tests use Go's `testing` package and testify. The scenario states its
 preconditions, user action and expected outcome. Small typed builders describe
