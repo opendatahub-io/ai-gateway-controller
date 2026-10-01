@@ -304,7 +304,7 @@ func TestReconcileSkipsWhenMaasTenantConfigNotFound(t *testing.T) {
 
 func TestReconcileSkipsWhenNotUsingPraxis(t *testing.T) {
 	scheme := mtcSchemeForTests()
-	mtc := newMTC("ai-tenant-redteam", "redteam", "", "redteam", "ai-tenants")
+	mtc := newMTC("ai-tenant-redteam", "redteam", PayloadProcessingBackendIPP, "redteam", "ai-tenants")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(rec.funcs()).Build()
 
@@ -747,7 +747,7 @@ func TestReconcileRejectsSpoofedOwningAITenantAnnotations(t *testing.T) {
 
 func TestReconcileSwitchAwayRejectsSpoofedOwningAITenantAnnotations(t *testing.T) {
 	scheme := mtcSchemeForTests()
-	mtc := withMTCFinalizer(newMTC("ai-tenant-attacker", "attacker", "", "victim", "ai-tenants"))
+	mtc := withMTCFinalizer(newMTC("ai-tenant-attacker", "attacker", PayloadProcessingBackendIPP, "victim", "ai-tenants"))
 	victim := newAITenantOwner("victim", "ai-tenants", AITenantPhaseActive, "victim-gateway", "ai-tenant-victim", "ai-tenant-victim")
 	rec := &recorder{}
 	seed := seedPraxisOwnedForCleanup("attacker", "ai-tenant-victim")
@@ -821,10 +821,9 @@ func seedPraxisOwnedForCleanup(tenantID, namespace string) []client.Object {
 
 func TestReconcileCleansUpAndRemovesFinalizerWhenSwitchedAwayFromPraxis(t *testing.T) {
 	scheme := mtcSchemeForTests()
-	// No AnnotationPayloadProcessingType: this tenant switched back to
-	// legacy IPP (or dropped the annotation), but our finalizer from when
-	// it was praxis is still present.
-	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", "", "redteam", "ai-tenants"))
+	// Explicit ipp: this tenant switched back to legacy IPP, but our
+	// finalizer from when it was praxis is still present.
+	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", PayloadProcessingBackendIPP, "redteam", "ai-tenants"))
 	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
 	rec := &recorder{}
 	seed := seedPraxisOwnedForCleanup("redteam", "tenant-ns")
@@ -863,7 +862,7 @@ func TestReconcileCleansUpAndRemovesFinalizerWhenSwitchedAwayFromPraxis(t *testi
 
 func TestReconcileCleanupSkipsMaaSOwnedResources(t *testing.T) {
 	scheme := mtcSchemeForTests()
-	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", "", "redteam", "ai-tenants"))
+	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", PayloadProcessingBackendIPP, "redteam", "ai-tenants"))
 	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
 	legacyDeploy := &unstructured.Unstructured{}
 	legacyDeploy.SetGroupVersionKind(gvkDeployment)
@@ -889,7 +888,7 @@ func TestReconcileCleanupSkipsMaaSOwnedResources(t *testing.T) {
 
 func TestReconcileSwitchAwayWithoutFinalizerIsNoop(t *testing.T) {
 	scheme := mtcSchemeForTests()
-	mtc := newMTC("tenant-ns", "redteam", "", "redteam", "ai-tenants")
+	mtc := newMTC("tenant-ns", "redteam", PayloadProcessingBackendIPP, "redteam", "ai-tenants")
 	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
@@ -1027,7 +1026,7 @@ func TestReconcileDeleteRequeuesWhenGatewayRefNeverPopulated(t *testing.T) {
 
 func TestReconcileSwitchAwayRequeuesWhenAITenantNotReady(t *testing.T) {
 	scheme := mtcSchemeForTests()
-	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", "", "redteam", "ai-tenants"))
+	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", PayloadProcessingBackendIPP, "redteam", "ai-tenants"))
 	aitenant := newAITenantOwner("redteam", "ai-tenants", "", "", "", "tenant-ns") // not Active
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()

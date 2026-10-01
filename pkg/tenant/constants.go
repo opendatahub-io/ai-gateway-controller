@@ -60,9 +60,9 @@ const (
 	// AnnotationPayloadProcessingType selects a tenant's payload-processing
 	// dataplane. Both this controller and maas-controller always read the
 	// same single source of truth (mirrors maas-controller's
-	// tenantreconcile.AnnotationPayloadProcessingType). Absent, empty, or any
-	// value other than PayloadProcessingBackendPraxis means IPP
-	// (maas-controller), out of scope for this controller.
+	// tenantreconcile.AnnotationPayloadProcessingType). Default (absent or
+	// "praxis") means this controller owns praxis; set to
+	// PayloadProcessingBackendIPP to opt back into maas-controller legacy IPP.
 	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
 
 	// AnnotationPayloadProcessingStatus coordinates the payload-processing
@@ -107,10 +107,15 @@ const (
 	LabelManagedByAITenant = "maas.opendatahub.io/managed-by-aitenant"
 	LabelTenantName        = "maas.opendatahub.io/tenant-name"
 
-	// PayloadProcessingBackendPraxis is the only AnnotationPayloadProcessingType
-	// value that opts a tenant into this controller (mirrors
-	// maas-controller's tenantreconcile.PayloadProcessingTypePraxis).
+	// PayloadProcessingBackendPraxis is the AnnotationPayloadProcessingType
+	// value for the praxis dataplane (also the product default when the
+	// annotation is absent; mirrors maas-controller's
+	// tenantreconcile.PayloadProcessingTypePraxis).
 	PayloadProcessingBackendPraxis = "praxis"
+
+	// PayloadProcessingBackendIPP opts a tenant into maas-controller legacy
+	// IPP (mirrors maas-controller's tenantreconcile.PayloadProcessingTypeIPP).
+	PayloadProcessingBackendIPP = "ipp"
 
 	// AITenantPhaseActive is the AITenant status.phase value maas-controller's
 	// AITenant reconciler sets only after it has validated the tenant's

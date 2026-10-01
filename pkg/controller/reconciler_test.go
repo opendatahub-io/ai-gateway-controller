@@ -695,7 +695,7 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	if len(gotModel.Status.Conditions) < 2 {
 		t.Fatalf("expected Ready and OverlayDistributed conditions: %#v", gotModel.Status.Conditions)
 	}
-	ait.SetAnnotations(nil)
+	ait.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendIPP})
 	if err := r.Update(context.Background(), ait); err != nil {
 		t.Fatal(err)
 	}

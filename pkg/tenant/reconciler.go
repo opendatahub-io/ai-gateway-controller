@@ -49,11 +49,11 @@ const notReadyRequeueInterval = 10 * time.Second
 
 // Reconciler primarily watches MaasTenantConfig CRs (owned by
 // maas-controller) — mirroring maas-controller's own TenantReconciler — and,
-// for every tenant whose AnnotationPayloadProcessingType annotation is
-// "praxis", renders and SSA-applies a per-tenant copy of the vendored
-// praxis-extproc manifests into that tenant's Gateway namespace. Tenants
-// that don't opt into praxis (absent/empty/other) are ignored:
-// maas-controller's own TenantReconciler owns their IPP deployment.
+// for every tenant that UsesPraxis (default when AnnotationPayloadProcessingType
+// is absent or "praxis"), renders and SSA-applies a per-tenant copy of the
+// vendored praxis-extproc manifests into that tenant's Gateway namespace.
+// Tenants annotated with PayloadProcessingBackendIPP are ignored:
+// maas-controller's own TenantReconciler owns their legacy IPP deployment.
 //
 // Reconciler still Gets a tenant's owning AITenant (see
 // OwningAITenantRef / GatewayRef / IsActive) — status.gatewayRef and
