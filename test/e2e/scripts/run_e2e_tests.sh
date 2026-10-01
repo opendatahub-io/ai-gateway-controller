@@ -79,6 +79,9 @@ e2e_test_files=(
     "$TEST_DIR/tests/test_embedding_inference.py"
     # Sister to ExtProc-only ExternalModel dataplane (PR #52): start validation.
     "$TEST_DIR/tests/test_external_models.py"
+    # Gateway AuthPolicy api-keys-x-api-key via ExternalModel apiFormat=messages
+    # (MaaS #1506 / #1517). Skips when ExternalModel CRD is absent.
+    "$TEST_DIR/tests/test_x_api_key_auth.py"
 )
 
 resolved_extra_args=()
