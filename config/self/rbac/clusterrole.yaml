@@ -79,9 +79,6 @@ rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Lookup status.gatewayRef before praxis-extproc apply (pkg/tenant.gatewayExists;
-# mirrors maas-controller validateGatewayExists). get/list/watch only — this
-# controller never creates or mutates Gateway objects.
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways"]
   verbs: ["get", "list", "watch"]
