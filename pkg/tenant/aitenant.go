@@ -31,9 +31,8 @@ func NewAITenant() *unstructured.Unstructured {
 // IsActive reports whether maas-controller's AITenant reconciler has
 // finished validating and bootstrapping this tenant (status.phase ==
 // "Active": its Gateway is validated, and its namespace, MaasTenantConfig,
-// and RBAC exist). Used as the readiness gate instead of GatewayRef alone,
-// since status.gatewayRef is populated optimistically from spec before any
-// of that validation happens.
+// and RBAC exist). Used by ExternalModel pathways that wait on full tenant
+// readiness.
 func IsActive(aitenant *unstructured.Unstructured) bool {
 	phase, _, _ := unstructured.NestedString(aitenant.Object, "status", "phase")
 	return phase == AITenantPhaseActive
@@ -57,11 +56,6 @@ func GatewayRef(aitenant *unstructured.Unstructured) (name, namespace string, ok
 // equal metadata.generation; maas-controller stamps that on every phase
 // transition (setAITenantPhase), and AITenantStatus exposes no top-level
 // observedGeneration to rely on instead.
-//
-// Used together with IsActive as the readiness gate: acting on an Active phase
-// whose gatewayRef still reflects a superseded generation would install
-// praxis-extproc against a stale Gateway. A false result is a transient
-// not-ready state (requeue), not an error.
 func StatusIsCurrent(aitenant *unstructured.Unstructured) bool {
 	conditions, _, _ := unstructured.NestedSlice(aitenant.Object, "status", "conditions")
 	for _, entry := range conditions {

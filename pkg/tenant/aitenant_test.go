@@ -106,9 +106,8 @@ func TestStatusIsCurrent(t *testing.T) {
 	})
 
 	t.Run("generation currency is independent of ready status", func(t *testing.T) {
-		// StatusIsCurrent gates on generation only; IsActive (phase) covers
-		// the True/False dimension. A current-but-False condition is still
-		// "current".
+		// StatusIsCurrent gates on generation only. A current-but-False
+		// condition is still "current".
 		if !StatusIsCurrent(aitenantWithReady(2, 2, "False")) {
 			t.Fatal("StatusIsCurrent = false, want true when observedGeneration matches, regardless of condition status")
 		}
