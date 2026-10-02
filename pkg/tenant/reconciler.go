@@ -231,10 +231,10 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 
 // gatewayExists verifies the Gateway API object named by status.gatewayRef
 // is present.
-func gatewayExists(ctx context.Context, c client.Client, namespace, name string) error {
+func (r *Reconciler) gatewayExists(ctx context.Context, namespace, name string) error {
 	gw := &unstructured.Unstructured{}
 	gw.SetGroupVersionKind(gvkGateway)
-	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, gw); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, gw); err != nil {
 		if apierrors.IsNotFound(err) {
 			return fmt.Errorf("gateway %s/%s not found: the specified Gateway must exist before applying praxis-extproc", namespace, name)
 		}
@@ -259,9 +259,8 @@ func gatewayExists(ctx context.Context, c client.Client, namespace, name string)
 // status.gatewayRef this reconcile rendered against; or has a non-zero
 // deletionTimestamp (delete already in flight). An empty wantUID disables the
 // check, so a live object always carries a UID and only tests can opt out.
-// Active / StatusIsCurrent / phase Terminating are deliberately not checked
-// here (legacy IPP parity). This guards the apply path only: delete/cleanup
-// must run regardless of identity (see resolveOwnedAITenant).
+// This guards the apply path only: delete/cleanup must run regardless of
+// identity (see resolveOwnedAITenant).
 func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string) (bool, error) {
 	if wantUID == "" {
 		return true, nil
@@ -283,8 +282,8 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	}
 	// Terminating: the owner's delete/cleanup is already in flight, so a fresh
 	// apply would provision for a tenant on its way out. deletionTimestamp is the
-	// only signal that flips here — uid/bind/active/current/gatewayRef can all
-	// still pass while the object is finalizing.
+	// signal — uid/bind/gatewayRef can all still pass while the object is
+	// finalizing.
 	if !aitenant.GetDeletionTimestamp().IsZero() {
 		return false, nil
 	}
@@ -330,7 +329,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		log.Info("owning AITenant status.gatewayRef is not populated; will retry")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
-	if err := gatewayExists(ctx, r.Client, gatewayNamespace, gatewayName); err != nil {
+	if err := r.gatewayExists(ctx, gatewayNamespace, gatewayName); err != nil {
 		log.Info("owning AITenant gatewayRef Gateway object is not ready; will retry", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
