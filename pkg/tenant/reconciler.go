@@ -362,6 +362,14 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the tenant changes")
 		return ctrl.Result{}, nil
 	}
+	if err := ApplyWorkloadResources(
+		resources,
+		tenantID,
+		PayloadProcessingResources(mtc),
+		PayloadPreProcessingResources(mtc),
+	); err != nil {
+		return ctrl.Result{}, fmt.Errorf("apply MaasTenantConfig workload resources: %w", err)
+	}
 	tenantNamespace := mtc.GetNamespace()
 	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace)
 	if err != nil {
