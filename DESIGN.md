@@ -235,13 +235,12 @@ doc comment for the full state machine this mirrors. In short:
   renders and applies a dedicated, per-tenant-named copy of the
   praxis-extproc resources (`{base}-{tenantID}`, the default/legacy tenant
   keeps the unsuffixed names) into that tenant's owning `AITenant`'s
-  `status.gatewayRef` namespace, once that `AITenant`'s `status.phase` is
-  `Active`. A secondary `AITenant` watch reacts to gatewayRef/phase changes
-  that a `MaasTenantConfig`-only watch would miss. Tenants that don't opt in
-  (absent/empty/other) are untouched — `maas-controller`'s own
-  `TenantReconciler` owns their IPP deployment. There is no
-  unconditional/default install anymore: a tenant gets praxis-extproc only
-  by opting in via its `MaasTenantConfig`.
+  `status.gatewayRef` namespace once `status.gatewayRef` is populated, the
+  referenced Gateway object exists, and the payload-processing handshake
+  allows deploy (`cleanup-complete` / `steady`). A secondary `AITenant` watch reacts
+  to gatewayRef/phase changes that a `MaasTenantConfig`-only watch would
+  miss. Tenants that don't opt in (absent/empty/other) are untouched —
+  `maas-controller`'s own `TenantReconciler` owns their IPP deployment.
   `PraxisCleanupFinalizer` (on `MaasTenantConfig`) deletes a tenant's
   praxis-extproc resources when it switches away from `praxis` or its
   `MaasTenantConfig` is deleted; `--deletion-timeout` bounds how long that
@@ -342,11 +341,6 @@ alone:
 
 ## Open questions (non-blocking, tracked)
 
-- `pkg/tenant.Reconciler` does not write any status
-  (condition/phase) on `MaasTenantConfig` or `AITenant` reflecting whether
-  the per-tenant praxis-extproc install succeeded — maas-controller's own
-  reconcilers own `status` on both objects today, so this would need a
-  careful merge strategy, not a blind `Status().Update()`.
 - A computed per-tenant resource name over 63 characters (possible even
   within the CRD's 41-character `AITenant` name limit, since that limit
   was sized against maas-controller's own longest base name, not

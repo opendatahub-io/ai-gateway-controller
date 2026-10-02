@@ -114,10 +114,7 @@ const (
 
 	// AITenantPhaseActive is the AITenant status.phase value maas-controller's
 	// AITenant reconciler sets only after it has validated the tenant's
-	// Gateway, and created its namespace, MaasTenantConfig, and RBAC. Used
-	// as the readiness gate before installing praxis-extproc: status.gatewayRef
-	// alone is not sufficient, since AITenantReconciler populates it
-	// optimistically (from spec, unvalidated) before that work happens.
+	// Gateway, and created its namespace, MaasTenantConfig, and RBAC.
 	AITenantPhaseActive = "Active"
 
 	// AITenantConditionReady is the AITenant status condition type
@@ -199,4 +196,5 @@ var (
 	gvkEnvoyFilter        = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
 	gvkDestinationRule    = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 	gvkClusterRoleBinding = schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"}
+	gvkGateway            = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
 )
