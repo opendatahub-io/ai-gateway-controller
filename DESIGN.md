@@ -14,13 +14,7 @@ end-to-end into a live `ai-gateway-operator` reconcile (see "Out of scope").
 **Phase 2 (EA2):** the multi-tenant Praxis-vs-IPP fan-out and ExternalModel
 control plane are implemented. `pkg/tenant` primarily watches
 `MaasTenantConfig` — mirroring
-maas-controller's own `TenantReconciler` — and, for every tenant whose
-`metadata.annotations["maas.opendatahub.io/payload-processing-type"]` is
-`"praxis"`, renders, SSA-applies, and (on switch-away or deletion) cleans
-up a per-tenant copy of the vendored `praxis-extproc` manifests — replacing
-Phase 1's single unconditional global install. `pkg/controller` reconciles
-`ExternalModel` / `ExternalProvider` resources into the tenant-local ExtProc
-overlay, credential projections, and Envoy-owned provider transport.
+maas-controller's own `TenantReconciler` — and, for every tenant that selects Praxis (the product default: annotation absent, `"praxis"`, or any unrecognized value), renders, SSA-applies, and (on switch-away or deletion) cleans up a per-tenant copy of the vendored `praxis-extproc` manifests. Tenants annotated `maas.opendatahub.io/payload-processing-type=ipp` stay on maas-controller legacy IPP. `pkg/controller` reconciles `ExternalModel` / `ExternalProvider` resources into the tenant-local ExtProc overlay, credential projections, and Envoy-owned provider transport.
 
 ## Purpose
 
@@ -48,7 +42,8 @@ dataplane. 3.5 ships only `maas-controller` + IPP; see
 manifests only.
 
 **Phase 2 (EA2, implemented)** primarily watches `MaasTenantConfig` and, per
-opted-in tenant, applies and cleans up its own per-tenant ExtProc resources.
+Praxis tenant (default), applies and cleans up its own per-tenant ExtProc
+resources. Legacy IPP is an explicit `ipp` opt-back.
 It also watches `ExternalModel` / `ExternalProvider` and publishes dynamic
 per-model routing, provider transport, and reference-only credentials.
 
@@ -115,8 +110,10 @@ flowchart TD
   - **`ai-gateway-controller`** — deployment and reconciling of external models (per-model config generation, formerly in IPP).
   - **Praxis (`praxis-extproc`)** — ExtProc dataplane only.
 - **`MaasTenantConfig` selects the dataplane backend per tenant (EA2 / Phase 2, implemented):**
-  - `MaasTenantConfig.metadata.annotations["maas.opendatahub.io/payload-processing-type"] == "praxis"` chooses **Praxis** (via `ai-gateway-controller`'s `pkg/tenant`) vs **IPP** (`payload-processing`, legacy MaaS path, the default when the annotation is absent/other). This annotation lives only on `MaasTenantConfig` — it is never mirrored to/from `AITenant` — so both controllers always read the same single source of truth from the same object they both watch.
-  - Lets 3.6 support both backends during the Praxis migration, one tenant at a time, with a race-free handoff (see [Approach](#approach)) when a tenant swaps backends.
+  - Selection lives only on `MaasTenantConfig.metadata.annotations["maas.opendatahub.io/payload-processing-type"]` — both controllers always read the same single source of truth from the same object they both watch.
+  - **Default is Praxis:** absent, empty, `"praxis"`, or any unrecognized value → this controller's `pkg/tenant` installs `praxis-extproc` and maas-controller skips legacy IPP (`SkipIPP`).
+  - **Explicit opt-back to legacy IPP:** `"ipp"` → maas-controller deploys `payload-processing`; this controller does not apply Praxis (and cleans up if it previously owned the names).
+  - Lets 3.6 support both backends during the Praxis migration, one tenant at a time, with a race-free handoff (see [Approach](#approach)) when a tenant swaps backends. New and unannotated tenants land on Praxis without an opt-in annotation.
 - **Multi-tenancy works the same way it does today:**
   - `MaasTenantConfig` / `AITenant` fan-out drives per-tenant namespaces, gateway binding, and dataplane install — no change to the tenancy model, only which ExtProc backend is selected.
 - **Split of responsibilities:**
@@ -145,7 +142,8 @@ This repo combines both: pinned-commit vendoring into
 manager (no `opendatahub-operator/v2` dependency) that primarily watches
 `MaasTenantConfig` (`pkg/tenant`) — mirroring maas-controller's own
 `TenantReconciler`, which watches the same object — and, for every tenant
-whose payload-processing annotation is `praxis`, does kustomize build →
+that UsesPraxis (default when the payload-processing annotation is absent
+or `praxis`; not when it is `ipp`), does kustomize build →
 placeholder post-render → per-tenant rename/patch → SSA apply into that
 tenant's Gateway namespace. Both controllers watching the same primary
 object (rather than `ai-gateway-controller` watching `AITenant` while
@@ -230,20 +228,19 @@ doc comment for the full state machine this mirrors. In short:
 
 - **Implemented:** `pkg/tenant` primarily watches `MaasTenantConfig`
   (`maas.opendatahub.io/v1alpha1`) — mirroring maas-controller's own
-  `TenantReconciler` — and, for every tenant whose
-  `maas.opendatahub.io/payload-processing-type` annotation is `praxis`,
+  `TenantReconciler` — and, for every tenant that UsesPraxis (absent /
+  `"praxis"` / unrecognized `maas.opendatahub.io/payload-processing-type`),
   renders and applies a dedicated, per-tenant-named copy of the
   praxis-extproc resources (`{base}-{tenantID}`, the default/legacy tenant
   keeps the unsuffixed names) into that tenant's owning `AITenant`'s
   `status.gatewayRef` namespace, once that `AITenant`'s `status.phase` is
   `Active`. A secondary `AITenant` watch reacts to gatewayRef/phase changes
-  that a `MaasTenantConfig`-only watch would miss. Tenants that don't opt in
-  (absent/empty/other) are untouched — `maas-controller`'s own
-  `TenantReconciler` owns their IPP deployment. There is no
-  unconditional/default install anymore: a tenant gets praxis-extproc only
-  by opting in via its `MaasTenantConfig`.
+  that a `MaasTenantConfig`-only watch would miss. Tenants annotated
+  `payload-processing-type=ipp` are untouched for apply — `maas-controller`'s
+  own `TenantReconciler` owns their IPP deployment — and this controller
+  cleans up Praxis resources if it previously owned them.
   `PraxisCleanupFinalizer` (on `MaasTenantConfig`) deletes a tenant's
-  praxis-extproc resources when it switches away from `praxis` or its
+  praxis-extproc resources when it switches to `ipp` or its
   `MaasTenantConfig` is deleted; `--deletion-timeout` bounds how long that
   retries before force-removing the finalizer without confirmed cleanup.
   This controller does not write any `AITenant` at all (status or
