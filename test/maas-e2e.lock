@@ -1,11 +1,7 @@
-# Pinned models-as-a-service source for ai-gateway-controller e2e.
-#
-# Includes the rate-group TRLP contract and subscription-deletion test.
-#
-# Validate e2e when bumping this pin.
-# Override for one-off runs without editing this file:
-#   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+# Pin for ai-gateway-controller e2e (models-as-a-service).
+# Includes payloadPreProcessing config + resource override E2E (RHOAIENG-97731 / PR #1602).
+# Override for one-off runs: MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
 maas_repo=https://github.com/opendatahub-io/models-as-a-service
-maas_commit=26e3116f6ddbe50a73fe9c31b61fbd6d3c817411
-maas_ref=main
-updated_at=2026-09-27T03:55:47Z
+maas_commit=8f33c1507207e928a87d2264397c3555b6753463
+maas_ref=feat/payload-pre-processing-config
+updated_at=2026-10-02T15:45:55Z
