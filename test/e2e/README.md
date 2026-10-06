@@ -5,6 +5,11 @@ MaaS pytest suite is **not vendored** in this repo. `prow_run_ai_gateway_control
 **Orchestration (this repo):** `test/e2e/scripts/`  
 **Tests + fixtures (MaaS checkout):** `test/maas-e2e/test/e2e/`
 
+Before deploying the controller, e2e setup installs this checkout's `config/crd`
+package and waits for its CRDs to become established. Kubernetes validates the
+schemas and CEL rules during installation; a rejection stops deployment and
+fails the test run. Production CRD installation remains owned by the operator.
+
 See [TODO.md](TODO.md) for excluded tests and upstream gaps.
 
 ```bash

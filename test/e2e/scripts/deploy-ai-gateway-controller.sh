@@ -179,6 +179,15 @@ _delete_legacy_ipp_in_gateway_namespace() {
 }
 
 _apply_ai_gateway_controller() {
+  # Install this checkout's schemas so API admission checks their CEL rules.
+  # The operator's installed CRDs may come from an older component revision.
+  local applied_crds
+  local -a crd_resources
+  echo "Installing ai-gateway-controller CRDs ..."
+  applied_crds="$(oc apply --server-side -k "${PROJECT_ROOT}/config/crd" -o name)"
+  mapfile -t crd_resources <<< "$applied_crds"
+  oc wait --for=condition=Established --timeout=60s "${crd_resources[@]}"
+
   local work_dir
   work_dir="$(mktemp -d -t aigc-kustomize.XXXXXXXXXX)"
 

@@ -70,7 +70,7 @@ type AIGuardrailProvider struct {
 
 	// Timeout is the maximum duration for an individual provider call.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:XValidation:rule="isDuration(self) && duration(self) > duration('0s')",message="timeout must be a valid positive duration"
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="timeout must be a valid positive duration"
 	Timeout metav1.Duration `json:"timeout"`
 }
 
