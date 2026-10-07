@@ -39,11 +39,114 @@ func aitenantFixture(phase, gatewayName, gatewayNamespace string) *unstructured.
 	return u
 }
 
+// aitenantWithReady builds an AITenant carrying the AITenantConditionReady
+// condition maas-controller writes alongside status.phase, with an explicit
+// metadata.generation and the condition's observedGeneration.
+func aitenantWithReady(phase string, generation, observedGeneration int64, readyStatus string) *unstructured.Unstructured {
+	u := NewAITenant()
+	u.SetGeneration(generation)
+	u.Object["status"] = map[string]any{
+		"phase": phase,
+		"conditions": []any{
+			map[string]any{
+				"type":               AITenantConditionReady,
+				"status":             readyStatus,
+				"observedGeneration": observedGeneration,
+			},
+		},
+	}
+	return u
+}
+
 func TestNewAITenantSetsGVK(t *testing.T) {
 	u := NewAITenant()
 	if got := u.GroupVersionKind(); got != AITenantGVK {
 		t.Fatalf("GVK = %v, want %v", got, AITenantGVK)
 	}
+}
+
+func TestIsFailed(t *testing.T) {
+	if IsFailed(aitenantFixture("Pending", "", "")) {
+		t.Fatal("IsFailed(Pending) = true, want false")
+	}
+	if !IsFailed(aitenantFixture(AITenantPhaseFailed, "", "")) {
+		t.Fatal("IsFailed(Failed) = false, want true")
+	}
+}
+
+func TestStatusIsCurrent(t *testing.T) {
+	t.Run("no conditions", func(t *testing.T) {
+		if StatusIsCurrent(aitenantFixture("Active", "", "")) {
+			t.Fatal("StatusIsCurrent = true, want false when there are no conditions")
+		}
+	})
+
+	t.Run("ready observedGeneration matches generation", func(t *testing.T) {
+		if !StatusIsCurrent(aitenantWithReady("Pending", 3, 3, "False")) {
+			t.Fatal("StatusIsCurrent = false, want true when Ready observedGeneration == generation")
+		}
+	})
+
+	t.Run("ready observedGeneration lags generation", func(t *testing.T) {
+		if StatusIsCurrent(aitenantWithReady("Active", 4, 3, "True")) {
+			t.Fatal("StatusIsCurrent = true, want false when Ready observedGeneration < generation")
+		}
+	})
+
+	t.Run("generation currency is independent of ready status", func(t *testing.T) {
+		if !StatusIsCurrent(aitenantWithReady("Pending", 2, 2, "False")) {
+			t.Fatal("StatusIsCurrent = false, want true when observedGeneration matches, regardless of condition status")
+		}
+	})
+
+	t.Run("only a non-ready condition present", func(t *testing.T) {
+		u := NewAITenant()
+		u.SetGeneration(2)
+		u.Object["status"] = map[string]any{
+			"conditions": []any{
+				map[string]any{"type": "SomethingElse", "observedGeneration": int64(2)},
+			},
+		}
+		if StatusIsCurrent(u) {
+			t.Fatal("StatusIsCurrent = true, want false when there is no Ready condition")
+		}
+	})
+
+	t.Run("observedGeneration decoded as float64", func(t *testing.T) {
+		u := NewAITenant()
+		u.SetGeneration(5)
+		u.Object["status"] = map[string]any{
+			"phase": "Active",
+			"conditions": []any{
+				map[string]any{
+					"type":               AITenantConditionReady,
+					"status":             "True",
+					"observedGeneration": float64(5),
+				},
+			},
+		}
+		if !StatusIsCurrent(u) {
+			t.Fatal("StatusIsCurrent = false, want true when observedGeneration is a float64 matching generation")
+		}
+	})
+}
+
+func TestDeployReady(t *testing.T) {
+	t.Run("pending current", func(t *testing.T) {
+		if !DeployReady(aitenantWithReady("Pending", 1, 1, "False")) {
+			t.Fatal("DeployReady(Pending, current) = false, want true")
+		}
+	})
+	t.Run("failed current", func(t *testing.T) {
+		if DeployReady(aitenantWithReady(AITenantPhaseFailed, 1, 1, "False")) {
+			t.Fatal("DeployReady(Failed, current) = true, want false")
+		}
+	})
+	t.Run("active stale", func(t *testing.T) {
+		if DeployReady(aitenantWithReady(AITenantPhaseActive, 2, 1, "True")) {
+			t.Fatal("DeployReady(Active, stale) = true, want false")
+		}
+	})
 }
 
 func TestGatewayRefNotReadyWhenUnset(t *testing.T) {

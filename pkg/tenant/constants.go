@@ -123,11 +123,17 @@ const (
 	// Gateway, and created its namespace, MaasTenantConfig, and RBAC.
 	AITenantPhaseActive = "Active"
 
+	// AITenantPhaseFailed is status.phase when maas-controller cannot finish
+	// bootstrap (including GatewayClaimFailed). gatewayRef may still name the
+	// contested gateway; DeployReady rejects Failed.
+	AITenantPhaseFailed = "Failed"
+
 	// AITenantConditionReady is the AITenant status condition type
 	// maas-controller's AITenant reconciler stamps together with status.phase
 	// (mirrors maasv1alpha1.AITenantConditionReady, set by
-	// AITenantReconciler.setAITenantPhase). Fixtures may include it for
-	// realism.
+	// AITenantReconciler.setAITenantPhase), carrying ObservedGeneration set to
+	// the AITenant's metadata.generation. StatusIsCurrent / DeployReady use
+	// that stamp so phase and gatewayRef are only trusted for the live spec.
 	AITenantConditionReady = "Ready"
 
 	// PraxisCleanupFinalizer is added to every MaasTenantConfig this controller

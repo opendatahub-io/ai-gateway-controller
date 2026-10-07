@@ -438,6 +438,16 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		}
 		return modelTenantContext{}, false, nil
 	}
+	// DeployReady (current Ready stamp, not Failed) — not Active. maas writes
+	// gatewayRef before the exclusive gateway claim; Failed/GatewayClaimFailed
+	// still publishes the contested ref. Pending with a current stamp is enough
+	// so ExternalModel publish does not wait on Active↔MTC Ready.
+	if !tenant.DeployReady(ait) {
+		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is not ready for ExternalModel publish (Failed or status not current for this generation)", nil); err != nil {
+			return modelTenantContext{}, false, err
+		}
+		return modelTenantContext{}, false, nil
+	}
 	if handled, err := r.handleModelLifecycle(ctx, model, ait); handled {
 		return modelTenantContext{}, false, err
 	} else if err != nil {
@@ -498,7 +508,7 @@ func (r *Reconciler) reconcileDeletingModel(ctx context.Context, model *v1alpha1
 		live.status != tenant.PayloadProcessingStatusSteady {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
-	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready {
+	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready || !tenant.DeployReady(live.aitenant) {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
 	return r.reconcileDeletedModel(ctx, model, live.aitenant)
@@ -838,7 +848,7 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 		return false, nil
 	}
 	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)
-	return ok && gatewayName == want.gatewayName && gatewayNamespace == want.gatewayNamespace, nil
+	return ok && tenant.DeployReady(live.aitenant) && gatewayName == want.gatewayName && gatewayNamespace == want.gatewayNamespace, nil
 }
 
 // praxisTenantForNamespace is retained for callers/tests that need the

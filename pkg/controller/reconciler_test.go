@@ -680,8 +680,8 @@ func TestTenantModelsMapsStatusNamespace(t *testing.T) {
 }
 
 // TestReconcilePendingPraxisTenantWithGatewayRefPublishes asserts ExternalModel
-// publish does not wait for AITenant Active (maas-controller parity): Pending +
-// gatewayRef + steady is enough.
+// publish does not wait for AITenant Active: Pending + current Ready stamp +
+// gatewayRef + steady is enough (DeployReady).
 func TestReconcilePendingPraxisTenantWithGatewayRefPublishes(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
@@ -703,10 +703,9 @@ func TestReconcilePendingPraxisTenantWithGatewayRefPublishes(t *testing.T) {
 		t.Fatal("AITenant fixture status is not an object")
 	}
 	status["phase"] = "Pending"
-	// Stale Ready observedGeneration must also not block publish.
 	if conditions, ok := status["conditions"].([]any); ok && len(conditions) > 0 {
 		if cond, ok := conditions[0].(map[string]any); ok {
-			cond["observedGeneration"] = int64(0)
+			cond["status"] = string(metav1.ConditionFalse)
 		}
 	}
 	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
@@ -729,8 +728,79 @@ func TestReconcilePendingPraxisTenantWithGatewayRefPublishes(t *testing.T) {
 	}
 	for _, condition := range got.Status.Conditions {
 		if condition.Reason == reasonTenantNotReady {
-			t.Fatalf("conditions = %#v, must not report %q when gatewayRef is ready", got.Status.Conditions, reasonTenantNotReady)
+			t.Fatalf("conditions = %#v, must not report %q when DeployReady", got.Status.Conditions, reasonTenantNotReady)
 		}
+	}
+}
+
+func TestReconcileFailedAITenantDoesNotPublish(t *testing.T) {
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalModelSpec{ModelName: "client-model"},
+	}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	status, ok := ait.Object["status"].(map[string]any)
+	if !ok {
+		t.Fatal("AITenant fixture status is not an object")
+	}
+	status["phase"] = tenant.AITenantPhaseFailed
+	if conditions, ok := status["conditions"].([]any); ok && len(conditions) > 0 {
+		if cond, ok := conditions[0].(map[string]any); ok {
+			cond["status"] = string(metav1.ConditionFalse)
+			cond["reason"] = "GatewayClaimFailed"
+		}
+	}
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, model, ait, mtc)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("Failed AITenant overlay lookup error = %v, want NotFound", err)
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Fatalf("phase = %q, want Failed", got.Status.Phase)
+	}
+	var foundTenantNotReady bool
+	for _, condition := range got.Status.Conditions {
+		if condition.Reason == reasonTenantNotReady {
+			foundTenantNotReady = true
+		}
+	}
+	if !foundTenantNotReady {
+		t.Fatalf("conditions = %#v, want reason %q", got.Status.Conditions, reasonTenantNotReady)
+	}
+}
+
+func TestReconcileStaleAITenantStatusDoesNotPublish(t *testing.T) {
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalModelSpec{ModelName: "client-model"},
+	}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	ait.SetGeneration(2)
+	status, ok := ait.Object["status"].(map[string]any)
+	if !ok {
+		t.Fatal("AITenant fixture status is not an object")
+	}
+	if conditions, ok := status["conditions"].([]any); ok && len(conditions) > 0 {
+		if cond, ok := conditions[0].(map[string]any); ok {
+			cond["observedGeneration"] = int64(1)
+		}
+	}
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, model, ait, mtc)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale AITenant overlay lookup error = %v, want NotFound", err)
 	}
 }
 

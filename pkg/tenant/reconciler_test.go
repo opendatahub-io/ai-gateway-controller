@@ -171,9 +171,9 @@ func withMTCFinalizer(u *unstructured.Unstructured) *unstructured.Unstructured {
 //
 // When phase is set it also emits the AITenantConditionReady condition
 // maas-controller writes alongside status.phase (setAITenantPhase), with
-// observedGeneration equal to metadata.generation (0 by default). Deploy
-// does not gate on that condition; withStaleReadyGeneration exists to
-// assert a lagged Ready still allows apply.
+// observedGeneration equal to metadata.generation (0 by default) so
+// DeployReady / StatusIsCurrent see a status computed for the current
+// generation. Use withStaleReadyGeneration to simulate a lagging status.
 func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, tenantConfigNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
 	u.SetName(name)
@@ -206,7 +206,8 @@ func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, ten
 // withStaleReadyGeneration bumps metadata.generation above the Ready
 // condition's observedGeneration, simulating an in-flight spec change
 // maas-controller has not reconciled yet (status.phase / gatewayRef still
-// reflect the prior generation).
+// reflect the prior generation). StatusIsCurrent / DeployReady treat it as
+// not ready.
 func withStaleReadyGeneration(u *unstructured.Unstructured) *unstructured.Unstructured {
 	u.SetGeneration(u.GetGeneration() + 1)
 	return u
@@ -447,11 +448,10 @@ func TestReconcileRequeuesWhenGatewayObjectMissing(t *testing.T) {
 	}
 }
 
-// TestReconcileAppliesWhenAITenantStatusIsStale asserts praxis apply is not
-// gated on Ready observedGeneration (legacy IPP parity): a lagged Ready
-// must not block install when gatewayRef and Gateway exist.
-func TestReconcileAppliesWhenAITenantStatusIsStale(t *testing.T) {
-	requireManifests(t)
+// TestReconcileRequeuesWhenAITenantStatusIsStale asserts praxis apply waits
+// for StatusIsCurrent: a lagged Ready observedGeneration means gatewayRef
+// may still describe the prior generation (e.g. mid re-home before claim).
+func TestReconcileRequeuesWhenAITenantStatusIsStale(t *testing.T) {
 	scheme := mtcSchemeForTests()
 	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
 	aitenant := withStaleReadyGeneration(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns"))
@@ -463,22 +463,47 @@ func TestReconcileAppliesWhenAITenantStatusIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != time.Hour {
-		t.Fatalf("RequeueAfter = %v, want ResyncInterval after apply despite stale Ready observedGeneration", res.RequeueAfter)
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
 	}
-	patched, _, _ := rec.snapshot()
-	if len(patched) == 0 {
-		t.Fatal("expected praxis-extproc apply even when AITenant Ready observedGeneration is stale")
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no apply while Ready observedGeneration is stale, got patched=%v deleted=%v", patched, deleted)
+	}
+}
+
+// TestReconcileRequeuesWhenAITenantFailed asserts GatewayClaimFailed (and
+// other Failed phases) do not get praxis-extproc even though gatewayRef is
+// populated — maas writes the ref before the exclusive claim.
+func TestReconcileRequeuesWhenAITenantFailed(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseFailed, "my-gateway", "tenant-ns", "tenant-ns")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no apply while AITenant is Failed, got patched=%v deleted=%v", patched, deleted)
 	}
 }
 
 // TestAITenantStillValidForApply covers the RHAI-2514 apply-path fence helper:
 // the live re-read must confirm the owning AITenant is still the same object
-// (metadata.uid), still binds this MaasTenantConfig, and still publishes the
-// gatewayRef this reconcile rendered against. A delete+recreate (new UID), a
-// re-home (new gatewayRef), a lost ownership bind, or an owner whose delete is
-// in flight (deletionTimestamp set) must be rejected. Terminating phase /
-// stale Ready observedGeneration are *not* reject reasons (legacy IPP parity).
+// (metadata.uid), still binds this MaasTenantConfig, still publishes the
+// gatewayRef this reconcile rendered against, and is still DeployReady. A
+// delete+recreate (new UID), a re-home (new gatewayRef), a lost ownership
+// bind, an owner whose delete is in flight, Failed, or a stale Ready stamp
+// must be rejected. Terminating phase alone (without deletionTimestamp) is
+// still accepted if DeployReady holds.
 func TestAITenantStillValidForApply(t *testing.T) {
 	scheme := mtcSchemeForTests()
 	mtc := newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")
@@ -508,7 +533,8 @@ func TestAITenantStillValidForApply(t *testing.T) {
 		{"matching uid, active, gateway matches", []client.Object{mtc, ownerWithUID("uid-1")}, mtc, "uid-1", true},
 		{"matching uid, pending, gateway matches", []client.Object{mtc, ownerWith("uid-1", "Pending", "my-gateway")}, mtc, "uid-1", true},
 		{"matching uid, terminating, gateway matches", []client.Object{mtc, ownerWith("uid-1", "Terminating", "my-gateway")}, mtc, "uid-1", true},
-		{"matching uid, stale generation, gateway matches", []client.Object{mtc, withStaleReadyGeneration(ownerWithUID("uid-1"))}, mtc, "uid-1", true},
+		{"matching uid, stale generation, gateway matches", []client.Object{mtc, withStaleReadyGeneration(ownerWithUID("uid-1"))}, mtc, "uid-1", false},
+		{"matching uid, failed, gateway matches", []client.Object{mtc, ownerWith("uid-1", AITenantPhaseFailed, "my-gateway")}, mtc, "uid-1", false},
 		{"uid changed (recreate)", []client.Object{mtc, ownerWithUID("uid-2")}, mtc, "uid-1", false},
 		{"owning AITenant gone", []client.Object{mtc}, mtc, "uid-1", false},
 		{"no owning-ref annotations", []client.Object{ownerWithUID("uid-1")}, newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "", ""), "uid-1", false},
