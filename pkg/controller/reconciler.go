@@ -438,12 +438,6 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		}
 		return modelTenantContext{}, false, nil
 	}
-	if !tenant.IsActive(ait) || !tenant.StatusIsCurrent(ait) {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
-			return modelTenantContext{}, false, err
-		}
-		return modelTenantContext{}, false, nil
-	}
 	if handled, err := r.handleModelLifecycle(ctx, model, ait); handled {
 		return modelTenantContext{}, false, err
 	} else if err != nil {
@@ -501,8 +495,7 @@ func (r *Reconciler) reconcileDeletingModel(ctx context.Context, model *v1alpha1
 	}
 	if live.missingConfig || live.mtc == nil || live.aitenant == nil ||
 		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
-		live.status != tenant.PayloadProcessingStatusSteady || !tenant.IsActive(live.aitenant) ||
-		!tenant.StatusIsCurrent(live.aitenant) {
+		live.status != tenant.PayloadProcessingStatusSteady {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
 	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready {
@@ -842,9 +835,6 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 		return false, nil
 	}
 	if want.aitenantUID != "" && live.aitenant.GetUID() != want.aitenantUID {
-		return false, nil
-	}
-	if !tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
 		return false, nil
 	}
 	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)

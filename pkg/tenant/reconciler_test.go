@@ -171,9 +171,9 @@ func withMTCFinalizer(u *unstructured.Unstructured) *unstructured.Unstructured {
 //
 // When phase is set it also emits the AITenantConditionReady condition
 // maas-controller writes alongside status.phase (setAITenantPhase), with
-// observedGeneration equal to metadata.generation (0 by default), so the
-// StatusIsCurrent generation fence sees a status computed for the current
-// generation. Use withStaleReadyGeneration to simulate a lagging status.
+// observedGeneration equal to metadata.generation (0 by default). Deploy
+// does not gate on that condition; withStaleReadyGeneration exists to
+// assert a lagged Ready still allows apply.
 func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, tenantConfigNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
 	u.SetName(name)
@@ -206,7 +206,7 @@ func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, ten
 // withStaleReadyGeneration bumps metadata.generation above the Ready
 // condition's observedGeneration, simulating an in-flight spec change
 // maas-controller has not reconciled yet (status.phase / gatewayRef still
-// reflect the prior generation). StatusIsCurrent must treat it as not ready.
+// reflect the prior generation).
 func withStaleReadyGeneration(u *unstructured.Unstructured) *unstructured.Unstructured {
 	u.SetGeneration(u.GetGeneration() + 1)
 	return u
@@ -448,8 +448,8 @@ func TestReconcileRequeuesWhenGatewayObjectMissing(t *testing.T) {
 }
 
 // TestReconcileAppliesWhenAITenantStatusIsStale asserts praxis apply is not
-// gated on StatusIsCurrent (legacy IPP parity): a lagged Ready
-// observedGeneration must not block install when gatewayRef and Gateway exist.
+// gated on Ready observedGeneration (legacy IPP parity): a lagged Ready
+// must not block install when gatewayRef and Gateway exist.
 func TestReconcileAppliesWhenAITenantStatusIsStale(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()

@@ -192,9 +192,9 @@ cross-object propagation lag between them.
 `MaasTenantConfig`, so this controller also Gets a tenant's owning `AITenant`
 (via the `aitenant-name`/`aitenant-namespace` annotations maas-controller's
 own `AITenantReconciler` already stamps onto every AITenant-managed
-`MaasTenantConfig`) and gates apply on `status.phase == "Active"` there, so
-nothing is applied before maas-controller has actually validated the
-Gateway and finished bootstrapping the tenant. Both CRDs are read as
+`MaasTenantConfig`) and gates apply on a populated `status.gatewayRef` (plus
+Gateway existence / handshake for praxis-extproc, and `steady` for
+ExternalModel publish). Both CRDs are read as
 `unstructured.Unstructured` against hardcoded `schema.GroupVersionKind`s
 rather than by importing `models-as-a-service/maas-controller`'s Go types:
 that module's `go.mod` pulls in `kserve`, `knative`, `KEDA`, `openshift/api`,
@@ -278,8 +278,7 @@ doc comment for the full state machine this mirrors. In short:
   keeps the unsuffixed names) into that tenant's owning `AITenant`'s
   `status.gatewayRef` namespace once `status.gatewayRef` is populated, the
   referenced Gateway object exists, and the payload-processing handshake
-  allows deploy (`cleanup-complete` / `steady`) — matching maas-controller
-  legacy IPP deploy gates (no wait on AITenant Active / Ready). A secondary
+  allows deploy (`cleanup-complete` / `steady`). A secondary
   `AITenant` watch reacts to gatewayRef/phase changes that a
   `MaasTenantConfig`-only watch would miss. Tenants explicitly set to `ipp`
   are untouched — `maas-controller`'s own `TenantReconciler` owns their IPP
@@ -372,7 +371,7 @@ ai-gateway-controller/
 ├── pkg/tenant/                          # per-tenant MaasTenantConfig -> praxis-extproc fan-out (Phase 2)
 │   ├── constants.go, naming.go          # MaasTenantConfigGVK, AITenantGVK, base resource names, "{base}-{tenantID}" naming
 │   ├── maastenantconfig.go              # unstructured MaasTenantConfig field accessors (no Go type import)
-│   ├── aitenant.go                      # unstructured AITenant field accessors (status.gatewayRef / status.phase only)
+│   ├── aitenant.go                      # unstructured AITenant field accessors (status.gatewayRef)
 │   ├── migration.go                     # payload-processing backend swap handshake (existence-check + CAS claim)
 │   ├── ownership.go                     # field-manager/label ownership check for cleanup deletes
 │   ├── rename.go                        # Rename(): per-tenant resource rename + internal-reference patch
