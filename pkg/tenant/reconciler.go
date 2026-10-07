@@ -221,13 +221,15 @@ func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured
 }
 
 // resolveOwningAITenant is resolveOwnedAITenant plus a readiness bool for
-// the praxis apply path.
+// the praxis apply path. ready follows DeployReady: current Ready
+// observedGeneration and not Failed. maas writes status.gatewayRef before the
+// exclusive gateway claim, so gatewayRef alone is not enough.
 func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
 	aitenant, err = r.resolveOwnedAITenant(ctx, mtc)
 	if err != nil || aitenant == nil {
 		return aitenant, false, err
 	}
-	return aitenant, true, nil
+	return aitenant, DeployReady(aitenant), nil
 }
 
 // gatewayExists verifies the Gateway API object named by status.gatewayRef
@@ -304,6 +306,11 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	if !gwReady || gwName != wantGatewayName || gwNamespace != wantGatewayNamespace {
 		return false, nil
 	}
+	// Re-check DeployReady live: a GatewayClaimFailed (or stale Ready stamp)
+	// that landed after resolve must not proceed to apply.
+	if !DeployReady(aitenant) {
+		return false, nil
+	}
 	return true, nil
 }
 
@@ -321,7 +328,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not resolvable yet; will retry")
+		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not DeployReady yet (missing/Failed/stale Ready stamp); will retry")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
