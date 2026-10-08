@@ -143,6 +143,47 @@ ensure_gateway_allows_model_namespace() {
         patch_gateway_allowed_routes "${GATEWAY_NAME}" "${GATEWAY_NAMESPACE}"
 }
 
+# Group-test mitigation: shared maas-api at replicas=2 (from serial override tests or
+# inherited spec) leaves MTC Ready stuck on "updated replicas 1/2" while rolling.
+# Pin default-tenant to 1 before the parallel suite.
+pin_maas_api_replicas_for_e2e() {
+    local tenant_ns="${MAAS_SUBSCRIPTION_NAMESPACE:-models-as-a-service}"
+    local tenant_name="${MAAS_TENANT_CONFIG_NAME:-default-tenant}"
+    local infra_ns
+    infra_ns="$(oc get maastenantconfig "${tenant_name}" -n "${tenant_ns}" \
+        -o jsonpath='{.status.infraNamespace}' 2>/dev/null || true)"
+    if [[ -z "${infra_ns}" ]]; then
+        infra_ns="${MAAS_API_DEPLOYMENT_NAMESPACE:-odh-ai-gateway-infra}"
+    fi
+
+    if ! oc get maastenantconfig "${tenant_name}" -n "${tenant_ns}" &>/dev/null; then
+        echo "WARN: MaasTenantConfig ${tenant_ns}/${tenant_name} not found; skip maas-api replicas pin"
+        return 0
+    fi
+
+    echo "Pinning MaasTenantConfig ${tenant_ns}/${tenant_name} spec.maasApi.replicas=1 ..."
+    oc patch maastenantconfig "${tenant_name}" -n "${tenant_ns}" --type=merge \
+        -p '{"spec":{"maasApi":{"replicas":1}}}' \
+        || { echo "ERROR: failed to pin maasApi.replicas"; return 1; }
+
+    echo "Waiting for deployment/maas-api in ${infra_ns} to report Ready (replicas=1) ..."
+    local deadline=$((SECONDS + 180))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local desired ready
+        desired="$(oc get deployment maas-api -n "${infra_ns}" \
+            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")"
+        ready="$(oc get deployment maas-api -n "${infra_ns}" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")"
+        if [[ "${desired}" == "1" && "${ready}" == "1" ]]; then
+            echo "maas-api ready at 1/1 in ${infra_ns}"
+            return 0
+        fi
+        sleep 5
+    done
+    echo "WARN: maas-api did not reach 1/1 within 180s (desired=${desired:-?}, ready=${ready:-?}); continuing"
+    return 0
+}
+
 enable_tenant_namespace_discovery_for_e2e() {
     [[ "${ENABLE_TENANT_NAMESPACE_DISCOVERY}" == "true" ]] || return 0
 
@@ -274,8 +315,12 @@ run_e2e_tests() {
     fi
 
     export ARTIFACTS_DIR
-    export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-7}"
+    # Lower default parallelism vs upstream MaaS (7): group-test single-worker
+    # maastenantconfig + per-tenant maas-api rollouts otherwise starve Ready waits.
+    export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-3}"
     export E2E_RECONCILE_WAIT="${E2E_RECONCILE_WAIT:-4}"
+    export E2E_MULTITENANCY_PHASE_TIMEOUT="${E2E_MULTITENANCY_PHASE_TIMEOUT:-360}"
+    export E2E_AITENANT_READY_TIMEOUT="${E2E_AITENANT_READY_TIMEOUT:-480}"
     "${SCRIPT_DIR}/run_e2e_tests.sh"
 }
 
@@ -324,6 +369,11 @@ export AITENANT_NAMESPACE
 export ENABLE_TENANT_NAMESPACE_DISCOVERY
 enable_tenant_namespace_discovery_for_e2e || exit 1
 phase_mark tenant_namespace_discovery end
+
+print_header "Pinning shared maas-api replicas for parallel e2e"
+phase_mark pin_maas_api_replicas start
+pin_maas_api_replicas_for_e2e || exit 1
+phase_mark pin_maas_api_replicas end
 
 print_header "Setting up variables for tests"
 setup_vars_for_tests
