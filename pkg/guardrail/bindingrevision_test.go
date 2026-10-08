@@ -257,11 +257,11 @@ func TestComputeBindingRevisionIgnoresLabelsOutsideSelectorMode(t *testing.T) {
 	}
 }
 
-// TestComputeBindingRevisionRejectsUnparseableConfigs keeps the digest from
+// TestComputeBindingRevisionRejectsUnparsableConfigs keeps the digest from
 // standing in for a provider it could not read. Reconcile only reaches this
 // on the accepted path, where Compatible=True already proves the parse
 // succeeded, so this pins the contract rather than a reachable state.
-func TestComputeBindingRevisionRejectsUnparseableConfigs(t *testing.T) {
+func TestComputeBindingRevisionRejectsUnparsableConfigs(t *testing.T) {
 	provider := nemoWithRawConfigs([]any{int64(7)})
 	provider.SetName(nemoName)
 	provider.SetNamespace(providerNS)

@@ -173,7 +173,7 @@ func main() {
 		Scheme:         mgr.GetScheme(),
 		ResyncInterval: resyncInterval,
 		Log:            ctrl.Log.WithName("aiguardrail"),
-		Recorder:       mgr.GetEventRecorderFor("aiguardrail"),
+		Recorder:       mgr.GetEventRecorder("aiguardrail"),
 	}
 	if err := guardrailReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AIGuardrail reconciler")

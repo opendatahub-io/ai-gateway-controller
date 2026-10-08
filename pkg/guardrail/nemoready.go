@@ -23,7 +23,22 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// evaluateProviderReady resolves the referenced NeMo server's checks endpoint,
+// nemoReadiness is what reading a NemoGuardrails provider's status answers:
+// whether a checks endpoint was discovered, which one, and the reason and
+// message to publish on the ProviderReady condition.
+//
+// This is NeMo-specific, like the file it lives in. ProviderReady itself is
+// not — if a second guardrails provider is ever supported, it gets its own
+// evaluator returning this same shape, and Reconcile keeps publishing one
+// condition.
+type nemoReadiness struct {
+	Ready    bool
+	Endpoint string
+	Reason   string
+	Message  string
+}
+
+// evaluateNemoReady resolves the referenced NeMo server's checks endpoint,
 // returning it alongside the condition reason and message to publish.
 //
 // What this establishes is endpoint *discovery*, not liveness. TrustyAI
@@ -67,32 +82,50 @@ import (
 // against.
 //
 // The value is parsed rather than trusted. status.endpoint is owned by another
-// controller, and anything that is not an absolute https URL with a host is a
-// target ExtProc cannot call; rejecting it here fails closed instead of
-// handing a malformed or plaintext address downstream.
-func evaluateProviderReady(nemo *unstructured.Unstructured) (ready bool, endpoint, reason, message string) {
-	const undiscovered = "the referenced NemoGuardrails provider publishes no status.endpoint, so no supported " +
-		"checks endpoint could be discovered"
+// controller, and anything that is not a plain absolute https base URL — no
+// userinfo, query or fragment — is a target ExtProc cannot call; rejecting it
+// here fails closed instead of handing a malformed, plaintext or
+// credential-bearing address downstream.
+func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
+	undiscovered := nemoReadiness{
+		Reason: reasonEndpointDiscoveryUnavailable,
+		Message: "the referenced NemoGuardrails provider publishes no status.endpoint, so no supported " +
+			"checks endpoint could be discovered",
+	}
 
 	if nemo == nil {
-		return false, "", reasonEndpointDiscoveryUnavailable, undiscovered
+		return undiscovered
 	}
 
 	discovered, found, err := unstructured.NestedString(nemo.Object, "status", "endpoint")
 	if err != nil || !found || discovered == "" {
-		return false, "", reasonEndpointDiscoveryUnavailable, undiscovered
+		return undiscovered
 	}
 
-	// A DNS name is not a credential, so the rejected value is echoed: without
-	// it the only actionable detail — what upstream actually wrote — is lost.
+	// Only the scheme and host are echoed back. The rejected value is an
+	// arbitrary string from another controller's status, so quoting it whole
+	// would copy a userinfo password into a condition message and the Warning
+	// Event refuse emits.
 	parsed, err := url.Parse(discovered)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return false, "", reasonEndpointDiscoveryUnavailable, fmt.Sprintf(
-			"the referenced NemoGuardrails provider publishes a status.endpoint that is not an absolute "+
-				"https URL (%q), so no supported checks endpoint could be discovered", discovered)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		shown := "unparsable"
+		if err == nil {
+			shown = (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host}).String()
+		}
+		return nemoReadiness{
+			Reason: reasonEndpointDiscoveryUnavailable,
+			Message: fmt.Sprintf(
+				"the referenced NemoGuardrails provider publishes a status.endpoint that is not a plain absolute "+
+					"https base URL (%s), so no supported checks endpoint could be discovered", shown),
+		}
 	}
 
-	return true, discovered, reasonProviderAvailable,
-		"referenced NemoGuardrails provider publishes an authenticated in-cluster checks endpoint; " +
-			"this confirms discovery, not that the server is serving"
+	return nemoReadiness{
+		Ready:    true,
+		Endpoint: discovered,
+		Reason:   reasonProviderAvailable,
+		Message: "referenced NemoGuardrails provider publishes an authenticated in-cluster checks endpoint; " +
+			"this confirms discovery, not that the server is serving",
+	}
 }

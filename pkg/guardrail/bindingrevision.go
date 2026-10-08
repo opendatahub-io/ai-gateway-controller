@@ -127,7 +127,7 @@ func selectorLabels(selector *metav1.LabelSelector, consumerNS *corev1.Namespace
 // addressing.
 //
 // endpoint is the provider's discovered checks endpoint, as returned by
-// evaluateProviderReady. consumerNS is the consumer namespace's Namespace
+// evaluateNemoReady. consumerNS is the consumer namespace's Namespace
 // object, or nil outside Selector mode, where no labels are read.
 //
 // This does not detect every remote change, and must not be documented as if

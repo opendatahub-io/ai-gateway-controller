@@ -47,6 +47,16 @@ func nemoDeclaring(names ...string) *unstructured.Unstructured {
 	return withNemoConfigs(NewNemoGuardrails(), names...)
 }
 
+const (
+	// providerSecret stands in for provider-owned configuration content. It is
+	// planted where an apimachinery accessor error would echo it back, so a
+	// test can assert it never reaches the consumer-visible message.
+	providerSecret = "provider-only-do-not-publish"
+	// malformedConfigsMessage is the fixed text evaluateCompatible publishes
+	// for an unparseable spec.nemoConfigs.
+	malformedConfigsMessage = "referenced NemoGuardrails provider has malformed configurations in spec.nemoConfigs"
+)
+
 // nemoWithRawConfigs builds a provider whose spec.nemoConfigs is set without
 // going through the typed setters, so a test can plant a shape the API server
 // would reject but an unstructured read still has to survive.
@@ -80,7 +90,7 @@ func TestEvaluateCompatibleAcceptsDeclaredConfigs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message := evaluateCompatible(c.guardrail, c.provider)
+			compatible, reason, message, _ := evaluateCompatible(c.guardrail, c.provider)
 			if !compatible {
 				t.Fatalf("evaluateCompatible = false (%s: %s), want true", reason, message)
 			}
@@ -129,7 +139,7 @@ func TestEvaluateCompatibleRejectsUndeclaredConfigs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message := evaluateCompatible(c.guardrail, c.provider)
+			compatible, reason, message, _ := evaluateCompatible(c.guardrail, c.provider)
 			if compatible {
 				t.Fatal("evaluateCompatible = true, want false for an undeclared configId")
 			}
@@ -155,15 +165,15 @@ func TestEvaluateCompatibleRejectsUndeclaredConfigs(t *testing.T) {
 // Unknown configIds are collected by iterating a map, whose order Go
 // randomises per run. An unstable message rewrites the condition on every
 // reconcile, which bumps LastTransitionTime and re-emits a Warning event each
-// time the unaccepted policy comes back round the NotReadyRequeueInterval
-// loop — a slow event flood that only shows up in a long-running cluster.
+// time the unaccepted policy comes back round the resync loop — a slow event
+// flood that only shows up in a long-running cluster.
 func TestEvaluateCompatibleMessageIsStable(t *testing.T) {
 	guardrail := guardrailSelecting("zeta-v1", "alpha-v1", "mu-v1", "alpha-v1")
 	provider := nemoDeclaring("other-v1")
 	want := "referenced NemoGuardrails provider does not declare configId(s): alpha-v1, mu-v1, zeta-v1"
 
 	for i := range 32 {
-		_, _, message := evaluateCompatible(guardrail, provider)
+		_, _, message, _ := evaluateCompatible(guardrail, provider)
 		if message != want {
 			t.Fatalf("message on call %d = %q, want %q", i, message, want)
 		}
@@ -182,7 +192,7 @@ func TestEvaluateCompatibleRejectsProvidersDeclaringNothing(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
+			compatible, reason, message, _ := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
 			if compatible {
 				t.Fatal("evaluateCompatible = true, want false against a provider declaring no configurations")
 			}
@@ -205,25 +215,42 @@ func TestEvaluateCompatibleRejectsMalformedConfigs(t *testing.T) {
 		name     string
 		provider *unstructured.Unstructured
 	}{
-		{"spec.nemoConfigs is not a list", nemoWithRawConfigs("jailbreak-v1")},
-		{"an entry is not an object", nemoWithRawConfigs([]any{"jailbreak-v1"})},
-		{"a name is not a string", nemoWithRawConfigs([]any{map[string]any{"name": int64(7)}})},
+		{"spec.nemoConfigs is not a list", nemoWithRawConfigs(providerSecret)},
+		{"an entry is not an object", nemoWithRawConfigs([]any{providerSecret})},
+		{"a name is not a string", nemoWithRawConfigs([]any{map[string]any{"name": []any{providerSecret}}})},
 		{
 			name:     "a later entry is malformed",
-			provider: nemoWithRawConfigs([]any{map[string]any{"name": "jailbreak-v1"}, int64(7)}),
+			provider: nemoWithRawConfigs([]any{map[string]any{"name": "jailbreak-v1"}, providerSecret}),
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
+			compatible, reason, message, err := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
 			if compatible {
 				t.Fatal("evaluateCompatible = true, want false against a provider this controller cannot parse")
 			}
 			if reason != reasonInvalidProviderConfigs {
 				t.Fatalf("reason = %q, want %q", reason, reasonInvalidProviderConfigs)
 			}
-			if message == "" {
-				t.Fatal("message is empty; the condition must explain what could not be parsed")
+			// Pinned exactly. The message lands on a condition and a Warning
+			// Event in the consumer's namespace, readable by anyone who can
+			// read that namespace, while the provider may be owned by someone
+			// else entirely. apimachinery's accessor errors embed the value
+			// they rejected, so interpolating one here would republish the
+			// provider's own spec.
+			if message != malformedConfigsMessage {
+				t.Errorf("message = %q, want the fixed %q", message, malformedConfigsMessage)
+			}
+			if strings.Contains(message, providerSecret) {
+				t.Errorf("message %q leaks the provider's spec.nemoConfigs content", message)
+			}
+			// Still diagnosable: the detail has to reach the caller so it can
+			// be logged, it just must not be published.
+			if err == nil {
+				t.Fatal("error is nil; the parse failure must still reach the caller for logging")
+			}
+			if !strings.Contains(err.Error(), "nemoConfigs") {
+				t.Errorf("error %q does not identify the field that failed to parse", err)
 			}
 		})
 	}

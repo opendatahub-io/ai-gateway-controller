@@ -76,13 +76,14 @@ rules:
 # AIGuardrail is the guardrail reconciler's primary watch target. This
 # controller owns AIGuardrail.status (the accepted provider binding:
 # ResolvedRefs / ProviderReady / Accepted), hence the status subresource rule.
-# It never writes the spec, so no update/patch on the resource itself.
+# It never writes the spec, so no update/patch on the resource itself, and it
+# publishes status with a merge patch, so no update there either.
 - apiGroups: ["aigateway.opendatahub.io"]
   resources: ["aiguardrails"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["aigateway.opendatahub.io"]
   resources: ["aiguardrails/status"]
-  verbs: ["get", "update", "patch"]
+  verbs: ["get", "patch"]
 # Provider references: each AIGuardrail names a NemoGuardrails whose
 # spec.allowedConsumers decides whether this namespace may consume it.
 # TrustyAI's operator is the sole owner of NemoGuardrails and its status, so
@@ -110,6 +111,14 @@ rules:
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Two groups, because the manager has two recorders. Leader election emits
+# through the deprecated core/v1 one (GetEventRecorderFor), while the
+# AIGuardrail reconciler uses GetEventRecorder, whose sink is events.k8s.io/v1.
+# Dropping either group silently 403s that half of the events.
 - apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# create and patch only: the events broadcaster never issues an update.
+- apiGroups: ["events.k8s.io"]
   resources: ["events"]
   verbs: ["create", "patch"]

@@ -33,14 +33,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 )
 
 const (
@@ -180,7 +179,7 @@ func newFixture(opts fixtureOptions) *fixture {
 		WithObjects(opts.liveObjects...).
 		WithInterceptorFuncs(opts.liveFuncs).
 		Build()
-	recorder := record.NewFakeRecorder(16)
+	recorder := events.NewFakeRecorder(16)
 	return &fixture{
 		reconciler: &Reconciler{
 			Client:         cache,
@@ -188,6 +187,9 @@ func newFixture(opts fixtureOptions) *fixture {
 			Scheme:         scheme,
 			ResyncInterval: time.Minute,
 			Recorder:       recorder,
+			// What SetupWithManager fills in from the manager. A nil mapper
+			// is not a usable Reconciler, so it is stated rather than assumed.
+			RESTMapper: mapperWithNemo(),
 		},
 		cache:  cache,
 		live:   live,
@@ -242,13 +244,17 @@ func requireCondition(t *testing.T, guardrail *aigatewayv1alpha1.AIGuardrail, co
 }
 
 // requireDenied asserts the full shape of a refused binding: both conditions
-// False with the same reason, a short requeue, and the policy left in place.
-// The checks must never be dropped — a guardrail that cannot be authorized
-// has to keep failing closed downstream, not quietly stop existing.
+// False with the same reason, a drift-fallback requeue, and the policy left
+// in place. The checks must never be dropped — a guardrail that cannot be
+// authorized has to keep failing closed downstream, not quietly stop existing.
+//
+// The requeue is the resync cadence, not a short one: every refusal is lifted
+// by a watched edit, so polling faster would only repeat the uncached read
+// that produced the refusal.
 func requireDenied(t *testing.T, f *fixture, res ctrl.Result, namespace, reason string) *aigatewayv1alpha1.AIGuardrail {
 	t.Helper()
-	if res.RequeueAfter != constants.NotReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	if res.RequeueAfter != f.reconciler.ResyncInterval {
+		t.Fatalf("RequeueAfter = %v, resync interval %v", res.RequeueAfter, f.reconciler.ResyncInterval)
 	}
 	got := f.reload(t, namespace)
 	requireCondition(t, got, ConditionResolvedRefs, metav1.ConditionFalse, reason)
@@ -712,7 +718,7 @@ func TestReconcileDeniesSelectorModeWithoutAMatch(t *testing.T) {
 	}{
 		{"consumer Namespace labels do not match", newNamespace(consumerNS, map[string]string{"guardrails": "private"})},
 		{"consumer Namespace carries no labels", newNamespace(consumerNS, nil)},
-		{"consumer Namespace is unreadable", nil},
+		{"consumer Namespace does not exist", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -815,8 +821,8 @@ func TestReconcileRefusesChecksTheProviderCannotSatisfy(t *testing.T) {
 	if len(got.Spec.Checks) != 1 {
 		t.Fatalf("spec.checks = %#v, want the declared checks left untouched", got.Spec.Checks)
 	}
-	if res.RequeueAfter != constants.NotReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	if res.RequeueAfter != f.reconciler.ResyncInterval {
+		t.Fatalf("RequeueAfter = %v, want the resync interval %v", res.RequeueAfter, f.reconciler.ResyncInterval)
 	}
 	if got := len(f.events); got != 1 {
 		t.Fatalf("%d events emitted, want 1 for the transition to refused", got)
@@ -865,8 +871,8 @@ func TestReconcileRefusesProvidersWithUnusableConfigs(t *testing.T) {
 			requireCondition(t, got, ConditionResolvedRefs, metav1.ConditionTrue, reasonReferencesAuthorized)
 			requireCondition(t, got, ConditionCompatible, metav1.ConditionFalse, c.want)
 			requireCondition(t, got, ConditionAccepted, metav1.ConditionFalse, c.want)
-			if res.RequeueAfter != constants.NotReadyRequeueInterval {
-				t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+			if res.RequeueAfter != f.reconciler.ResyncInterval {
+				t.Fatalf("RequeueAfter = %v, want the resync interval %v", res.RequeueAfter, f.reconciler.ResyncInterval)
 			}
 		})
 	}
@@ -944,25 +950,150 @@ func TestReconcileDeniesWhenProviderIsMissing(t *testing.T) {
 	requireDenied(t, f, res, consumerNS, "ProviderNotFound")
 }
 
+// TestReconcileRefusesEveryPolicyWhenTheProviderCRDIsAbsent covers a cluster
+// TrustyAI was never installed on. SetupWithManager registers the reconciler
+// there anyway: skipping registration leaves every AIGuardrail with no
+// conditions at all, which a consumer cannot tell apart from a controller
+// that crashed before reaching it.
+func TestReconcileRefusesEveryPolicyWhenTheProviderCRDIsAbsent(t *testing.T) {
+	// A provider that exists and authorizes this namespace, so the missing
+	// CRD is the only thing that can be producing the refusal.
+	f := newStandardFixture(
+		newGuardrail(consumerNS, nemoName, providerNS),
+		newNemo(providerNS, nemoName, map[string]any{"from": "All"}),
+	)
+	f.reconciler.RESTMapper = mapperWithoutNemo()
+
+	res := f.reconcile(t, consumerNS)
+	// The slow cadence, not the ten-second one every other refusal uses:
+	// each miss costs the RESTMapper a discovery reload.
+	if res.RequeueAfter != f.reconciler.ResyncInterval {
+		t.Errorf("RequeueAfter = %v, want the resync interval %v", res.RequeueAfter, f.reconciler.ResyncInterval)
+	}
+
+	got := f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionResolvedRefs, metav1.ConditionFalse, reasonProviderCRDNotInstalled)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionFalse, reasonProviderCRDNotInstalled)
+	requireCondition(t, got, ConditionCompatible, metav1.ConditionUnknown, reasonProviderCRDNotInstalled)
+	requireCondition(t, got, ConditionProviderReady, metav1.ConditionUnknown, reasonProviderCRDNotInstalled)
+}
+
+// TestReconcileRecoversWhenTheProviderCRDIsInstalledLater is the reason the
+// CRD check is re-asked per reconcile instead of being cached at startup.
+// Installing TrustyAI after this controller is already running must accept
+// the policy on the next pass, not leave it refused until someone notices and
+// restarts the pod.
+//
+// Only the provider watch still needs a restart, and that is a latency
+// difference rather than a correctness one: the requeue this refusal schedules
+// is what brings the policy back.
+func TestReconcileRecoversWhenTheProviderCRDIsInstalledLater(t *testing.T) {
+	f := newStandardFixture(
+		newGuardrail(consumerNS, nemoName, providerNS),
+		newNemo(providerNS, nemoName, map[string]any{"from": "All"}),
+	)
+	f.reconciler.RESTMapper = mapperWithoutNemo()
+	f.reconcile(t, consumerNS)
+	requireCondition(t, f.reload(t, consumerNS), ConditionAccepted, metav1.ConditionFalse, reasonProviderCRDNotInstalled)
+
+	// TrustyAI is installed. Nothing else about the cluster changes, and this
+	// controller is not restarted.
+	f.reconciler.RESTMapper = mapperWithNemo()
+
+	res := f.reconcile(t, consumerNS)
+	if res.RequeueAfter != f.reconciler.ResyncInterval {
+		t.Errorf("RequeueAfter = %v, want the steady-state resync %v", res.RequeueAfter, f.reconciler.ResyncInterval)
+	}
+	requireCondition(t, f.reload(t, consumerNS), ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+}
+
 // TestReconcileDeniesWhenProviderCannotBeRead keeps a transient API failure
 // on the deny path rather than the error path: a read failure is not evidence
 // that the reference is authorized, so the binding must come down while the
 // controller retries.
-func TestReconcileDeniesWhenProviderCannotBeRead(t *testing.T) {
+// TestReconcileKeepsAnAcceptedBindingWhenTheProviderReadFails proves a failed
+// read is not a verdict. The provider is unchanged and still authorizes this
+// namespace; only the read breaks. Denying would clear bindingRevision and
+// providerEndpoint, retracting a working binding on an API server blip, so the
+// error is surfaced for backoff and the last verdict is left standing.
+func TestReconcileKeepsAnAcceptedBindingWhenTheProviderReadFails(t *testing.T) {
+	// Flipped between the two reconciles; both run on this goroutine, with the
+	// interceptor called synchronously inside Reconcile.
+	failRead := false
 	f := newFixture(fixtureOptions{
 		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
 		liveObjects:  []client.Object{newNemo(providerNS, nemoName, map[string]any{"from": "All"})},
 		liveFuncs: interceptor.Funcs{
 			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if obj.GetObjectKind().GroupVersionKind().Kind == NemoGuardrailsGVK.Kind {
+				if failRead && obj.GetObjectKind().GroupVersionKind().Kind == NemoGuardrailsGVK.Kind {
 					return apierrors.NewInternalError(errors.New("etcd unavailable"))
 				}
 				return c.Get(ctx, key, obj, opts...)
 			},
 		},
 	})
-	res := f.reconcile(t, consumerNS)
-	requireDenied(t, f, res, consumerNS, "ProviderReadError")
+
+	f.reconcile(t, consumerNS)
+	accepted := f.reload(t, consumerNS)
+	requireCondition(t, accepted, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	if accepted.Status.BindingRevision == "" {
+		t.Fatal("precondition: the binding was never accepted")
+	}
+
+	failRead = true
+	if _, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS)); err == nil {
+		t.Fatal("Reconcile returned no error, want the failed read surfaced so the manager backs off")
+	}
+
+	got := f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	if got.Status.BindingRevision != accepted.Status.BindingRevision {
+		t.Errorf("bindingRevision = %q, want the accepted one %q left standing",
+			got.Status.BindingRevision, accepted.Status.BindingRevision)
+	}
+	if got.Status.ProviderEndpoint != accepted.Status.ProviderEndpoint {
+		t.Errorf("providerEndpoint = %q, want the accepted one %q left standing",
+			got.Status.ProviderEndpoint, accepted.Status.ProviderEndpoint)
+	}
+}
+
+// TestReconcileKeepsAnAcceptedBindingWhenTheNamespaceReadFails is the same
+// argument for the other authorization input: a Namespace whose labels could
+// not be read is not a Namespace that stopped matching.
+func TestReconcileKeepsAnAcceptedBindingWhenTheNamespaceReadFails(t *testing.T) {
+	selector := map[string]any{"from": "Selector", "selector": map[string]any{"matchLabels": map[string]any{"guardrails": "shared"}}}
+	failRead := false
+	f := newFixture(fixtureOptions{
+		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
+		liveObjects: []client.Object{
+			newNemo(providerNS, nemoName, selector),
+			newNamespace(consumerNS, map[string]string{"guardrails": "shared"}),
+		},
+		liveFuncs: interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isNamespace := obj.(*corev1.Namespace); failRead && isNamespace {
+					return apierrors.NewInternalError(errors.New("etcd unavailable"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	})
+
+	f.reconcile(t, consumerNS)
+	accepted := f.reload(t, consumerNS)
+	requireCondition(t, accepted, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+
+	failRead = true
+	if _, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS)); err == nil {
+		t.Fatal("Reconcile returned no error, want the failed read surfaced so the manager backs off")
+	}
+
+	got := f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	if got.Status.BindingRevision != accepted.Status.BindingRevision {
+		t.Errorf("bindingRevision = %q, want the accepted one %q left standing",
+			got.Status.BindingRevision, accepted.Status.BindingRevision)
+	}
 }
 
 // TestReconcileReadsTheProviderLive proves authorization does not come from
@@ -1001,9 +1132,8 @@ func TestReconcileReadsTheConsumerNamespaceLive(t *testing.T) {
 }
 
 // TestReconcileEmitsOneEventPerTransition guards the gating on
-// SetStatusCondition's changed bool. A denied policy is requeued every
-// NotReadyRequeueInterval, so an ungated emit would post an Event every ten
-// seconds forever.
+// SetStatusCondition's changed bool. A denied policy is requeued every resync
+// interval, so an ungated emit would post an Event on every pass forever.
 func TestReconcileEmitsOneEventPerTransition(t *testing.T) {
 	f := newStandardFixture(
 		newGuardrail(consumerNS, nemoName, providerNS),
@@ -1144,13 +1274,85 @@ func TestReconcileStampsEveryConditionWithTheCurrentGeneration(t *testing.T) {
 	}
 }
 
-func TestReconcileToleratesANilRecorder(t *testing.T) {
-	// Recorder is documented as optional, and the deny path is the one that
-	// would dereference it.
-	f := newStandardFixture(newGuardrail(consumerNS, nemoName, providerNS), newNemo(providerNS, nemoName, nil))
-	f.reconciler.Recorder = nil
-	res := f.reconcile(t, consumerNS)
-	requireDenied(t, f, res, consumerNS, "ConsumerNotAuthorized")
+// TestReconcileRetractsCheckVerdictsWhenTheBindingIsDenied covers the case the
+// generation fence cannot: a policy accepted at generation N whose provider is
+// then deleted or whose permission is revoked. Neither edit touches this
+// policy's spec, so metadata.generation stays at N and a leftover
+// Compatible=True / ProviderReady=True would still match it — reporting a
+// missing or unauthorized provider as ready and compatible to any consumer
+// that reads those conditions independently of Accepted.
+//
+// Unknown rather than False because the deny path returns before either
+// verdict is evaluated: there is no provider to judge, which is not the same
+// as having judged it and found it wanting.
+func TestReconcileRetractsCheckVerdictsWhenTheBindingIsDenied(t *testing.T) {
+	accepted := func() []metav1.Condition {
+		conditions := make([]metav1.Condition, 0, 4)
+		for _, c := range []struct{ conditionType, reason string }{
+			{ConditionResolvedRefs, "ReferencesAuthorized"},
+			{ConditionCompatible, "ChecksSatisfiable"},
+			{ConditionProviderReady, "ProviderAvailable"},
+			{ConditionAccepted, "Accepted"},
+		} {
+			conditions = append(conditions, metav1.Condition{
+				Type:   c.conditionType,
+				Status: metav1.ConditionTrue,
+				// The current generation, not an older one: that is what makes
+				// these leftovers invisible to the staleness check.
+				ObservedGeneration: testGeneration,
+				Reason:             c.reason,
+				LastTransitionTime: metav1.Now(),
+			})
+		}
+		return conditions
+	}
+
+	cases := []struct {
+		name string
+		// objects is the cluster state besides the AIGuardrail itself.
+		objects []client.Object
+		// wantReason is the Accepted reason the denial publishes.
+		wantReason string
+	}{
+		{
+			name:       "the provider was deleted",
+			wantReason: "ProviderNotFound",
+		},
+		{
+			name:       "the provider revoked this namespace's permission",
+			objects:    []client.Object{newNemo(providerNS, nemoName, nil)},
+			wantReason: "ConsumerNotAuthorized",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			guardrail := newGuardrail(consumerNS, nemoName, providerNS)
+			guardrail.Status = aigatewayv1alpha1.AIGuardrailStatus{
+				ObservedGeneration: testGeneration,
+				Conditions:         accepted(),
+				BindingRevision:    "stale-revision",
+				ProviderEndpoint:   nemoEndpoint,
+			}
+
+			f := newStandardFixture(guardrail, c.objects...)
+			res := f.reconcile(t, consumerNS)
+			got := requireDenied(t, f, res, consumerNS, c.wantReason)
+
+			for _, conditionType := range []string{ConditionCompatible, ConditionProviderReady} {
+				cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
+				if cond == nil {
+					t.Fatalf("%s is missing; a denied binding must not leave the last verdict standing", conditionType)
+				}
+				if cond.Status != metav1.ConditionUnknown {
+					t.Errorf("%s = %s with reason %q, want Unknown: the provider was never evaluated on this path",
+						conditionType, cond.Status, cond.Reason)
+				}
+				if cond.ObservedGeneration != testGeneration {
+					t.Errorf("%s kept observedGeneration %d, want %d", conditionType, cond.ObservedGeneration, testGeneration)
+				}
+			}
+		})
+	}
 }
 
 // guardrailCRDPath is the generated CRD for the type this package reconciles.

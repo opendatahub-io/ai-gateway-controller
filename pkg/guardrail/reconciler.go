@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 )
 
 // Reconciler reconciles AIGuardrail resources.
@@ -59,22 +58,32 @@ type Reconciler struct {
 	// Recorder publishes a Warning Event whenever a policy stops being
 	// accepted, so the reason a guardrail is not enforcing is visible to a
 	// namespace owner who can read their own AIGuardrail but not this
-	// controller's logs. May be nil, in which case events are dropped.
-	Recorder record.EventRecorder
+	// controller's logs.
+	Recorder events.EventRecorder
+
+	// RESTMapper answers whether TrustyAI's NemoGuardrails CRD is installed.
+	// SetupWithManager fills it from the manager; it is re-read on every
+	// reconcile so a policy recovers once TrustyAI appears, rather than
+	// waiting for this controller to restart.
+	RESTMapper apimeta.RESTMapper
 }
 
-// event records a Kubernetes Event on the AIGuardrail, tolerating a nil
-// Recorder.
+// refuseAction is the machine-readable action every Event this controller
+// emits reports. The events API requires one, and there is a single kind of
+// event here: a provider binding being refused.
+const refuseAction = "RefuseBinding"
+
+// event records a Kubernetes Event on the AIGuardrail.
 //
 // Callers must gate emission on the bool apimeta.SetStatusCondition returns,
 // so exactly one event fires per state transition: an unaccepted policy is
-// requeued every constants.NotReadyRequeueInterval, and an ungated emit would
-// turn that loop into an event flood.
+// requeued every resync interval, and an ungated emit would turn that loop
+// into an event flood.
 func (r *Reconciler) event(guardrail *aigatewayv1alpha1.AIGuardrail, eventType, reason, message string) {
-	if r.Recorder == nil {
-		return
-	}
-	r.Recorder.Event(guardrail, eventType, reason, message)
+	// related is nil: the refusal is about this AIGuardrail. The message is
+	// passed as an argument rather than as the format string, so a percent
+	// sign in a provider-supplied value cannot turn into a verb.
+	r.Recorder.Eventf(guardrail, nil, eventType, reason, refuseAction, "%s", message)
 }
 
 // providerRef resolves the NemoGuardrails an AIGuardrail references. An
@@ -117,23 +126,15 @@ func indexGuardrailByProvider(obj client.Object) []string {
 // Credential Secrets are deliberately not watched: nothing in this package
 // reads one yet, and a watch with no reader is only cache pressure.
 //
-// The whole reconciler is skipped when TrustyAI's NemoGuardrails CRD is not
-// installed (see providerCRDInstalled). Returning nil rather than an error is
-// deliberate: a cluster without TrustyAI is a supported configuration, and the
-// manager must still come up to run the other reconcilers.
+// Only the provider watch is skipped when TrustyAI's NemoGuardrails CRD is not
+// installed (see providerCRDInstalled). The reconciler is registered either
+// way: a cluster without TrustyAI is a supported configuration, and a policy
+// there still has to be told on its own status why it is not enforcing.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	installed, err := providerCRDInstalled(mgr.GetRESTMapper())
+	r.RESTMapper = mgr.GetRESTMapper()
+	installed, err := providerCRDInstalled(r.RESTMapper)
 	if err != nil {
 		return err
-	}
-	if !installed {
-		// Logged at the level an operator will actually see: a disabled
-		// reconciler is otherwise indistinguishable from one that is running
-		// and refusing every policy.
-		r.Log.Info("NemoGuardrails CRD not installed; AIGuardrail reconciler disabled",
-			"crd", NemoGuardrailsGVK.String(),
-			"effect", "AIGuardrail resources will not be reconciled until TrustyAI is installed and this controller restarts")
-		return nil
 	}
 
 	// IndexField only records the extractor against a cache that has not been
@@ -144,23 +145,34 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("indexing AIGuardrail by provider reference: %w", err)
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&aigatewayv1alpha1.AIGuardrail{}).
-		// The provider owns the authorization rule, so an edit to
-		// spec.allowedConsumers must re-evaluate every policy bound to it.
-		// This starts an informer for TrustyAI's CRD, which therefore has to
-		// be installed on the cluster.
-		Watches(NewNemoGuardrails(), handler.EnqueueRequestsFromMapFunc(r.guardrailsForProvider)).
 		// Selector mode matches labels on the consumer's Namespace, so a label
 		// edit grants or revokes access without touching the policy or the
 		// provider. Only label changes can do that, hence the predicate:
 		// without it every Namespace write in the cluster would fan out.
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.guardrailsInNamespace),
-			builder.WithPredicates(predicate.LabelChangedPredicate{})).
-		Complete(r)
+			builder.WithPredicates(predicate.LabelChangedPredicate{}))
+
+	if installed {
+		// The provider owns the authorization rule, so an edit to
+		// spec.allowedConsumers must re-evaluate every policy bound to it.
+		// This starts an informer for TrustyAI's CRD, which is why it is the
+		// one part of the setup that depends on the CRD being present.
+		b = b.Watches(NewNemoGuardrails(), handler.EnqueueRequestsFromMapFunc(r.guardrailsForProvider))
+	} else {
+		// Logged at the level an operator will actually see, alongside the
+		// reasonProviderCRDNotInstalled each policy will carry.
+		r.Log.Info("NemoGuardrails CRD not installed; AIGuardrail provider watch disabled",
+			"crd", NemoGuardrailsGVK.String(),
+			"effect", "every AIGuardrail is refused until TrustyAI is installed; policies recover on their own, "+
+				"but until this controller restarts provider edits are picked up at the resync interval rather than immediately")
+	}
+
+	return b.Complete(r)
 }
 
-// guardrailsForProvider maps a NemoGuardrails event to every AIGuardrail bound
+// guardrailsForProvider maps a NemoGuardrails event to every AIGuardrail bound1
 // to it.
 //
 // The lookup is cache-backed on purpose, unlike the reads inside Reconcile.
@@ -229,6 +241,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	original := guardrail.DeepCopy()
 	guardrail.Status.ObservedGeneration = guardrail.Generation
 
+	// Asked again on every reconcile rather than reused from startup, so a
+	// policy is accepted once TrustyAI is installed without this controller
+	// being restarted. The provider watch cannot be added to a running
+	// controller, so until a restart the resync below is what picks provider
+	// edits up; the verdict itself is correct either way.
+	installed, err := providerCRDInstalled(r.RESTMapper)
+	if err != nil {
+		// Discovery failed, which is not evidence the CRD is gone. Backing
+		// off beats publishing a verdict on a read that did not complete.
+		return ctrl.Result{}, fmt.Errorf("checking whether %s is installed: %w", NemoGuardrailsGVK, err)
+	}
+	if !installed {
+		// Reported as a refusal rather than skipped, so the policy says why
+		// it is not enforcing instead of carrying no conditions at all.
+		log.Info("NemoGuardrails CRD not installed; refusing AIGuardrail", "crd", NemoGuardrailsGVK.String())
+		return r.denyBinding(ctx, &guardrail, original, reasonProviderCRDNotInstalled,
+			"TrustyAI's NemoGuardrails CRD is not installed on this cluster, so no guardrail provider can be resolved")
+	}
+
 	// The same resolution the field index uses, so a provider event and this
 	// path can never disagree about which provider a policy is bound to.
 	provider := providerRef(&guardrail)
@@ -240,14 +271,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// pkg/tenant.Reconciler's APIReader use).
 	nemo := NewNemoGuardrails()
 	if err := r.APIReader.Get(ctx, provider, nemo); err != nil {
-		reason := reasonProviderReadError
-		message := "failed to read the referenced NemoGuardrails provider"
-		if apierrors.IsNotFound(err) {
-			reason = reasonProviderNotFound
-			message = "referenced NemoGuardrails provider does not exist"
+		if !apierrors.IsNotFound(err) {
+			// The read did not complete, so nothing was learned about the
+			// provider. Denying here would retract a working binding on an API
+			// server blip — refuse clears BindingRevision and ProviderEndpoint
+			// — so this backs off and leaves the last verdict standing, the
+			// same choice the CRD check above makes.
+			return ctrl.Result{}, fmt.Errorf("reading NemoGuardrails %s: %w", provider, err)
 		}
-		log.Info("AIGuardrail provider unresolved", "provider", provider, "reason", reason)
-		return r.denyBinding(ctx, &guardrail, original, reason, message)
+		// Absence, unlike a failed read, is an answer.
+		log.Info("AIGuardrail provider unresolved", "provider", provider, "reason", reasonProviderNotFound)
+		return r.denyBinding(ctx, &guardrail, original, reasonProviderNotFound,
+			"referenced NemoGuardrails provider does not exist")
 	}
 
 	// The provider owns the rule for which namespaces may reference it. Parse
@@ -261,16 +296,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Selector mode matches labels on the consumer's Namespace object, so read
-	// it live too: those labels are an authorization input, and a missing or
-	// unreadable Namespace must never match.
+	// it live too: those labels are an authorization input, and a stale read
+	// must never keep a revoked binding alive.
+	//
+	// Absence and failure are split as they are for the provider read above. A
+	// Namespace that does not exist carries no labels, so the selector cannot
+	// match and nil is left for policy.allows to deny on. A read that failed
+	// says nothing about the labels, and denying on it would retract a binding
+	// that was authorized moments ago — revocation never arrives as an error,
+	// it is a successful read of a Namespace that no longer carries the label.
 	var consumerNS *corev1.Namespace
 	if policy.Mode == consumerModeSelector {
 		var ns corev1.Namespace
-		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: guardrail.Namespace}, &ns); err != nil {
-			log.Info("consumer Namespace unreadable for allowedConsumers selector matching",
-				"namespace", guardrail.Namespace, "error", err)
-		} else {
+		switch err := r.APIReader.Get(ctx, types.NamespacedName{Name: guardrail.Namespace}, &ns); {
+		case err == nil:
 			consumerNS = &ns
+		case apierrors.IsNotFound(err):
+			log.Info("consumer Namespace does not exist for allowedConsumers selector matching",
+				"namespace", guardrail.Namespace)
+		default:
+			return ctrl.Result{}, fmt.Errorf("reading consumer namespace %s: %w", guardrail.Namespace, err)
 		}
 	}
 
@@ -304,7 +349,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// compares two specs, both readable while the server is down, so a
 	// configId typo is reported as one instead of being masked by an unready
 	// provider.
-	compatible, compatibleReason, compatibleMessage := evaluateCompatible(&guardrail, nemo)
+	compatible, compatibleReason, compatibleMessage, parseErr := evaluateCompatible(&guardrail, nemo)
+	if parseErr != nil {
+		log.Info("AIGuardrail provider has malformed spec.nemoConfigs",
+			"provider", provider, "error", parseErr)
+	}
 	compatibleStatus := metav1.ConditionFalse
 	if compatible {
 		compatibleStatus = metav1.ConditionTrue
@@ -319,18 +368,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Provider readiness resolves the provider's published checks endpoint,
 	// never inferring one from the NeMo CR's status.phase or from its name
-	// (see evaluateProviderReady).
-	ready, endpoint, readyReason, readyMessage := evaluateProviderReady(nemo)
+	// (see evaluateNemoReady).
+	readiness := evaluateNemoReady(nemo)
 	readyStatus := metav1.ConditionFalse
-	if ready {
+	if readiness.Ready {
 		readyStatus = metav1.ConditionTrue
 	}
 	apimeta.SetStatusCondition(&guardrail.Status.Conditions, metav1.Condition{
 		Type:               ConditionProviderReady,
 		Status:             readyStatus,
 		ObservedGeneration: guardrail.Generation,
-		Reason:             readyReason,
-		Message:            readyMessage,
+		Reason:             readiness.Reason,
+		Message:            readiness.Message,
 	})
 
 	// Either failure prevents activation. Incompatibility is refused first: it
@@ -342,9 +391,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			"provider", provider, "reason", compatibleReason)
 		return r.refuse(ctx, &guardrail, original, compatibleReason, compatibleMessage)
 	}
-	if !ready {
-		log.Info("AIGuardrail provider not ready", "provider", provider, "reason", readyReason)
-		return r.refuse(ctx, &guardrail, original, reasonProviderNotReady, readyMessage)
+	if !readiness.Ready {
+		log.Info("AIGuardrail provider not ready", "provider", provider, "reason", readiness.Reason)
+		return r.refuse(ctx, &guardrail, original, reasonProviderNotReady, readiness.Message)
 	}
 
 	// Resolved, authorized, satisfiable and ready. The revision digests the
@@ -358,7 +407,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// for an unreachable state would be vocabulary nobody can act on. If it
 	// ever does fail, something is wrong beyond this policy, and a backed-off
 	// retry that leaves the previous status alone is the right response.
-	revision, err := computeBindingRevision(nemo, endpoint, policy, consumerNS)
+	revision, err := computeBindingRevision(nemo, readiness.Endpoint, policy, consumerNS)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("computing the binding revision for %s: %w", req.NamespacedName, err)
 	}
@@ -367,7 +416,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Published alongside the revision it was digested into, so a consumer
 	// compiles against the endpoint this verdict was reached on rather than
 	// re-deriving one from the provider's name.
-	guardrail.Status.ProviderEndpoint = endpoint
+	guardrail.Status.ProviderEndpoint = readiness.Endpoint
 
 	apimeta.SetStatusCondition(&guardrail.Status.Conditions, metav1.Condition{
 		Type:               ConditionAccepted,
@@ -389,6 +438,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 
 // denyBinding publishes an unresolved or unauthorized provider binding.
+//
+// Compatible and ProviderReady are reset to Unknown because this path returns
+// before either is evaluated. Both are answered by reading the provider, so
+// without a resolved and authorized one there is no verdict to report — and
+// the edits that land here, a deleted provider or a revoked permission, leave
+// metadata.generation untouched. A True left over from the last accepted
+// reconcile would therefore still carry the current generation and pass the
+// staleness fence described in constants.go, telling a consumer that a missing
+// provider is ready and compatible.
 func (r *Reconciler) denyBinding(
 	ctx context.Context,
 	guardrail, original *aigatewayv1alpha1.AIGuardrail,
@@ -401,16 +459,34 @@ func (r *Reconciler) denyBinding(
 		Reason:             reason,
 		Message:            message,
 	})
+	for _, conditionType := range []string{ConditionCompatible, ConditionProviderReady} {
+		apimeta.SetStatusCondition(&guardrail.Status.Conditions, metav1.Condition{
+			Type:               conditionType,
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: guardrail.Generation,
+			Reason:             reason,
+			Message:            "not evaluated: " + message,
+		})
+	}
 	return r.refuse(ctx, guardrail, original, reason, message)
 }
 
-// refuse publishes Accepted=False, persists the status and requeues shortly,
-// leaving whatever other conditions the caller already set in place.
+// refuse publishes Accepted=False, persists the status and requeues on the
+// resync cadence, leaving whatever other conditions the caller already set in
+// place.
 //
 // The policy itself is never dropped and its checks are never silently
 // removed — it stays marked not accepted, so downstream catalog compilation
 // keeps failing closed rather than serving traffic with one fewer guardrail
 // than the author declared.
+//
+// The requeue is a drift fallback, not a recovery path, which is why it uses
+// the same cadence as an accepted binding rather than a short one. Every
+// refusal here is lifted by an edit this controller already watches: the
+// policy itself, the provider it binds to, or the consumer Namespace's
+// labels. A refused policy therefore recovers on the watch event, and polling
+// faster would only repeat the uncached provider read that produced the
+// refusal — forever, for a misconfiguration no amount of re-reading fixes.
 func (r *Reconciler) refuse(
 	ctx context.Context,
 	guardrail, original *aigatewayv1alpha1.AIGuardrail,
@@ -438,10 +514,10 @@ func (r *Reconciler) refuse(
 		return ctrl.Result{}, err
 	}
 	// Emitted only after the patch succeeds, so an event never announces a
-	// verdict that failed to persist, and only on a transition, so the
-	// NotReadyRequeueInterval loop cannot become an event flood.
+	// verdict that failed to persist, and only on a transition, so the requeue
+	// loop cannot become an event flood.
 	if changed {
 		r.event(guardrail, corev1.EventTypeWarning, reason, message)
 	}
-	return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }

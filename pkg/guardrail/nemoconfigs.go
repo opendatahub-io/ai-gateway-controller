@@ -63,20 +63,20 @@ func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string]bool, error) 
 //
 // Compatible=True means the configuration is selectable, not that the running
 // server loaded it. Load success is not observable from the CR and needs the
-// same endpoint-discovery contract as evaluateProviderReady.
+// same endpoint-discovery contract as evaluateNemoReady.
 //
 // The verdict does not depend on the provider being ready. It compares two
 // specs, both readable while the server is down, so a configId typo is
 // reported as one instead of being masked by an unready provider.
-func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstructured.Unstructured) (bool, string, string) {
+func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstructured.Unstructured) (bool, string, string, error) {
 	configs, err := parseNemoConfigs(nemo)
 	if err != nil {
 		return false, reasonInvalidProviderConfigs,
-			fmt.Sprintf("referenced NemoGuardrails provider has malformed configurations: %v", err)
+			"referenced NemoGuardrails provider has malformed configurations in spec.nemoConfigs", err
 	}
 	if len(configs) == 0 {
 		return false, reasonProviderConfigsUnavailable,
-			"referenced NemoGuardrails provider declares no configurations in spec.nemoConfigs"
+			"referenced NemoGuardrails provider declares no configurations in spec.nemoConfigs", nil
 	}
 
 	var unknown []string
@@ -91,7 +91,7 @@ func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstruct
 
 	if len(unknown) == 0 {
 		return true, reasonChecksSatisfiable,
-			"every check selects a configuration declared by the provider"
+			"every check selects a configuration declared by the provider", nil
 	}
 
 	// Sorted so the message is stable across reconciles. An unstable message
@@ -99,5 +99,5 @@ func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstruct
 	// event on every pass through the requeue loop.
 	sort.Strings(unknown)
 	return false, reasonUnknownCheckConfig,
-		fmt.Sprintf("referenced NemoGuardrails provider does not declare configId(s): %s", strings.Join(unknown, ", "))
+		fmt.Sprintf("referenced NemoGuardrails provider does not declare configId(s): %s", strings.Join(unknown, ", ")), nil
 }
