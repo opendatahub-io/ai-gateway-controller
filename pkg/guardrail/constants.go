@@ -68,9 +68,13 @@ const (
 const (
 	reasonReferencesAuthorized  = "ReferencesAuthorized"
 	reasonProviderNotFound      = "ProviderNotFound"
-	reasonProviderReadError     = "ProviderReadError"
 	reasonInvalidPolicy         = "InvalidAllowedConsumers"
 	reasonConsumerNotAuthorized = "ConsumerNotAuthorized"
+	// reasonProviderCRDNotInstalled is reported when TrustyAI is absent, so
+	// no NemoGuardrails can exist for a policy to resolve against. Re-asked
+	// on every reconcile, so a policy is accepted once TrustyAI is installed
+	// without this controller being restarted; see providerCRDInstalled.
+	reasonProviderCRDNotInstalled = "ProviderCRDNotInstalled"
 )
 
 // Provider readiness condition reasons.
@@ -92,7 +96,7 @@ const (
 // must name a configuration the provider declares in spec.nemoConfigs[].name.
 // Whether the running NeMo server actually loaded that configuration is not
 // observable from the CR and needs the same endpoint-discovery contract as
-// provider readiness (see evaluateProviderReady).
+// provider readiness (see evaluateNemoReady).
 //
 // The proposal names no reasons for this condition, so all four are this
 // controller's own.

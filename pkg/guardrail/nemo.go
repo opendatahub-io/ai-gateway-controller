@@ -34,19 +34,27 @@ func NewNemoGuardrails() *unstructured.Unstructured {
 // providerCRDInstalled reports whether TrustyAI's NemoGuardrails CRD is
 // present on the cluster.
 //
-// This gates the whole reconciler. Watching a Kind whose CRD is absent fails
-// the informer and brings the manager down with it, which would take the
-// tenant and external-model reconcilers offline too — so on a cluster without
-// TrustyAI, an AI Gateway that cannot do guardrails has to keep doing
-// everything else.
+// This gates the provider watch, not the reconciler. Watching a Kind whose
+// CRD is absent fails the informer and brings the manager down with it, which
+// would take the tenant and external-model reconcilers offline too. The
+// reconciler itself still runs, so an AIGuardrail on a cluster without
+// TrustyAI is refused with reasonProviderCRDNotInstalled instead of being
+// left with no conditions.
 //
 // The manager's RESTMapper is used rather than a separate discovery client:
 // it is already built from the same discovery data, and reading it needs no
 // RBAC beyond the API discovery every client already performs.
 //
-// This is a startup-only decision. Installing TrustyAI afterwards does not
-// enable the reconciler until this controller restarts, which is the usual
-// trade for not running a CRD watch purely to detect its own activation.
+// Called twice over: at startup to decide whether to register the provider
+// watch, and on every reconcile so a policy is accepted on its own once
+// TrustyAI is installed. Only the watch needs a restart, because one cannot
+// be added to a running controller — until then provider edits are picked up
+// at the resync interval rather than immediately.
+//
+// The mapper reloads discovery on a miss, so the repeated call is a cache hit
+// once the CRD exists and an API round trip while it does not. That cost is
+// why the refusal is requeued on the resync cadence rather than the ten-second
+// one every other refusal uses.
 func providerCRDInstalled(mapper apimeta.RESTMapper) (bool, error) {
 	_, err := mapper.RESTMapping(NemoGuardrailsGVK.GroupKind(), NemoGuardrailsGVK.Version)
 	switch {

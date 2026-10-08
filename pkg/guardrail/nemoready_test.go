@@ -17,6 +17,7 @@ limitations under the License.
 package guardrail
 
 import (
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -26,7 +27,7 @@ import (
 // formatted the way controllers/nemo_guardrails/status.go does.
 const nemoEndpoint = "https://" + nemoName + "." + providerNS + ".svc.cluster.local"
 
-// TestEvaluateProviderReadyGatesOnTheDiscoveredEndpoint covers the contract
+// TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint covers the contract
 // TrustyAI merged in PR #977: status.endpoint is the sole input, and
 // everything else the CR reports is irrelevant to the verdict.
 //
@@ -38,7 +39,7 @@ const nemoEndpoint = "https://" + nemoName + "." + providerNS + ".svc.cluster.lo
 // (RHAI-4448 / RHOAIENG-96107), and with spec.exposeRoute unset the phase it
 // feeds is Ready unconditionally, so reading either would make this evaluator
 // fail open against a dead server. PR #977 did not change that.
-func TestEvaluateProviderReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
+func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 	withStatus := func(status map[string]any) *unstructured.Unstructured {
 		u := NewNemoGuardrails()
 		u.SetName(nemoName)
@@ -77,6 +78,27 @@ func TestEvaluateProviderReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 			provider: withStatus(map[string]any{"endpoint": "https:///v1/checks"}),
 		},
 		{
+			// Callers append their own path to this value, so a query or a
+			// fragment would end up in the middle of the resulting URL.
+			name:     "endpoint carries a query string",
+			provider: withStatus(map[string]any{"endpoint": nemoEndpoint + "/?debug=1"}),
+		},
+		{
+			name:     "endpoint carries an empty forced query",
+			provider: withStatus(map[string]any{"endpoint": nemoEndpoint + "?"}),
+		},
+		{
+			name:     "endpoint carries a fragment",
+			provider: withStatus(map[string]any{"endpoint": nemoEndpoint + "/#section"}),
+		},
+		{
+			// Accepting this would copy the password into
+			// status.providerEndpoint, the binding revision, and the Warning
+			// Event refuse emits.
+			name:     "endpoint embeds userinfo credentials",
+			provider: withStatus(map[string]any{"endpoint": "https://user:pw@" + nemoName + "." + providerNS + ".svc.cluster.local"}),
+		},
+		{
 			name: "phase Ready and DeploymentReady True, but no endpoint",
 			provider: withStatus(map[string]any{
 				"phase": "Ready",
@@ -104,22 +126,58 @@ func TestEvaluateProviderReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ready, endpoint, reason, message := evaluateProviderReady(c.provider)
-			if ready != c.wantReady {
-				t.Fatalf("evaluateProviderReady = %v, want %v (reason %q, message %q)", ready, c.wantReady, reason, message)
+			got := evaluateNemoReady(c.provider)
+			if got.Ready != c.wantReady {
+				t.Fatalf("evaluateNemoReady = %v, want %v (reason %q, message %q)", got.Ready, c.wantReady, got.Reason, got.Message)
 			}
-			if endpoint != c.wantEndpoint {
-				t.Errorf("endpoint = %q, want %q", endpoint, c.wantEndpoint)
+			if got.Endpoint != c.wantEndpoint {
+				t.Errorf("endpoint = %q, want %q", got.Endpoint, c.wantEndpoint)
 			}
 			wantReason := reasonEndpointDiscoveryUnavailable
 			if c.wantReady {
 				wantReason = reasonProviderAvailable
 			}
-			if reason != wantReason {
-				t.Errorf("reason = %q, want %q", reason, wantReason)
+			if got.Reason != wantReason {
+				t.Errorf("reason = %q, want %q", got.Reason, wantReason)
 			}
-			if message == "" {
+			if got.Message == "" {
 				t.Error("message is empty; status has to say why this verdict was reached")
+			}
+		})
+	}
+}
+
+// TestEvaluateNemoReadyDoesNotEchoTheRejectedEndpoint pins that a refusal
+// never republishes the raw status.endpoint. The field belongs to another
+// controller, so the rejected string is arbitrary input rather than the DNS
+// name the success path assumes, and Reconcile puts this message into both a
+// condition and a Warning Event that any reader of the consumer namespace can
+// see.
+func TestEvaluateNemoReadyDoesNotEchoTheRejectedEndpoint(t *testing.T) {
+	const secret = "sup3rs3cret"
+	host := nemoName + "." + providerNS + ".svc.cluster.local"
+
+	for _, endpoint := range []string{
+		"https://user:" + secret + "@" + host,
+		"http://user:" + secret + "@" + host,
+		"https://" + host + "/?token=" + secret,
+		"https://" + host + "/#" + secret,
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			provider := NewNemoGuardrails()
+			provider.SetName(nemoName)
+			provider.SetNamespace(providerNS)
+			provider.Object["status"] = map[string]any{"endpoint": endpoint}
+
+			got := evaluateNemoReady(provider)
+			if got.Ready {
+				t.Fatal("accepted an endpoint that is not a plain absolute https base URL")
+			}
+			if got.Endpoint != "" {
+				t.Errorf("endpoint = %q, want it withheld on refusal", got.Endpoint)
+			}
+			if strings.Contains(got.Message, secret) {
+				t.Errorf("refusal message republishes the rejected value: %q", got.Message)
 			}
 		})
 	}
