@@ -319,24 +319,34 @@ _select_praxis_on_default_tenant() {
   fi
 
   # aigc only reads these from MaasTenantConfig (never AITenant). Select ExtProc
-  # with type=praxis but WITHOUT clearing to claim: EnsurePraxisMayDeploy still
-  # blocks the deploy until cleanup-complete, so aigc will not create its own
-  # (same-named) payload-processing until the legacy IPP delete has converged.
-  # type=praxis is also the signal for maas-controller to stop managing the
-  # legacy IPP, so it will not recreate it during the delete.
-  echo "Annotating MaasTenantConfig ${ns}/${MAAS_TENANT_CONFIG_NAME}: type=praxis ..."
+  # with type=praxis and clear payload-processing-status in the same write:
+  # EnsurePraxisMayDeploy only keeps the deploy gate closed while the status is
+  # absent — both cleanup-complete and steady release aigc. A re-run (or any
+  # prior handoff) leaves the annotation behind, so without this clear aigc
+  # would create its own (same-named) payload-processing while
+  # _delete_legacy_ipp_in_gateway_namespace is still waiting for the legacy one
+  # to disappear. type=praxis is also the signal for maas-controller to stop
+  # managing the legacy IPP, so it will not recreate it during the delete.
+  echo "Annotating MaasTenantConfig ${ns}/${MAAS_TENANT_CONFIG_NAME}: type=praxis, clearing payload-processing-status ..."
   oc annotate maastenantconfig "${MAAS_TENANT_CONFIG_NAME}" -n "${ns}" \
     maas.opendatahub.io/payload-processing-type=praxis \
+    maas.opendatahub.io/payload-processing-status- \
     --overwrite
 
-  local type
+  local type status
   type="$(oc get maastenantconfig "${MAAS_TENANT_CONFIG_NAME}" -n "${ns}" \
     -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-type}' 2>/dev/null || true)"
   if [[ "${type}" != "praxis" ]]; then
     echo "ERROR: payload-processing-type did not stick (got '${type}')" >&2
     return 1
   fi
-  echo "MaasTenantConfig praxis selected: type=${type}"
+  status="$(oc get maastenantconfig "${MAAS_TENANT_CONFIG_NAME}" -n "${ns}" \
+    -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-status}' 2>/dev/null || true)"
+  if [[ -n "${status}" ]]; then
+    echo "ERROR: payload-processing-status is still '${status}'; the praxis deploy gate would be open during legacy IPP removal" >&2
+    return 1
+  fi
+  echo "MaasTenantConfig praxis selected: type=${type}, status=<absent> (deploy gate closed)"
 }
 
 _clear_praxis_cleanup_on_default_tenant() {
@@ -399,10 +409,12 @@ echo "  gateway: ${GATEWAY_NAMESPACE}/${GATEWAY_NAME}"
 echo "  remove maas IPP: ${REMOVE_MAAS_IPP}"
 
 # Apply the controller first so it is watching when the tenant opts in.
-# Then select praxis (type=praxis) and remove the legacy IPP; only after the
-# delete converges do we clear cleanup-complete, releasing aigc to create the
-# shared payload-processing. Clearing earlier races aigc's (same-named) create
-# against the legacy-removal convergence check.
+# Then select praxis (type=praxis) with payload-processing-status cleared — that
+# absent status is what holds aigc's deploy gate closed — and remove the legacy
+# IPP; only after the delete converges do we set cleanup-complete, releasing
+# aigc to create the shared payload-processing. Leaving a carried-over status in
+# place races aigc's (same-named) create against the legacy-removal
+# convergence check.
 _apply_ai_gateway_controller
 
 if [[ "${REMOVE_MAAS_IPP}" == "true" ]]; then
