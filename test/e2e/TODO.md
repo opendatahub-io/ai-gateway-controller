@@ -63,7 +63,7 @@ Some fixes landed in upstream MaaS `main` @ `5ece7d3` (#1493); IPP backend-swap 
 | **`validate-deployment.sh`** | BBR model URL is gateway-root; path-based HTTPRoute needs path prefix | **Upstream (maas-billing):** `E2E_MODEL_PATH` / `E2E_MODEL_REF` in `validate-deployment.sh`; **aigc:** `ensure_gateway_allows_model_namespace` in prow runner |
 | **`prow_run_*` prerequisites** | Empty `PRAXIS_EXTPROC_IMAGE` + `set -e` silent exit | **aigc-only** in `prow_run_ai_gateway_controller_test.sh` |
 | **Must-gather** | CI artifacts for HTTPRoute/LLMIS debugging | **aigc:** `collect-maas-must-gather.sh` dumps all `maas.opendatahub.io` + `inference.opendatahub.io` kinds, Gateway API HTTPRoutes/Gateways (cluster + per-namespace), Kuadrant policies, Istio gateway networking; Tekton step writes `gather-maas/` + `gather-openshift/` |
-| **Webhook handoff** | Pausing `maas-controller` breaks AITenant webhook during praxis install | **aigc-only** in `deploy-ai-gateway-controller.sh` (annotate → pause → delete IPP → **resume** → apply aigc) |
+| **Webhook handoff** | Applying aigc before legacy IPP delete lets it claim `cleanup-complete` and recreate shared names mid-wait | **aigc-only** in `deploy-ai-gateway-controller.sh` (select praxis → delete legacy IPP → `cleanup-complete` → **then** apply aigc) |
 | **IPP migration / backend swap** | Legacy↔praxis handoff races / `MaasTenantConfig` blocked during cleanup | **Upstream (#1508):** `ipp-migration-cleanup-complete` annotation as handoff boundary. aigc workarounds removed on `ci/e2e-maas-pr-1508`. |
 
 ---
