@@ -43,7 +43,7 @@ Some e2e fixes from the vendored branch (`ci/maas-e2e-konflux-group-test`) are *
 
 **Current choice:** MaaS source @ `090cc5d`, including the [#1546](https://github.com/opendatahub-io/models-as-a-service/pull/1546) short TRLP subscription IDs and the [#1537](https://github.com/opendatahub-io/models-as-a-service/pull/1537) rate-grouping test. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
 
-**Group-test harness mitigations (aigc-only, not product):** `patch-maas-tests-for-aigc.sh` + `prow_run_ai_gateway_controller_test.sh` pin shared `maasApi.replicas=1`, cap tenant IDs for EnvoyFilter ≤63, shorten `e2e-shared-*` prefixes, lower default `E2E_PARALLEL_WORKERS` (3), and raise `E2E_AITENANT_READY_TIMEOUT` / `E2E_MULTITENANCY_PHASE_TIMEOUT`. Revisit when MaaS defaults / worker count land upstream.
+**Group-test harness mitigations (aigc-only, not product):** `patch-maas-tests-for-aigc.sh` + `prow_run_ai_gateway_controller_test.sh` pin shared `maasApi.replicas=1`, cap tenant IDs for EnvoyFilter ≤63, shorten `e2e-shared-*` prefixes, default `E2E_PARALLEL_WORKERS=1` while still running marker-split passes (`-m 'not serial'` then `-m serial`; do not collapse into one selection), and raise `E2E_AITENANT_READY_TIMEOUT` / `E2E_MULTITENANCY_PHASE_TIMEOUT`. Revisit when MaaS defaults / worker count land upstream.
 
 ---
 

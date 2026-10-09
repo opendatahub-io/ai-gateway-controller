@@ -23,7 +23,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 export E2E_RECONCILE_WAIT="${E2E_RECONCILE_WAIT:-4}"
-E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-3}"
+# Default 1: concurrent AITenant bootstraps starve single-worker maastenantconfig.
+E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-1}"
 if ! [[ "$E2E_PARALLEL_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: E2E_PARALLEL_WORKERS must be a positive integer (>= 1), got '$E2E_PARALLEL_WORKERS'" >&2
     exit 1
@@ -32,13 +33,11 @@ fi
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-${ARTIFACT_DIR:-${ARTIFACTS:-${LOG_DIR:-$PROJECT_ROOT/test/e2e/reports}}}}"
 mkdir -p "$ARTIFACTS_DIR"
 
-if [[ "$E2E_PARALLEL_WORKERS" -gt 1 ]]; then
-    export E2E_AUTHPOLICY_PHASE_TIMEOUT="${E2E_AUTHPOLICY_PHASE_TIMEOUT:-120}"
-    export E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT="${E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT:-90}"
-    export E2E_GATEWAY_ENFORCED_TIMEOUT="${E2E_GATEWAY_ENFORCED_TIMEOUT:-240}"
-    export E2E_MULTITENANCY_PHASE_TIMEOUT="${E2E_MULTITENANCY_PHASE_TIMEOUT:-360}"
-    export E2E_AITENANT_READY_TIMEOUT="${E2E_AITENANT_READY_TIMEOUT:-480}"
-fi
+export E2E_AUTHPOLICY_PHASE_TIMEOUT="${E2E_AUTHPOLICY_PHASE_TIMEOUT:-120}"
+export E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT="${E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT:-90}"
+export E2E_GATEWAY_ENFORCED_TIMEOUT="${E2E_GATEWAY_ENFORCED_TIMEOUT:-240}"
+export E2E_MULTITENANCY_PHASE_TIMEOUT="${E2E_MULTITENANCY_PHASE_TIMEOUT:-360}"
+export E2E_AITENANT_READY_TIMEOUT="${E2E_AITENANT_READY_TIMEOUT:-480}"
 
 VENV_DIR="${PROJECT_ROOT}/test/e2e/.venv"
 if [[ ! -d "$VENV_DIR" ]]; then
@@ -114,8 +113,10 @@ fi
 parallel_rc=0
 serial_rc=0
 
-if [[ "$serial_only" == "true" || "$E2E_PARALLEL_WORKERS" -le 1 ]]; then
-    echo "Running E2E tests serially (E2E_PARALLEL_WORKERS=${E2E_PARALLEL_WORKERS})"
+# Always keep marker-split passes (not serial / serial). Collapsing into one
+# pytest selection mixes markers and trips MaaS fixtures (see group-test-6wmsg).
+if [[ "$serial_only" == "true" ]]; then
+    echo "Running E2E tests serially (--serial-only)"
     if ! PYTHONPATH="$TEST_DIR:${PYTHONPATH:-}" pytest \
         --maxfail=5 \
         --junitxml="$xml" \

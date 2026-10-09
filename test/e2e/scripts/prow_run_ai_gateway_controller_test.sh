@@ -315,9 +315,10 @@ run_e2e_tests() {
     fi
 
     export ARTIFACTS_DIR
-    # Lower default parallelism vs upstream MaaS (7): group-test single-worker
-    # maastenantconfig + per-tenant maas-api rollouts otherwise starve Ready waits.
-    export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-3}"
+    # Serial default vs upstream MaaS (7), but keep marker-split passes (not one
+    # mixed selection). Concurrent AITenant bootstraps starve single-worker
+    # maastenantconfig / per-tenant maas-api Ready waits.
+    export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-1}"
     export E2E_RECONCILE_WAIT="${E2E_RECONCILE_WAIT:-4}"
     export E2E_MULTITENANCY_PHASE_TIMEOUT="${E2E_MULTITENANCY_PHASE_TIMEOUT:-360}"
     export E2E_AITENANT_READY_TIMEOUT="${E2E_AITENANT_READY_TIMEOUT:-480}"
