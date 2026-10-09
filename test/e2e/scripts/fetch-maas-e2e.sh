@@ -130,4 +130,6 @@ done
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/patch-maas-deploy-for-aigc.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/patch-maas-tests-for-aigc.sh"
 _ensure_maas_script_perms

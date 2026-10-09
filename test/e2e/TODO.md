@@ -39,9 +39,11 @@ Some e2e fixes from the vendored branch (`ci/maas-e2e-konflux-group-test`) are *
 | Approach | When to use | Trade-off |
 |----------|-------------|-----------|
 | **Upstream MaaS PR** (preferred) | Fix belongs in shared MaaS tests (praxis log skip, `_poll_status` flakes, duplicate-header warmup) | All MaaS consumers benefit; slower until merged |
-| **aigc post-fetch patch** (`patch-maas-tests-for-aigc.sh`, not added yet) | Short-term CI unblock while upstream PR is open | Duplicated logic; must re-apply after every lock bump |
+| **aigc post-fetch patch** (`patch-maas-tests-for-aigc.sh`) | Short-term CI unblock while upstream PR is open | Duplicated logic; must re-apply after every lock bump |
 
 **Current choice:** MaaS source @ `090cc5d`, including the [#1546](https://github.com/opendatahub-io/models-as-a-service/pull/1546) short TRLP subscription IDs and the [#1537](https://github.com/opendatahub-io/models-as-a-service/pull/1537) rate-grouping test. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
+
+**Group-test harness mitigations (aigc-only, not product):** `patch-maas-tests-for-aigc.sh` + `prow_run_ai_gateway_controller_test.sh` pin shared `maasApi.replicas=1`, cap tenant IDs for EnvoyFilter ≤63, shorten `e2e-shared-*` prefixes, default `E2E_PARALLEL_WORKERS=1` while still running marker-split passes (`-m 'not serial'` then `-m serial`; do not collapse into one selection), and raise `E2E_AITENANT_READY_TIMEOUT` / `E2E_MULTITENANCY_PHASE_TIMEOUT`. Revisit when MaaS defaults / worker count land upstream.
 
 ---
 
@@ -61,7 +63,7 @@ Some fixes landed in upstream MaaS `main` @ `5ece7d3` (#1493); IPP backend-swap 
 | **`validate-deployment.sh`** | BBR model URL is gateway-root; path-based HTTPRoute needs path prefix | **Upstream (maas-billing):** `E2E_MODEL_PATH` / `E2E_MODEL_REF` in `validate-deployment.sh`; **aigc:** `ensure_gateway_allows_model_namespace` in prow runner |
 | **`prow_run_*` prerequisites** | Empty `PRAXIS_EXTPROC_IMAGE` + `set -e` silent exit | **aigc-only** in `prow_run_ai_gateway_controller_test.sh` |
 | **Must-gather** | CI artifacts for HTTPRoute/LLMIS debugging | **aigc:** `collect-maas-must-gather.sh` dumps all `maas.opendatahub.io` + `inference.opendatahub.io` kinds, Gateway API HTTPRoutes/Gateways (cluster + per-namespace), Kuadrant policies, Istio gateway networking; Tekton step writes `gather-maas/` + `gather-openshift/` |
-| **Webhook handoff** | Pausing `maas-controller` breaks AITenant webhook during praxis install | **aigc-only** in `deploy-ai-gateway-controller.sh` (annotate → pause → delete IPP → **resume** → apply aigc) |
+| **Webhook handoff** | Applying aigc before legacy IPP delete lets it claim `cleanup-complete` and recreate shared names mid-wait | **aigc-only** in `deploy-ai-gateway-controller.sh` (select praxis → delete legacy IPP → `cleanup-complete` → **then** apply aigc) |
 | **IPP migration / backend swap** | Legacy↔praxis handoff races / `MaasTenantConfig` blocked during cleanup | **Upstream (#1508):** `ipp-migration-cleanup-complete` annotation as handoff boundary. aigc workarounds removed on `ci/e2e-maas-pr-1508`. |
 
 ---

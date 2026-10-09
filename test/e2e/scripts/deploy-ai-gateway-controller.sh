@@ -146,6 +146,14 @@ _tenant_config_namespace() {
   fi
 }
 
+# True when payload-processing is already owned by aigc (praxis handoff landed).
+_payload_processing_owned_by_aigc() {
+  local managed
+  managed="$(oc get deployment payload-processing -n "${GATEWAY_NAMESPACE}" \
+    -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+  [[ "${managed}" == "ai-gateway-controller" ]]
+}
+
 _delete_legacy_ipp_in_gateway_namespace() {
   echo "Removing maas-controller legacy IPP in ${GATEWAY_NAMESPACE} ..."
   local name
@@ -169,11 +177,20 @@ _delete_legacy_ipp_in_gateway_namespace() {
       echo "Legacy IPP resources removed from ${GATEWAY_NAMESPACE}"
       return 0
     fi
+    # aigc may claim the shared names once MaaS writes cleanup-complete; that is
+    # handoff success, not legacy leftover (see group-test-25tzt).
+    if _payload_processing_owned_by_aigc; then
+      echo "payload-processing already managed-by ai-gateway-controller; treating legacy IPP removal as done"
+      return 0
+    fi
     sleep 2
   done
   echo "ERROR: legacy IPP resources still present after delete" >&2
   oc get deployment,service,serviceaccount,configmap,envoyfilter,destinationrule,networkpolicy \
     -n "${GATEWAY_NAMESPACE}" 2>/dev/null | grep payload || true
+  oc get deployment payload-processing -n "${GATEWAY_NAMESPACE}" \
+    -o jsonpath='managed-by={.metadata.labels.app\.kubernetes\.io/managed-by} image={.spec.template.spec.containers[0].image}{"\n"}' \
+    2>/dev/null || true
   oc get clusterrolebinding payload-processing-reader 2>/dev/null || true
   return 1
 }
@@ -319,14 +336,11 @@ _select_praxis_on_default_tenant() {
   fi
 
   # aigc only reads these from MaasTenantConfig (never AITenant). Select ExtProc
-  # with type=praxis and clear payload-processing-status in the same write:
-  # EnsurePraxisMayDeploy only keeps the deploy gate closed while the status is
-  # absent — both cleanup-complete and steady release aigc. A re-run (or any
-  # prior handoff) leaves the annotation behind, so without this clear aigc
-  # would create its own (same-named) payload-processing while
-  # _delete_legacy_ipp_in_gateway_namespace is still waiting for the legacy one
-  # to disappear. type=praxis is also the signal for maas-controller to stop
-  # managing the legacy IPP, so it will not recreate it during the delete.
+  # with type=praxis and clear payload-processing-status in the same write.
+  # Absent status keeps EnsurePraxisMayDeploy closed until we set
+  # cleanup-complete after legacy IPP removal (aigc is applied only then).
+  # type=praxis is also the signal for maas-controller to stop managing legacy
+  # IPP and run its SkipIPP cleanup path.
   echo "Annotating MaasTenantConfig ${ns}/${MAAS_TENANT_CONFIG_NAME}: type=praxis, clearing payload-processing-status ..."
   oc annotate maastenantconfig "${MAAS_TENANT_CONFIG_NAME}" -n "${ns}" \
     maas.opendatahub.io/payload-processing-type=praxis \
@@ -408,19 +422,21 @@ echo "  namespace: ${AI_GATEWAY_CONTROLLER_NAMESPACE}"
 echo "  gateway: ${GATEWAY_NAMESPACE}/${GATEWAY_NAME}"
 echo "  remove maas IPP: ${REMOVE_MAAS_IPP}"
 
-# Apply the controller first so it is watching when the tenant opts in.
-# Then select praxis (type=praxis) with payload-processing-status cleared — that
-# absent status is what holds aigc's deploy gate closed — and remove the legacy
-# IPP; only after the delete converges do we set cleanup-complete, releasing
-# aigc to create the shared payload-processing. Leaving a carried-over status in
-# place races aigc's (same-named) create against the legacy-removal
-# convergence check.
-_apply_ai_gateway_controller
-
+# Handoff before applying aigc. New MaasTenantConfigs are seeded with
+# cleanup-complete; if aigc is already running it claims steady and creates
+# shared payload-processing while _delete_legacy_ipp still waits for names to
+# disappear (group-test-25tzt). Order: select praxis + clear status → remove
+# legacy IPP (MaaS may write cleanup-complete) → ensure cleanup-complete →
+# apply aigc → wait for praxis.
 if [[ "${REMOVE_MAAS_IPP}" == "true" ]]; then
   _select_praxis_on_default_tenant
   _delete_legacy_ipp_in_gateway_namespace
   _clear_praxis_cleanup_on_default_tenant
+fi
+
+_apply_ai_gateway_controller
+
+if [[ "${REMOVE_MAAS_IPP}" == "true" ]]; then
   _wait_for_aigc_praxis_reconcile
   _wait_for_praxis_extproc
   _protect_praxis_from_maas_reconcile
