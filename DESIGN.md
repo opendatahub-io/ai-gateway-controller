@@ -253,6 +253,18 @@ doc comment for the full state machine this mirrors. In short:
   controller writes `cleanup-complete` (`MarkPayloadProcessingCleanupComplete`)
   so maas-controller may claim to absent and (re)deploy legacy IPP.
 
+### Plugins ConfigMap migration gate (RHOAIENG-98846)
+
+maas-controller fingerprints the live `payload-processing-plugins` ConfigMap
+**before** IPP cleanup and only auto-migrates known-good baselines (product
+default, or default with response `api-translation` enabled). Non-standard
+ConfigMaps block cleanup until the operator sets
+`maas.opendatahub.io/force-payload-processing-migration=true` on
+`MaasTenantConfig` (after reviewing release notes). This controller adds
+defense-in-depth: if an IPP-shaped plugins ConfigMap is still present at
+Praxis apply time without that force annotation, apply waits rather than
+`ForceOwnership`-overwriting custom plugin edits.
+
 ## Scope
 
 ### Phase 1 — `praxis-extproc` install (implemented)

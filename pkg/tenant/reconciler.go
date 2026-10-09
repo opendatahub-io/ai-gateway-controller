@@ -423,6 +423,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
+	// RHOAIENG-98846: do not ForceOwnership-overwrite a leftover IPP plugins
+	// ConfigMap unless the operator force-annotated the MaasTenantConfig.
+	if err := r.ensurePluginsConfigMapMigrationAllowed(ctx, mtc, gatewayNamespace, tenantID); err != nil {
+		log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+
 	// Re-validate the owning AITenant live, immediately before writing cluster
 	// resources: the resolve above read the informer cache, which can lag a
 	// delete+recreate (new UID), a re-home (new gatewayRef), or a spec bump
