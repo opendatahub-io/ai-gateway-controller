@@ -48,6 +48,7 @@ var buildVersion = "dev"
 func main() {
 	var (
 		metricsAddr          string
+		metricsSecure        bool
 		probeAddr            string
 		enableLeaderElection bool
 		image                string
@@ -64,7 +65,8 @@ func main() {
 		skipNetworkPolicy    bool
 	)
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
+	flag.BoolVar(&metricsSecure, "metrics-secure", true, "Serve metrics over HTTPS using the TLS certificates in /tmp/k8s-metrics-server/metrics-certs.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
@@ -119,7 +121,8 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: clientgoscheme.Scheme,
 		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
+			BindAddress:   metricsAddr,
+			SecureServing: metricsSecure,
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
