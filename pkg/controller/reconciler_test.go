@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1154,15 +1156,37 @@ func TestReconcileRecoversProviderAfterTransientTransportFailure(t *testing.T) {
 
 func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	r, model := reconcilerFixture(t)
+	r.KnownClusters = append(r.KnownClusters, "provider-provider-b", "provider-provider-c")
+	model.Spec.ModelName = "shared-model"
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
 	}
-	sibling := model.DeepCopy()
-	sibling.Name = "sibling"
-	sibling.UID = "sibling-uid"
-	sibling.ResourceVersion = ""
-	sibling.Finalizers = []string{externalModelFinalizer}
-	sibling.Status.Phase = resolver.PhaseReady
+	for _, name := range []string{"provider-b", "provider-c"} {
+		provider := &v1alpha1.ExternalProvider{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: model.Namespace, UID: types.UID(name + "-uid")},
+			Spec: v1alpha1.ExternalProviderSpec{
+				Provider: "openai", Endpoint: name + ".example.com",
+				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: name + "-credentials"}},
+			},
+		}
+		if err := r.Create(context.Background(), provider); err != nil {
+			t.Fatal(err)
+		}
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-credentials", Namespace: model.Namespace}, Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}
+		if err := r.Create(context.Background(), secret); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sibling := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid", Finalizers: []string{externalModelFinalizer}},
+		Spec: v1alpha1.ExternalModelSpec{ModelName: "shared-model", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
+			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-c"}, TargetModel: "gpt-c", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		}},
+	}
 	if err := r.Create(context.Background(), sibling); err != nil {
 		t.Fatal(err)
 	}
@@ -1186,8 +1210,226 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(overlay.Data["routing-overlay.json"], "sibling") {
-		t.Fatal("remaining overlay does not contain sibling model")
+	var published envelope.Envelope
+	if err := json.Unmarshal([]byte(overlay.Data["routing-overlay.json"]), &published); err != nil {
+		t.Fatalf("decode republished overlay: %v", err)
+	}
+	var policy struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(published.Overlay.SelectionPolicy, &policy); err != nil || policy.Mode != "random" {
+		t.Fatalf("deletion-time selection policy = %s, want random (err=%v)", published.Overlay.SelectionPolicy, err)
+	}
+	if len(published.Overlay.Candidates) != 2 {
+		t.Fatalf("deletion-time candidates = %d, want both remaining providers", len(published.Overlay.Candidates))
+	}
+	for _, candidate := range published.Overlay.Candidates {
+		if candidate.Name != "shared-model" || candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Fatalf("deletion-time candidate did not retain shared random group: %+v", candidate)
+		}
+	}
+	deletionDigest := published.Revision.Value
+	deletionGeneration := published.Provenance.SourceGeneration
+	remainingProviders := make([]*v1alpha1.ExternalProvider, 0, 2)
+	for _, name := range []string{"provider-b", "provider-c"} {
+		provider := &v1alpha1.ExternalProvider{}
+		if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: name}, provider); err != nil {
+			t.Fatal(err)
+		}
+		provider.Status.Phase = resolver.PhaseReady
+		remainingProviders = append(remainingProviders, provider)
+	}
+	remainingSet, err := resolver.Resolve([]*v1alpha1.ExternalModel{sibling}, remainingProviders)
+	if err != nil {
+		t.Fatalf("resolve normal remaining routes: %v", err)
+	}
+	normal, err := envelope.Render(remainingSet, envelope.Scope{
+		Network: r.Network, Gateway: r.GatewayName, Namespace: sibling.Namespace, LocalSite: r.localSite(),
+	}, envelope.Revision{Generation: deletionGeneration, Digest: deletionDigest}, envelope.Options{
+		KnownClusters: r.KnownClusters, SourceUID: string(sibling.UID), ProducerVersion: r.ProducerVersion,
+	})
+	if err != nil {
+		t.Fatalf("render normal remaining routes: %v", err)
+	}
+	if normal.Revision.Value != deletionDigest || normal.Provenance.SourceGeneration != deletionGeneration {
+		t.Fatalf("normal publication revision %s/%d differs from deletion-time %s/%d",
+			normal.Revision.Value, normal.Provenance.SourceGeneration, deletionDigest, deletionGeneration)
+	}
+	var normalPolicy struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(normal.Overlay.SelectionPolicy, &normalPolicy); err != nil {
+		t.Fatalf("decode normal selection policy: %v", err)
+	}
+	if normalPolicy.Mode != policy.Mode {
+		t.Fatalf("normal selection policy %s differs from deletion-time %s",
+			normalPolicy.Mode, policy.Mode)
+	}
+}
+
+func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	var providerA v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "provider"}, &providerA); err != nil {
+		t.Fatal(err)
+	}
+	providerA.Status.Phase = resolver.PhaseReady
+	if err := r.Status().Update(context.Background(), &providerA); err != nil {
+		t.Fatal(err)
+	}
+	providerB := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace, UID: "provider-b-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	if err := r.Create(context.Background(), providerB); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: model.Namespace},
+		Data:       map[string][]byte{"api-key": []byte("fixture-only-secret")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+	})
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
+
+	providerTransport := map[string]map[string]bool{}
+	routedProviders := map[string]bool{}
+	routeApplied, filterApplied, publishCalled := false, false, false
+	r.ApplyResource = func(ctx context.Context, _ client.Client, object unstructured.Unstructured) error {
+		labels := object.GetLabels()
+		providerName := labels["inference.opendatahub.io/external-provider"]
+		if providerName != "" {
+			if providerTransport[providerName] == nil {
+				providerTransport[providerName] = map[string]bool{}
+			}
+			providerTransport[providerName][object.GetKind()] = true
+		}
+		if object.GetKind() == "HTTPRoute" && labels["inference.opendatahub.io/external-model"] == model.Name {
+			routeApplied = true
+			for _, rawRule := range nestedSlice(t, object.Object, "spec", "rules") {
+				rule, ok := rawRule.(map[string]any)
+				if !ok {
+					continue
+				}
+				for _, rawBackend := range nestedSlice(t, rule, "backendRefs") {
+					backend, ok := rawBackend.(map[string]any)
+					if !ok {
+						continue
+					}
+					if name, ok := backend["name"].(string); ok {
+						routedProviders[name] = true
+					}
+				}
+			}
+		}
+		if object.GetKind() == "EnvoyFilter" {
+			filterApplied = true
+		}
+		return render.Apply(ctx, r.Client, []unstructured.Unstructured{object})
+	}
+	pub, err := publisher.New(r.Client, publisher.Config{Namespace: model.Namespace, Name: "routing-overlay"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.PublishOverlay = func(ctx context.Context, set *resolver.ResolvedRouteSet, scope envelope.Scope,
+		options envelope.Options) (publisher.Result, error) {
+		for _, provider := range []string{"provider", "provider-b"} {
+			for _, kind := range []string{"Service", "ServiceEntry", "DestinationRule"} {
+				if !providerTransport[provider][kind] {
+					return publisher.Result{}, fmt.Errorf("publish called before %s transport for %s was applied", kind, provider)
+				}
+			}
+		}
+		if !routeApplied || !filterApplied {
+			return publisher.Result{}, errors.New("publish called before candidate HTTPRoute and EnvoyFilter were applied")
+		}
+		for _, provider := range []string{"provider-provider", "provider-provider-b"} {
+			if !routedProviders[provider] {
+				return publisher.Result{}, fmt.Errorf("candidate HTTPRoute lacks backend %s", provider)
+			}
+		}
+		preview, err := envelope.Render(set, scope, envelope.Revision{}, options)
+		if err != nil {
+			return publisher.Result{}, err
+		}
+		if string(preview.Overlay.SelectionPolicy) != `{"mode":"random"}` || len(preview.Overlay.Candidates) != 2 {
+			return publisher.Result{}, fmt.Errorf("published candidates/policy = %d/%s, want two grouped random candidates",
+				len(preview.Overlay.Candidates), preview.Overlay.SelectionPolicy)
+		}
+		for _, candidate := range preview.Overlay.Candidates {
+			if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+				return publisher.Result{}, fmt.Errorf("candidate %s lacks numeric group zero", candidate.Cluster)
+			}
+		}
+		publishCalled = true
+		return pub.Publish(ctx, set, scope, options)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !publishCalled {
+		t.Fatal("overlay selection was not published")
+	}
+}
+
+func TestReconcileRejectsUnequalWeightsBeforeTransportOrPublication(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	var providerA v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "provider"}, &providerA); err != nil {
+		t.Fatal(err)
+	}
+	providerA.Status.Phase = resolver.PhaseReady
+	if err := r.Status().Update(context.Background(), &providerA); err != nil {
+		t.Fatal(err)
+	}
+	providerB := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace, UID: "provider-b-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	if err := r.Create(context.Background(), providerB); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: model.Namespace},
+		Data:       map[string][]byte{"api-key": []byte("fixture-only-secret")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unequalWeight := 2
+	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat",
+		Path: "/v1/chat/completions", Weight: &unequalWeight,
+	})
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	r.KnownClusters = append(r.KnownClusters, "provider-provider-b")
+	transportApplied, overlayPublished := false, false
+	r.ApplyResource = func(context.Context, client.Client, unstructured.Unstructured) error {
+		transportApplied = true
+		return nil
+	}
+	r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
+		overlayPublished = true
+		return publisher.Result{}, nil
+	}
+	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if !errors.Is(err, envelope.ErrWeightUnsupported) {
+		t.Fatalf("Reconcile error = %v, want WeightUnsupported", err)
+	}
+	if transportApplied || overlayPublished {
+		t.Fatalf("unsupported weights changed serving resources: transportApplied=%t overlayPublished=%t",
+			transportApplied, overlayPublished)
 	}
 }
 
