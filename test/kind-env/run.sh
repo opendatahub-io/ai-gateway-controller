@@ -410,6 +410,7 @@ EOF
   "${KCTL[@]}" -n kuadrant-system get authorino authorino -o yaml >"$EVIDENCE/authorino-ca-config.yaml"
   kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-api/rbac" | sed 's#namespace: opendatahub#namespace: maas-system#g' | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/31-maas-api-kind-rbac.yaml"
+  "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/32-maas-api-kind-network.yaml"
   # The webhook Secret is created after the OpenShift-only bundle is rendered;
   # restart so the projected certificate is present before manager startup.
   "${KCTL[@]}" -n maas-system rollout restart deployment/maas-controller
@@ -602,7 +603,7 @@ EOF
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml) continue ;;
+      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml) continue ;;
       45-real-openai-policies.yaml|60-client-kind-patch.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
@@ -806,15 +807,17 @@ EOF
       -p='{"spec":{"template":{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532}}}}}'
   }
   wait_for_extproc maas-system payload-pre-processing
-  wait_for_extproc models-as-a-service payload-processing
+  wait_for_extproc models-as-a-service payload-processing-external-model
   patch_kind_extproc_identity maas-system payload-pre-processing
-  patch_kind_extproc_identity models-as-a-service payload-processing
-  for extproc_ref in maas-system/payload-pre-processing models-as-a-service/payload-processing; do
+  patch_kind_extproc_identity models-as-a-service payload-processing-external-model
+  for extproc_ref in maas-system/payload-pre-processing models-as-a-service/payload-processing-external-model; do
     extproc_namespace=${extproc_ref%/*}
     extproc_name=${extproc_ref#*/}
     deployed_image=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o jsonpath='{.spec.template.spec.containers[0].image}')
     [[ "$deployed_image" == "${EXTPROC_IMAGE:-praxis-extproc:dev}" ]] || { fail "ExtProc image mismatch for $extproc_ref: requested=${EXTPROC_IMAGE:-praxis-extproc:dev} deployed=$deployed_image"; exit 2; }
-    "${KCTL[@]}" -n "$extproc_namespace" get pods -l app=payload-processing -o json | jq --arg requested "${EXTPROC_IMAGE:-praxis-extproc:dev}" --arg deployment "$extproc_name" '{requestedImage:$requested,deployment:$deployment,pods:[.items[]|{name:.metadata.name,uid:.metadata.uid,image:.spec.containers[0].image,imageID:.status.containerStatuses[0].imageID,ready:([.status.conditions[]?|select(.type=="Ready" and .status=="True")]|length==1)}]}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
+    deployment_selector=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o json | jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")')
+    [[ -n "$deployment_selector" ]] || { fail "ExtProc Deployment $extproc_ref has no selector"; exit 2; }
+    "${KCTL[@]}" -n "$extproc_namespace" get pods -l "$deployment_selector" -o json | jq --arg requested "${EXTPROC_IMAGE:-praxis-extproc:dev}" --arg deployment "$extproc_name" '{requestedImage:$requested,deployment:$deployment,pods:[.items[]|{name:.metadata.name,uid:.metadata.uid,image:.spec.containers[0].image,imageID:.status.containerStatuses[0].imageID,ready:([.status.conditions[]?|select(.type=="Ready" and .status=="True")]|length==1)}]}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
   done
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-a-tenant-b --timeout=180s
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-b-tenant-b --timeout=180s
