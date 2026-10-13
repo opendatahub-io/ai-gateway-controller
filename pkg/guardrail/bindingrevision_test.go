@@ -63,7 +63,13 @@ func mustComputeRevision(
 	consumerNS *corev1.Namespace,
 ) string {
 	t.Helper()
-	revision, err := computeBindingRevision(nemo, endpoint, policy, consumerNS)
+	// Parsed here the way Reconcile parses once and hands the result on, so
+	// the cases below keep naming configurations instead of maps.
+	configs, err := parseNemoConfigs(nemo)
+	if err != nil {
+		t.Fatalf("parseNemoConfigs: %v", err)
+	}
+	revision, err := computeBindingRevision(nemo, configs, endpoint, policy, consumerNS)
 	if err != nil {
 		t.Fatalf("computeBindingRevision: %v", err)
 	}
@@ -254,20 +260,6 @@ func TestComputeBindingRevisionIgnoresLabelsOutsideSelectorMode(t *testing.T) {
 				t.Fatalf("revision depends on Namespace labels in %s mode, which never reads them", mode)
 			}
 		})
-	}
-}
-
-// TestComputeBindingRevisionRejectsUnparsableConfigs keeps the digest from
-// standing in for a provider it could not read. Reconcile only reaches this
-// on the accepted path, where Compatible=True already proves the parse
-// succeeded, so this pins the contract rather than a reachable state.
-func TestComputeBindingRevisionRejectsUnparsableConfigs(t *testing.T) {
-	provider := nemoWithRawConfigs([]any{int64(7)})
-	provider.SetName(nemoName)
-	provider.SetNamespace(providerNS)
-
-	if _, err := computeBindingRevision(provider, revisionEndpoint, allowedConsumers{Mode: consumerModeSame}, nil); err == nil {
-		t.Fatal("computeBindingRevision succeeded on a provider whose configurations cannot be parsed")
 	}
 }
 

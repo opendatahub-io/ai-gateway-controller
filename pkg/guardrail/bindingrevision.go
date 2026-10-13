@@ -126,9 +126,10 @@ func selectorLabels(selector *metav1.LabelSelector, consumerNS *corev1.Namespace
 // bindingInputs — the same construction pkg/envelope uses for content
 // addressing.
 //
-// endpoint is the provider's discovered checks endpoint, as returned by
-// evaluateNemoReady. consumerNS is the consumer namespace's Namespace
-// object, or nil outside Selector mode, where no labels are read.
+// configs are the provider's declared configuration names, already parsed by
+// evaluateCompatible. endpoint is the provider's discovered checks endpoint,
+// as returned by evaluateNemoReady. consumerNS is the consumer namespace's
+// Namespace object, or nil outside Selector mode, where no labels are read.
 //
 // This does not detect every remote change, and must not be documented as if
 // it did. The content of a ConfigMap behind a declared configuration name is
@@ -137,14 +138,11 @@ func selectorLabels(selector *metav1.LabelSelector, consumerNS *corev1.Namespace
 // configuration resources immutably where that distinction matters.
 func computeBindingRevision(
 	nemo *unstructured.Unstructured,
+	configs map[string]bool,
 	endpoint string,
 	policy allowedConsumers,
 	consumerNS *corev1.Namespace,
 ) (string, error) {
-	configs, err := parseNemoConfigs(nemo)
-	if err != nil {
-		return "", fmt.Errorf("reading provider configurations: %w", err)
-	}
 	declared := make([]string, 0, len(configs))
 	for name := range configs {
 		declared = append(declared, name)

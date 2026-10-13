@@ -349,21 +349,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// compares two specs, both readable while the server is down, so a
 	// configId typo is reported as one instead of being masked by an unready
 	// provider.
-	compatible, compatibleReason, compatibleMessage, parseErr := evaluateCompatible(&guardrail, nemo)
-	if parseErr != nil {
+	compat := evaluateCompatible(&guardrail, nemo)
+	if compat.Err != nil {
 		log.Info("AIGuardrail provider has malformed spec.nemoConfigs",
-			"provider", provider, "error", parseErr)
+			"provider", provider, "error", compat.Err)
 	}
 	compatibleStatus := metav1.ConditionFalse
-	if compatible {
+	if compat.Compatible {
 		compatibleStatus = metav1.ConditionTrue
 	}
 	apimeta.SetStatusCondition(&guardrail.Status.Conditions, metav1.Condition{
 		Type:               ConditionCompatible,
 		Status:             compatibleStatus,
 		ObservedGeneration: guardrail.Generation,
-		Reason:             compatibleReason,
-		Message:            compatibleMessage,
+		Reason:             compat.Reason,
+		Message:            compat.Message,
 	})
 
 	// Provider readiness resolves the provider's published checks endpoint,
@@ -386,10 +386,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// is a static misconfiguration whose author can fix it, whereas an unready
 	// provider is usually transient and says nothing about whether the policy
 	// itself is correct.
-	if !compatible {
+	if !compat.Compatible {
 		log.Info("AIGuardrail checks are not satisfiable by its provider",
-			"provider", provider, "reason", compatibleReason)
-		return r.refuse(ctx, &guardrail, original, compatibleReason, compatibleMessage)
+			"provider", provider, "reason", compat.Reason)
+		return r.refuse(ctx, &guardrail, original, compat.Reason, compat.Message)
 	}
 	if !readiness.Ready {
 		log.Info("AIGuardrail provider not ready", "provider", provider, "reason", readiness.Reason)
@@ -407,7 +407,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// for an unreachable state would be vocabulary nobody can act on. If it
 	// ever does fail, something is wrong beyond this policy, and a backed-off
 	// retry that leaves the previous status alone is the right response.
-	revision, err := computeBindingRevision(nemo, readiness.Endpoint, policy, consumerNS)
+	revision, err := computeBindingRevision(nemo, compat.Configs, readiness.Endpoint, policy, consumerNS)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("computing the binding revision for %s: %w", req.NamespacedName, err)
 	}

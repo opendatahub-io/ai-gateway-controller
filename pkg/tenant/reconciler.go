@@ -294,16 +294,6 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	if ns, ok := ConfigNamespace(aitenant); !ok || ns != mtc.GetNamespace() {
 		return false, nil
 	}
-	// A delete in flight is the one transition none of the other signals can
-	// see. Finalizers keep the object readable with its uid, ownership bind,
-	// phase, observedGeneration and gatewayRef all unchanged until maas
-	// finishes tearing it down, so every check around this one still passes
-	// while a fresh install would be landing for a tenant on its way out.
-	// deletionTimestamp is the only field that flips the moment the delete is
-	// accepted (status.phase: Terminating arrives later, once maas observes it).
-	if !aitenant.GetDeletionTimestamp().IsZero() {
-		return false, nil
-	}
 	// The gateway we rendered against must still be the live one: a re-home
 	// (new status.gatewayRef for the same object) must not be applied against
 	// the old gateway.

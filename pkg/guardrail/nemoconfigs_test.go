@@ -53,7 +53,7 @@ const (
 	// test can assert it never reaches the consumer-visible message.
 	providerSecret = "provider-only-do-not-publish"
 	// malformedConfigsMessage is the fixed text evaluateCompatible publishes
-	// for an unparseable spec.nemoConfigs.
+	// for an unparsable spec.nemoConfigs.
 	malformedConfigsMessage = "referenced NemoGuardrails provider has malformed configurations in spec.nemoConfigs"
 )
 
@@ -90,12 +90,17 @@ func TestEvaluateCompatibleAcceptsDeclaredConfigs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message, _ := evaluateCompatible(c.guardrail, c.provider)
-			if !compatible {
-				t.Fatalf("evaluateCompatible = false (%s: %s), want true", reason, message)
+			verdict := evaluateCompatible(c.guardrail, c.provider)
+			if !verdict.Compatible {
+				t.Fatalf("evaluateCompatible = false (%s: %s), want true", verdict.Reason, verdict.Message)
 			}
-			if reason != reasonChecksSatisfiable {
-				t.Fatalf("reason = %q, want %q", reason, reasonChecksSatisfiable)
+			if verdict.Reason != reasonChecksSatisfiable {
+				t.Fatalf("reason = %q, want %q", verdict.Reason, reasonChecksSatisfiable)
+			}
+			// computeBindingRevision digests these instead of re-reading the
+			// provider, so an accepted verdict has to carry them.
+			if len(verdict.Configs) == 0 {
+				t.Error("Configs is empty; the accepted path digests them")
 			}
 		})
 	}
@@ -139,21 +144,21 @@ func TestEvaluateCompatibleRejectsUndeclaredConfigs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message, _ := evaluateCompatible(c.guardrail, c.provider)
-			if compatible {
+			verdict := evaluateCompatible(c.guardrail, c.provider)
+			if verdict.Compatible {
 				t.Fatal("evaluateCompatible = true, want false for an undeclared configId")
 			}
-			if reason != reasonUnknownCheckConfig {
-				t.Fatalf("reason = %q, want %q", reason, reasonUnknownCheckConfig)
+			if verdict.Reason != reasonUnknownCheckConfig {
+				t.Fatalf("reason = %q, want %q", verdict.Reason, reasonUnknownCheckConfig)
 			}
 			for _, configID := range c.wantNamed {
-				if !strings.Contains(message, configID) {
-					t.Errorf("message %q does not name the undeclared configId %q", message, configID)
+				if !strings.Contains(verdict.Message, configID) {
+					t.Errorf("message %q does not name the undeclared configId %q", verdict.Message, configID)
 				}
 			}
 			for _, configID := range c.wantUnnamed {
-				if strings.Contains(message, configID) {
-					t.Errorf("message %q names %q, which the provider does declare", message, configID)
+				if strings.Contains(verdict.Message, configID) {
+					t.Errorf("message %q names %q, which the provider does declare", verdict.Message, configID)
 				}
 			}
 		})
@@ -173,8 +178,7 @@ func TestEvaluateCompatibleMessageIsStable(t *testing.T) {
 	want := "referenced NemoGuardrails provider does not declare configId(s): alpha-v1, mu-v1, zeta-v1"
 
 	for i := range 32 {
-		_, _, message, _ := evaluateCompatible(guardrail, provider)
-		if message != want {
+		if message := evaluateCompatible(guardrail, provider).Message; message != want {
 			t.Fatalf("message on call %d = %q, want %q", i, message, want)
 		}
 	}
@@ -192,14 +196,14 @@ func TestEvaluateCompatibleRejectsProvidersDeclaringNothing(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message, _ := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
-			if compatible {
+			result := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
+			if result.Compatible {
 				t.Fatal("evaluateCompatible = true, want false against a provider declaring no configurations")
 			}
-			if reason != reasonProviderConfigsUnavailable {
-				t.Fatalf("reason = %q, want %q", reason, reasonProviderConfigsUnavailable)
+			if result.Reason != reasonProviderConfigsUnavailable {
+				t.Fatalf("reason = %q, want %q", result.Reason, reasonProviderConfigsUnavailable)
 			}
-			if message == "" {
+			if result.Message == "" {
 				t.Fatal("message is empty; the condition must explain why the checks are unsatisfiable")
 			}
 		})
@@ -225,12 +229,12 @@ func TestEvaluateCompatibleRejectsMalformedConfigs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			compatible, reason, message, err := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
-			if compatible {
+			result := evaluateCompatible(guardrailSelecting("jailbreak-v1"), c.provider)
+			if result.Compatible {
 				t.Fatal("evaluateCompatible = true, want false against a provider this controller cannot parse")
 			}
-			if reason != reasonInvalidProviderConfigs {
-				t.Fatalf("reason = %q, want %q", reason, reasonInvalidProviderConfigs)
+			if result.Reason != reasonInvalidProviderConfigs {
+				t.Fatalf("reason = %q, want %q", result.Reason, reasonInvalidProviderConfigs)
 			}
 			// Pinned exactly. The message lands on a condition and a Warning
 			// Event in the consumer's namespace, readable by anyone who can
@@ -238,19 +242,19 @@ func TestEvaluateCompatibleRejectsMalformedConfigs(t *testing.T) {
 			// else entirely. apimachinery's accessor errors embed the value
 			// they rejected, so interpolating one here would republish the
 			// provider's own spec.
-			if message != malformedConfigsMessage {
-				t.Errorf("message = %q, want the fixed %q", message, malformedConfigsMessage)
+			if result.Message != malformedConfigsMessage {
+				t.Errorf("message = %q, want the fixed %q", result.Message, malformedConfigsMessage)
 			}
-			if strings.Contains(message, providerSecret) {
-				t.Errorf("message %q leaks the provider's spec.nemoConfigs content", message)
+			if strings.Contains(result.Message, providerSecret) {
+				t.Errorf("message %q leaks the provider's spec.nemoConfigs content", result.Message)
 			}
 			// Still diagnosable: the detail has to reach the caller so it can
 			// be logged, it just must not be published.
-			if err == nil {
-				t.Fatal("error is nil; the parse failure must still reach the caller for logging")
+			if result.Err == nil {
+				t.Fatal("Err is nil; the parse failure must still reach the caller for logging")
 			}
-			if !strings.Contains(err.Error(), "nemoConfigs") {
-				t.Errorf("error %q does not identify the field that failed to parse", err)
+			if !strings.Contains(result.Err.Error(), "nemoConfigs") {
+				t.Errorf("error %q does not identify the field that failed to parse", result.Err)
 			}
 		})
 	}

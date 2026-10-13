@@ -58,6 +58,23 @@ func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string]bool, error) 
 	return configs, nil
 }
 
+// compatibility is what comparing an AIGuardrail's checks against its
+// provider's declared configurations answers: the Compatible condition's
+// status, reason and message, plus the configurations themselves so the
+// accepted path does not parse the same provider twice.
+type compatibility struct {
+	Compatible bool
+	Reason     string
+	Message    string
+	// Configs are the names the provider declares, set whenever the parse
+	// succeeded. computeBindingRevision digests them.
+	Configs map[string]bool
+	// Err is the parse failure behind reasonInvalidProviderConfigs, for the
+	// caller to log. It must not reach Message: apimachinery accessor errors
+	// embed the value they rejected, which is the provider's own spec.
+	Err error
+}
+
 // evaluateCompatible reports whether every check selects a configuration the
 // provider declares, as the Compatible condition status, reason and message.
 //
@@ -68,15 +85,20 @@ func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string]bool, error) 
 // The verdict does not depend on the provider being ready. It compares two
 // specs, both readable while the server is down, so a configId typo is
 // reported as one instead of being masked by an unready provider.
-func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstructured.Unstructured) (bool, string, string, error) {
+func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstructured.Unstructured) compatibility {
 	configs, err := parseNemoConfigs(nemo)
 	if err != nil {
-		return false, reasonInvalidProviderConfigs,
-			"referenced NemoGuardrails provider has malformed configurations in spec.nemoConfigs", err
+		return compatibility{
+			Reason:  reasonInvalidProviderConfigs,
+			Message: "referenced NemoGuardrails provider has malformed configurations in spec.nemoConfigs",
+			Err:     err,
+		}
 	}
 	if len(configs) == 0 {
-		return false, reasonProviderConfigsUnavailable,
-			"referenced NemoGuardrails provider declares no configurations in spec.nemoConfigs", nil
+		return compatibility{
+			Reason:  reasonProviderConfigsUnavailable,
+			Message: "referenced NemoGuardrails provider declares no configurations in spec.nemoConfigs",
+		}
 	}
 
 	var unknown []string
@@ -90,14 +112,21 @@ func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstruct
 	}
 
 	if len(unknown) == 0 {
-		return true, reasonChecksSatisfiable,
-			"every check selects a configuration declared by the provider", nil
+		return compatibility{
+			Compatible: true,
+			Reason:     reasonChecksSatisfiable,
+			Message:    "every check selects a configuration declared by the provider",
+			Configs:    configs,
+		}
 	}
 
 	// Sorted so the message is stable across reconciles. An unstable message
 	// rewrites the condition, bumping LastTransitionTime and re-emitting an
 	// event on every pass through the requeue loop.
 	sort.Strings(unknown)
-	return false, reasonUnknownCheckConfig,
-		fmt.Sprintf("referenced NemoGuardrails provider does not declare configId(s): %s", strings.Join(unknown, ", ")), nil
+	return compatibility{
+		Reason:  reasonUnknownCheckConfig,
+		Message: fmt.Sprintf("referenced NemoGuardrails provider does not declare configId(s): %s", strings.Join(unknown, ", ")),
+		Configs: configs,
+	}
 }

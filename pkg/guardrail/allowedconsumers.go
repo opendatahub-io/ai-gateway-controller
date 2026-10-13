@@ -27,23 +27,24 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// allowedConsumers is the parsed spec.allowedConsumers.namespaces policy of a
-// NemoGuardrails provider. Selector is set only for consumerModeSelector.
+// allowedConsumers stores a copy of the NemoGuardrails.spec.allowedConsumers
+// field which defines the types of namespaces that are allowed to attach an
+// AIGuardrail consumer to a NeMo Guardrails server.
 type allowedConsumers struct {
 	Mode     consumerMode
 	Selector *metav1.LabelSelector
 }
 
-// parseAllowedConsumers reads the provider's spec.allowedConsumers.namespaces
-// policy. An absent policy defaults to Same (same-namespace only), so a
-// provider that predates the field — TrustyAI has not shipped it yet — is
-// never treated as allow-all.
+// parseAllowedConsumers reads NemoGuardrails.spec.allowedConsumers.namespaces.from.
+// If spec.allowedConsumers is omitted, from defaults to Same, meaning only
+// AIGuardrails in the same namespace as the NeMo Guardrails server can attach
+// to it.
 //
-// Validation is deliberately strict and fail-closed: an absent or empty
-// selector under Selector is rejected rather than read as allow-all (users
-// must choose All explicitly), a selector is forbidden under Same and All
-// including when from defaults to Same, and an unknown from value is an
-// error. Callers surface any error as an unauthorized binding.
+// Validation is deliberately strict and fail-closed: a selector is rejected
+// under Same and All including when from defaults to Same, a missing or empty
+// selector under Selector is rejected rather than read as allow-all, and an
+// unknown from value is an error. Callers surface any error as an unauthorized
+// binding.
 func parseAllowedConsumers(nemo *unstructured.Unstructured) (allowedConsumers, error) {
 	namespaces, found, err := unstructured.NestedMap(nemo.Object, "spec", "allowedConsumers", "namespaces")
 	if err != nil {
