@@ -39,6 +39,20 @@ if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE:-}" ]]; then
   exit 1
 fi
 
+# Konflux group-test (odh-konflux-central) still exports the snapshot digest as
+# AI_GATEWAY_CONTROLLER_IMAGE. That digest can lag the floating odh-pr-<N> tag and
+# roll out a stale manager while e2e scripts come from the PR head — praxis handoff
+# then never attaches the MaasTenantConfig finalizer. Prefer the snapshot tag when
+# present (see hack/tekton/pr-group-testing-pipeline.yaml).
+if [[ "${AI_GATEWAY_CONTROLLER_IMAGE}" == *@sha256:* ]] && [[ -n "${SNAPSHOT:-}" ]]; then
+  aigc_tag="$(jq -r '."odh-ai-gateway-controller-ci".image_tag // empty' <<< "${SNAPSHOT}" 2>/dev/null || true)"
+  if [[ -n "${aigc_tag}" && "${aigc_tag}" != "null" ]]; then
+    aigc_repo="${AI_GATEWAY_CONTROLLER_IMAGE%%@*}"
+    echo "NOTE: rewriting AI_GATEWAY_CONTROLLER_IMAGE from snapshot digest to tag ${aigc_tag}" >&2
+    export AI_GATEWAY_CONTROLLER_IMAGE="${aigc_repo}:${aigc_tag}"
+  fi
+fi
+
 # Konflux group-test may export PRAXIS_EXTPROC_IMAGE from odh-praxis-extproc-ci snapshot.
 export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc:odh-stable}"
 
