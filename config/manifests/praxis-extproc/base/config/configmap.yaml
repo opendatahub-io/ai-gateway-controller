@@ -16,9 +16,6 @@ data:
     filter_chains:
       - name: bbr
         filters:
-          - filter: headers
-            request_remove:
-              - X-Gateway-Model-Name
           - filter: json_body
             request_extract:
               - pointer: /model
