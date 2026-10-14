@@ -38,13 +38,14 @@ func startControlPlane(t *testing.T) client.Client {
 	t.Helper()
 	return startEnvironment(t, func(mgr ctrl.Manager) {
 		tenantController := &tenant.Reconciler{
-			Client:               mgr.GetClient(),
-			APIReader:            mgr.GetAPIReader(),
-			ManifestPath:         filepath.Join(repoRoot, "config/manifests/external-model/overlays/odh"),
-			Image:                "quay.io/example/praxis-extproc:test",
-			MaaSAPIRouteNameBase: "maas-api-route",
-			ResyncInterval:       time.Minute,
-			Log:                  mgr.GetLogger().WithName("tenant"),
+			Client:                  mgr.GetClient(),
+			APIReader:               mgr.GetAPIReader(),
+			ManifestPath:            filepath.Join(repoRoot, "config/manifests/external-model/overlays/odh"),
+			Image:                   "quay.io/example/praxis-extproc:test",
+			InfrastructureNamespace: "responses-infra",
+			MaaSAPIRouteNameBase:    "maas-api-route",
+			ResyncInterval:          time.Minute,
+			Log:                     mgr.GetLogger().WithName("tenant"),
 		}
 		require.NoError(t, tenantController.SetupWithManager(mgr))
 		modelController := &controller.Reconciler{

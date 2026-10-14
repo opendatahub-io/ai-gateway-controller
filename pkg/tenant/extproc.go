@@ -39,11 +39,22 @@ type extprocCredential struct {
 // are never read: kubelet projects the referenced Secret into this workload and
 // credential_inject reads the mounted file at request time.
 func configureExternalModelExtProc(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate) error {
+	return configureExternalModelExtProcWithResponses(resources, namespace, candidates, nil)
+}
+
+func configureExternalModelExtProcWithResponses(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate, responses *responsesBinding) error {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return err
 	}
-	config := extprocPostAuthConfig(candidates, credentials)
+	tenantUID := ""
+	if responses != nil {
+		tenantUID = responses.tenantUID
+		if tenantUID == "" || responses.secret == nil {
+			return errors.New("responses runtime binding and tenant UID are required")
+		}
+	}
+	config := extprocPostAuthConfigWithResponses(candidates, credentials, tenantUID, responses != nil)
 
 	var configMap *unstructured.Unstructured
 	var deployment *unstructured.Unstructured
@@ -73,6 +84,11 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 	configHash := sha256.Sum256([]byte(config))
 	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", "ai-gateway-controller.opendatahub.io/extproc-config-sha256"); err != nil {
 		return fmt.Errorf("write post-auth ExtProc config hash: %w", err)
+	}
+	if responses != nil {
+		if err := mountResponsesBinding(deployment, *responses); err != nil {
+			return err
+		}
 	}
 
 	if len(credentials) == 0 {
@@ -165,6 +181,10 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 }
 
 func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential) string {
+	return extprocPostAuthConfigWithResponses(candidates, credentials, "", false)
+}
+
+func extprocPostAuthConfigWithResponses(candidates []envelope.Candidate, credentials []extprocCredential, tenantUID string, responses bool) string {
 	clusterSet := make(map[string]bool, len(candidates))
 	for _, candidate := range candidates {
 		clusterSet[candidate.Cluster] = true
@@ -177,7 +197,19 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n  tls:\n    mode: self_signed\n\n")
-	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
+	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n")
+	if responses {
+		writeResponsesFilters(&b, tenantUID)
+		b.WriteString("      - name: route-provider\n")
+		if len(candidates) == 0 {
+			b.WriteString("        filter: request_id\n")
+			b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
+			return b.String()
+		}
+		b.WriteString("        filter: intelligent_route\n")
+	} else {
+		b.WriteString("      - filter: intelligent_route\n")
+	}
 	b.WriteString("        overlay_file: /etc/praxis/routing/routing-overlay.json\n")
 	b.WriteString("        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [")
 	for i, cluster := range clusters {

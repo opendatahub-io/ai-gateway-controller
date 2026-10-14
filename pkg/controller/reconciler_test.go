@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -87,7 +88,7 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		return nil
 	}
 	routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes, false); err != nil {
 		t.Fatal(err)
 	}
 	if applied.GetName() != tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a") {
@@ -172,7 +173,7 @@ func TestEnableExternalModelRoutesDeletesOnlyOwnedRouteFilterWhenEmpty(t *testin
 	neighbor.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-b"})
 	r := controllerTestClient(t, owned, foreign, neighbor)
 
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", nil); err != nil {
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", nil, false); err != nil {
 		t.Fatal(err)
 	}
 	var got unstructured.Unstructured
@@ -260,6 +261,79 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	}
 	if _, found, err := unstructured.NestedMap(nestedMapAt(t, bodyMatches, 0), "path"); err != nil || found {
 		t.Fatalf("body route must intentionally be path-independent: found=%v err=%v", found, err)
+	}
+}
+
+func TestResponsesCreationUsesModelRouteAndBufferedOverrides(t *testing.T) {
+	routes := []resolver.Route{{Model: "model", ClientName: "chat", Provider: "openai", Endpoint: "api.example.com"}}
+	obj := modelHTTPRouteSet(routes, "tenant-a", "gateway", "gateway-system")
+	before := obj.DeepCopy()
+	if err := appendResponsesModelRules(&obj, routes); err != nil {
+		t.Fatal(err)
+	}
+	rules := nestedSlice(t, obj.Object, "spec", "rules")
+	oldRules := nestedSlice(t, before.Object, "spec", "rules")
+	if !reflect.DeepEqual(rules[:len(oldRules)], oldRules) || len(rules) != 6 {
+		t.Fatal("chat rules must stay unchanged; add provider and fail-closed creation rules")
+	}
+	for index := 4; index < 6; index++ {
+		match := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, index), "matches"), 0)
+		if nestedString(t, match, "path", "type") != "Exact" || nestedString(t, match, "path", "value") != "/v1/responses" || nestedString(t, match, "method") != "POST" {
+			t.Fatal("only exact Responses creation belongs on the model route")
+		}
+	}
+	providerHeaders := nestedSlice(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 4), "matches"), 0), "headers")
+	if nestedString(t, nestedMapAt(t, providerHeaders, 1), "value") != envelope.CandidateStableID("model", "openai") {
+		t.Fatal("provider dispatch requires trusted selection")
+	}
+	r := &Reconciler{ApplyResource: func(_ context.Context, _ client.Client, filter unstructured.Unstructured) error {
+		patches := nestedSlice(t, filter.Object, "spec", "configPatches")
+		if len(patches) != 6 {
+			t.Fatal("every model rule needs an exact override")
+		}
+		for index := 4; index < 6; index++ {
+			patch := nestedMapAt(t, patches, index)
+			mode := []string{"patch", "value", "typed_per_filter_config", externalModelExtProcFilter, "overrides", "processing_mode"}
+			if nestedString(t, patch, append(mode, "request_body_mode")...) != "BUFFERED" || nestedString(t, patch, append(mode, "response_body_mode")...) != "STREAMED" {
+				t.Fatal("Responses requires buffered requests and streamed responses")
+			}
+		}
+		return nil
+	}}
+	if err := r.enableExternalModelRoutes(t.Context(), "demo", "tenant-a", "gateway", "gateway-system", routes, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResponsesCreationRulesFollowTenantEnablement(t *testing.T) {
+	ait := controllerAITenant("demo", "owners", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "demo", "owners", "praxis")
+	r := controllerTestClient(t, ait, mtc)
+	routes := []resolver.Route{{Model: "model", ClientName: "chat", Provider: "openai", Endpoint: "api.example.com"}}
+	for _, enabled := range []bool{false, true, false} {
+		if err := unstructured.SetNestedField(ait.Object, enabled, "spec", "responses", "enabled"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Update(t.Context(), ait); err != nil {
+			t.Fatal(err)
+		}
+		var route unstructured.Unstructured
+		r.ApplyResource = func(_ context.Context, _ client.Client, obj unstructured.Unstructured) error {
+			if obj.GetKind() == "HTTPRoute" {
+				route = obj
+			}
+			return nil
+		}
+		if err := r.applyTransport(t.Context(), routes, "tenant-a", "demo", "gateway", "gateway-system", nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		want := 4
+		if enabled {
+			want = 6
+		}
+		if got := len(nestedSlice(t, route.Object, "spec", "rules")); got != want {
+			t.Fatalf("enabled=%v rules=%d want=%d", enabled, got, want)
+		}
 	}
 }
 

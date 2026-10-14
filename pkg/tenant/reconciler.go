@@ -84,6 +84,8 @@ type Reconciler struct {
 	ManifestPath string
 	// Image replaces the vendored overlay's placeholder container image.
 	Image string
+	// InfrastructureNamespace contains the platform Responses binding.
+	InfrastructureNamespace string
 	// SkipNetworkPolicy omits the controller-managed payload-processing
 	// NetworkPolicy when an installation supplies equivalent networking and the
 	// target namespace disallows this controller from creating policies. It is
@@ -124,7 +126,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigsForSecret)).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Complete(r)
 }
@@ -144,6 +146,27 @@ func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.
 		Namespace: obj.GetNamespace(),
 		Name:      MaasTenantConfigInstanceName,
 	}}}
+}
+
+func (r *Reconciler) maasTenantConfigsForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetNamespace() != r.InfrastructureNamespace || (obj.GetName() != responsesSecretName && obj.GetName() != responsesCAName && obj.GetName() != "maas-db-config") {
+		return r.maasTenantConfigForNamespace(ctx, obj)
+	}
+	owners := &unstructured.UnstructuredList{}
+	owners.SetGroupVersionKind(AITenantGVK.GroupVersion().WithKind("AITenantList"))
+	if err := r.Client.List(ctx, owners); err != nil {
+		r.Log.Error(err, "list tenants for platform binding event")
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range owners.Items {
+		owner := &owners.Items[i]
+		enabled, _, err := unstructured.NestedBool(owner.Object, "spec", "responses", "enabled")
+		if err == nil && enabled {
+			requests = append(requests, r.enqueueMaasTenantConfigForAITenant(ctx, owner)...)
+		}
+	}
+	return requests
 }
 
 // enqueueMaasTenantConfigForAITenant maps an AITenant event to the
@@ -255,7 +278,7 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 // the check, so a live object always carries a UID and only tests can opt out.
 // This guards the apply path only: delete/cleanup must run regardless of
 // identity (see resolveOwnedAITenant).
-func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string) (bool, error) {
+func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string, wantGeneration ...int64) (bool, error) {
 	if wantUID == "" {
 		return true, nil
 	}
@@ -285,6 +308,9 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	if aitenant.GetUID() != wantUID {
 		return false, nil
 	}
+	if len(wantGeneration) > 0 && aitenant.GetGeneration() != wantGeneration[0] {
+		return false, nil
+	}
 	// Ownership bind still holds live (anti-spoof): re-checked because the
 	// resolve above read the possibly-stale cache.
 	if ns, ok := ConfigNamespace(aitenant); !ok || ns != mtc.GetNamespace() {
@@ -310,6 +336,8 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 // opts into praxis: ensure the cleanup finalizer is present (before doing
 // anything else, so even a partially-applied tenant is guaranteed a
 // cleanup pass later), wait for readiness, then render/apply.
+//
+//nolint:gocyclo // Keep tenant lifecycle and fail-closed Responses checks together.
 func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
 	if err := r.ensureFinalizer(ctx, mtc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
@@ -363,6 +391,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, nil
 	}
 	tenantNamespace := mtc.GetNamespace()
+	responses, err := r.responsesBinding(ctx, aitenant, tenantNamespace)
+	if err != nil {
+		if cleanupErr := r.withdrawResponses(ctx, tenantID, tenantNamespace, gatewayNamespace); cleanupErr != nil {
+			return ctrl.Result{}, cleanupErr
+		}
+		return ctrl.Result{}, err
+	}
 	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -385,21 +420,41 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-	} else if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
-		return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
+	} else if responses == nil {
+		if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
+		}
 	}
 
 	resources, err = SplitPostAuthResources(resources, tenantID, gatewayNamespace, tenantNamespace)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
-	if hasModels {
-		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
+	if hasModels || responses != nil {
+		if err := configureExternalModelExtProcWithResponses(resources, tenantNamespace, runtimeCandidates, responses); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
 		}
 	} else {
 		resources = RemoveExternalModelResources(resources, tenantID)
 	}
+	if responses != nil {
+		responseResources, err := r.responsesRouteResources(ctx, aitenant, tenantID, tenantNamespace, gatewayName, gatewayNamespace)
+		if err != nil {
+			if cleanupErr := r.withdrawResponses(ctx, tenantID, tenantNamespace, gatewayNamespace); cleanupErr != nil {
+				return ctrl.Result{}, cleanupErr
+			}
+			return ctrl.Result{}, err
+		}
+		resources = append(resources, responseResources...)
+	} else if err := r.cleanupResponsesRoutes(ctx, tenantID, tenantNamespace, gatewayNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Keep isolation on draining pods even when models and Responses are disabled.
+	policy, err := externalModelNetworkPolicy(tenantID, tenantNamespace, gatewayName, gatewayNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resources = append(resources, policy)
 	if r.SkipNetworkPolicy {
 		filtered := make([]unstructured.Unstructured, 0, len(resources))
 		for _, resource := range resources {
@@ -431,13 +486,18 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// resolved copy, so if the live object no longer matches on identity,
 	// ownership, readiness, generation, or gateway, it must not be applied
 	// (RHAI-2514 apply-path fence). Transient ⇒ requeue.
-	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), gatewayName, gatewayNamespace); err != nil {
+	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), gatewayName, gatewayNamespace, aitenant.GetGeneration()); err != nil {
 		return ctrl.Result{}, err
 	} else if !valid {
 		log.Info("owning AITenant changed (uid, ownership, readiness, generation, or gatewayRef) before praxis-extproc apply; will re-resolve")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
+	if responses != nil {
+		if err := r.projectResponsesBinding(ctx, responses); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
@@ -783,6 +843,12 @@ func (r *Reconciler) removeFinalizer(ctx context.Context, mtc *unstructured.Unst
 // references that one role, so deleting it would break every other
 // praxis tenant sharing the cluster.
 func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
+	if err := r.cleanupResponsesRoutes(ctx, tenantID, tenantNamespace, gatewayNamespace); err != nil {
+		return err
+	}
+	if err := r.deleteResourceIfOwned(ctx, gvkNetworkPolicy, ResourceName("external-model-extproc", tenantID), tenantNamespace); err != nil {
+		return err
+	}
 	type target struct {
 		gvk       schema.GroupVersionKind
 		name      string
@@ -824,7 +890,7 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 			return err
 		}
 	}
-	return nil
+	return r.cleanupResponsesProjection(ctx, tenantID, tenantNamespace)
 }
 
 func (r *Reconciler) deleteResourceIfOwned(ctx context.Context, gvk schema.GroupVersionKind, name, namespace string) error {

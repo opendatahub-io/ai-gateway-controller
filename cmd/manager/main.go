@@ -47,21 +47,22 @@ var buildVersion = "dev"
 
 func main() {
 	var (
-		metricsAddr          string
-		probeAddr            string
-		enableLeaderElection bool
-		image                string
-		manifestPath         string
-		maasAPIRouteName     string
-		resyncInterval       time.Duration
-		deletionTimeout      time.Duration
-		externalNamespace    string
-		gatewayName          string
-		gatewayNamespace     string
-		network              string
-		localSite            string
-		knownClusters        []string
-		skipNetworkPolicy    bool
+		metricsAddr             string
+		probeAddr               string
+		enableLeaderElection    bool
+		image                   string
+		manifestPath            string
+		maasAPIRouteName        string
+		resyncInterval          time.Duration
+		deletionTimeout         time.Duration
+		externalNamespace       string
+		gatewayName             string
+		gatewayNamespace        string
+		network                 string
+		localSite               string
+		knownClusters           []string
+		skipNetworkPolicy       bool
+		infrastructureNamespace string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -93,6 +94,8 @@ func main() {
 	})
 	flag.BoolVar(&skipNetworkPolicy, "skip-network-policy", false,
 		"Omit controller-managed payload-processing NetworkPolicies when the installation supplies equivalent networking. Default false.")
+	flag.StringVar(&infrastructureNamespace, "infrastructure-namespace", cmp.Or(os.Getenv("INFRA_NAMESPACE"), "redhat-ai-gateway-infra"),
+		"Namespace containing platform Responses database connection and CA Secrets.")
 
 	opts := zap.Options{}
 	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
@@ -140,15 +143,16 @@ func main() {
 	}
 
 	reconciler := &tenant.Reconciler{
-		Client:               mgr.GetClient(),
-		APIReader:            mgr.GetAPIReader(),
-		ManifestPath:         manifestPath,
-		Image:                image,
-		SkipNetworkPolicy:    skipNetworkPolicy,
-		MaaSAPIRouteNameBase: maasAPIRouteName,
-		ResyncInterval:       resyncInterval,
-		DeletionTimeout:      deletionTimeout,
-		Log:                  ctrl.Log.WithName("tenant"),
+		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
+		ManifestPath:            manifestPath,
+		Image:                   image,
+		InfrastructureNamespace: infrastructureNamespace,
+		SkipNetworkPolicy:       skipNetworkPolicy,
+		MaaSAPIRouteNameBase:    maasAPIRouteName,
+		ResyncInterval:          resyncInterval,
+		DeletionTimeout:         deletionTimeout,
+		Log:                     ctrl.Log.WithName("tenant"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AITenant reconciler")

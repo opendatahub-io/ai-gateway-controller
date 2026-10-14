@@ -313,7 +313,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{Requeue: true}, nil
 	}
 	if len(set.Routes()) == 0 {
-		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil, false); err != nil {
 			return reconcile.Result{}, err
 		}
 		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
@@ -920,6 +920,17 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
 	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel,
 	providerOwners map[string]*v1alpha1.ExternalProvider) error {
+	live, err := r.liveTenantResolution(ctx, modelNamespace)
+	if err != nil {
+		return err
+	}
+	responses := false
+	if live.aitenant != nil {
+		responses, _, err = unstructured.NestedBool(live.aitenant.Object, "spec", "responses", "enabled")
+		if err != nil {
+			return err
+		}
+	}
 	resources := make([]unstructured.Unstructured, 0, len(routes)*3+len(routes))
 	seen := map[string]bool{}
 	for _, route := range routes {
@@ -964,6 +975,11 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			seen[key] = true
 		}
 		obj := modelHTTPRouteSet(modelRoutes, modelNamespace, gatewayName, gatewayNamespace)
+		if responses {
+			if err := appendResponsesModelRules(&obj, modelRoutes); err != nil {
+				return err
+			}
+		}
 		if owner := modelOwners[modelRoutes[0].Model]; owner != nil {
 			setOwnerReference(&obj, owner)
 		}
@@ -983,7 +999,7 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			return err
 		}
 	}
-	if err := r.enableExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes); err != nil {
+	if err := r.enableExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes, responses); err != nil {
 		return err
 	}
 	return nil
@@ -993,7 +1009,7 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 // route-specific ExternalModel filter overrides. The tenant reconciler owns
 // the base EnvoyFilter; keeping these objects separate prevents concurrent
 // tenant/model reconciles from overwriting configPatches.
-func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
+func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route, responses bool) error {
 	name := tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID)
 	if len(routes) == 0 {
 		return r.deleteExternalModelRouteFilters(ctx, name, modelNamespace)
@@ -1036,7 +1052,15 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 		// modelHTTPRouteSet emits two provider rules per route plus the
 		// canonical and header-only fail-closed sink rules.
 		count := byModel[model]*2 + 2
+		chatCount := count
+		if responses {
+			count += byModel[model] + 1
+		}
 		for index := 0; index < count; index++ {
+			requestBodyMode, responseBodyMode := "STREAMED", "NONE"
+			if index >= chatCount {
+				requestBodyMode, responseBodyMode = "BUFFERED", "STREAMED"
+			}
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
 				"match": map[string]any{
@@ -1074,9 +1098,9 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 								"processing_mode": map[string]any{
 									"request_header_mode": "SEND",
 									// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
-									"request_body_mode":     "STREAMED",
+									"request_body_mode":     requestBodyMode,
 									"response_header_mode":  "SEND",
-									"response_body_mode":    "NONE",
+									"response_body_mode":    responseBodyMode,
 									"request_trailer_mode":  "SKIP",
 									"response_trailer_mode": "SKIP",
 								},
@@ -1468,6 +1492,38 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			"rules":      rules,
 		},
 	}}
+}
+
+// Creation uses the model route's existing auth and subscription token policy.
+func appendResponsesModelRules(obj *unstructured.Unstructured, routes []resolver.Route) error {
+	rules, _, err := unstructured.NestedSlice(obj.Object, "spec", "rules")
+	if err != nil {
+		return err
+	}
+	if len(routes) == 0 {
+		return nil
+	}
+	model := routes[0]
+	match := func(headers []any) map[string]any {
+		return map[string]any{"path": map[string]any{"type": "Exact", "value": "/v1/responses"}, "method": "POST", "headers": headers}
+	}
+	for _, candidate := range routes {
+		rules = append(rules, map[string]any{
+			"matches": []any{match([]any{
+				map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": model.ClientName},
+				map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": envelope.CandidateStableID(model.Model, candidate.Provider)},
+			})},
+			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
+			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
+			"timeouts":    map[string]any{"request": "300s"},
+		})
+	}
+	rules = append(rules, map[string]any{
+		"matches":     []any{match([]any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": model.ClientName}})},
+		"backendRefs": []any{map[string]any{"name": providerSelectionSinkName(model.Model), "port": int64(443)}},
+		"timeouts":    map[string]any{"request": "300s"},
+	})
+	return unstructured.SetNestedSlice(obj.Object, rules, "spec", "rules")
 }
 
 func providerURLRewrite(endpoint providerEndpoint) map[string]any {
