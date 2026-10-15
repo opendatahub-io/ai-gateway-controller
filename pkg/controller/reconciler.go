@@ -1042,10 +1042,8 @@ func providerTenantReadinessMessage(live tenantResolution) string {
 		return "owning AITenant is being deleted"
 	case live.status != tenant.PayloadProcessingStatusSteady:
 		return fmt.Sprintf("MaasTenantConfig selects Praxis but payload-processing-status is %q, expected %q", live.status, tenant.PayloadProcessingStatusSteady)
-	case !tenant.IsActive(live.aitenant):
-		return "owning AITenant phase is not Active"
-	case !tenant.StatusIsCurrent(live.aitenant):
-		return "owning AITenant Ready condition does not observe its current generation"
+	case !tenant.DeployReady(live.aitenant):
+		return "owning AITenant is not DeployReady (Failed or Ready stamp not current for this generation)"
 	default:
 		return ""
 	}

@@ -714,6 +714,10 @@ func TestReconcilePendingPraxisTenantWithGatewayRefPublishes(t *testing.T) {
 	r := controllerTestClient(t, provider, model, secret, ait, mtc)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "gateway-system", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
+	// ExternalModel publish only routes through Ready providers (#128).
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile provider: %v", err)
+	}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
 	}
