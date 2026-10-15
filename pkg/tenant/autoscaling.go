@@ -18,7 +18,10 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
+	"strconv"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -112,6 +115,9 @@ func nestedInt32(m map[string]any, key string) (int32, bool) {
 	if !ok {
 		return 0, false
 	}
+	if v < math.MinInt32 || v > math.MaxInt32 {
+		return 0, false
+	}
 	return int32(v), true
 }
 
@@ -155,9 +161,9 @@ func parseResourceList(m map[string]any) (corev1.ResourceList, error) {
 		if !ok {
 			switch n := raw.(type) {
 			case int64:
-				s = fmt.Sprintf("%d", n)
+				s = strconv.FormatInt(n, 10)
 			case float64:
-				s = fmt.Sprintf("%v", n)
+				s = strconv.FormatFloat(n, 'g', -1, 64)
 			default:
 				return nil, fmt.Errorf("quantity for %q must be a string", k)
 			}
@@ -341,7 +347,7 @@ func appendIPPWorkloadHPA(log logr.Logger, resources *[]unstructured.Unstructure
 func setContainerResources(r *unstructured.Unstructured, containerName string, res *corev1.ResourceRequirements) error {
 	containers, found, err := unstructured.NestedSlice(r.Object, "spec", "template", "spec", "containers")
 	if err != nil || !found {
-		return fmt.Errorf("containers not found")
+		return errors.New("containers not found")
 	}
 	for i, c := range containers {
 		cm, ok := c.(map[string]any)

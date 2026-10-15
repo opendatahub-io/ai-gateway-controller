@@ -40,9 +40,9 @@ func TestResolveIPPScalingCustomValues(t *testing.T) {
 		"payloadProcessing": map[string]any{
 			"replicas": int64(2),
 			"autoscaling": map[string]any{
-				"maxReplicas":              int64(5),
-				"targetCPUUtilization":     int64(60),
-				"targetMemoryUtilization":  int64(75),
+				"maxReplicas":             int64(5),
+				"targetCPUUtilization":    int64(60),
+				"targetMemoryUtilization": int64(75),
 			},
 			"resources": map[string]any{
 				"requests": map[string]any{
