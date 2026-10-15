@@ -1359,7 +1359,7 @@ func TestReconcileRetractsCheckVerdictsWhenTheBindingIsDenied(t *testing.T) {
 // It is read rather than imported because the printer columns only exist in
 // the generated YAML — the kubebuilder markers that produce them are comments,
 // invisible to the compiler and to every other test in the repo.
-const guardrailCRDPath = "../../config/crd/bases/aigateway.opendatahub.io_aiguardrails.yaml"
+const guardrailCRDPath = "../../config/self/crd/bases/aigateway.opendatahub.io_aiguardrails.yaml"
 
 // conditionColumnPattern extracts X from a printer column JSONPath of the form
 // .status.conditions[?(@.type=="X")].status
