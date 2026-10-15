@@ -1240,38 +1240,100 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
 	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
 	rejected := make(map[string]error)
-	weights := make(map[string]int)
-	weightConflicts := make(map[string]bool)
-	bindings := make(map[string]bool)
-	duplicateProviders := make(map[string]bool)
+
+	// Phase 1: reject models whose own provider refs are internally inconsistent.
+	perModelOK := make(map[string]bool, len(set.Models))
 	for _, model := range set.Models {
+		weightByClient := make(map[string]int)
+		providerByClient := make(map[string]map[string]bool)
+		var reject error
 		for _, route := range model.Routes {
-			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
-				weightConflicts[route.ClientName] = true
-			} else {
-				weights[route.ClientName] = route.Weight
+			if weight, seen := weightByClient[route.ClientName]; seen && weight != route.Weight {
+				reject = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
+				break
 			}
-			binding := route.ClientName + "\x00" + route.Provider
-			if bindings[binding] {
-				duplicateProviders[route.ClientName] = true
+			weightByClient[route.ClientName] = route.Weight
+			if providerByClient[route.ClientName] == nil {
+				providerByClient[route.ClientName] = make(map[string]bool)
 			}
-			bindings[binding] = true
+			if providerByClient[route.ClientName][route.Provider] {
+				reject = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
+				break
+			}
+			providerByClient[route.ClientName][route.Provider] = true
+		}
+		if reject != nil {
+			rejected[model.ModelRef] = reject
+			perModelOK[model.ModelRef] = false
+			continue
+		}
+		perModelOK[model.ModelRef] = true
+	}
+
+	// Phase 2: reject models that disagree on the same client-visible model name.
+	clientWeights := make(map[string]map[string]int)
+	clientProviders := make(map[string]map[string]map[string]bool)
+	for _, model := range set.Models {
+		if !perModelOK[model.ModelRef] {
+			continue
+		}
+		for _, route := range model.Routes {
+			if clientWeights[route.ClientName] == nil {
+				clientWeights[route.ClientName] = make(map[string]int)
+			}
+			if clientProviders[route.ClientName] == nil {
+				clientProviders[route.ClientName] = make(map[string]map[string]bool)
+			}
+			if clientProviders[route.ClientName][model.ModelRef] == nil {
+				clientProviders[route.ClientName][model.ModelRef] = make(map[string]bool)
+			}
+			clientWeights[route.ClientName][model.ModelRef] = route.Weight
+			clientProviders[route.ClientName][model.ModelRef][route.Provider] = true
 		}
 	}
+	crossRejected := make(map[string]error)
+	for clientName, modelWeights := range clientWeights {
+		var canonical int
+		first := true
+		for _, weight := range modelWeights {
+			if first {
+				canonical = weight
+				first = false
+				continue
+			}
+			if weight != canonical {
+				for mr := range modelWeights {
+					crossRejected[mr] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, clientName)
+				}
+				break
+			}
+		}
+	}
+	for clientName, models := range clientProviders {
+		providerOwners := make(map[string][]string)
+		for modelRef, providers := range models {
+			for provider := range providers {
+				providerOwners[provider] = append(providerOwners[provider], modelRef)
+			}
+		}
+		for _, modelRefs := range providerOwners {
+			if len(modelRefs) > 1 {
+				for _, modelRef := range modelRefs {
+					crossRejected[modelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, clientName)
+				}
+			}
+		}
+	}
+
 	for _, model := range set.Models {
-		for _, route := range model.Routes {
-			if weightConflicts[route.ClientName] {
-				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
-				break
-			}
-			if duplicateProviders[route.ClientName] {
-				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
-				break
-			}
+		if rejected[model.ModelRef] != nil {
+			continue
 		}
-		if rejected[model.ModelRef] == nil {
-			valid.Models = append(valid.Models, model)
+		if reject := crossRejected[model.ModelRef]; reject != nil {
+			rejected[model.ModelRef] = reject
+			continue
 		}
+		valid.Models = append(valid.Models, model)
 	}
 	return valid, rejected
 }

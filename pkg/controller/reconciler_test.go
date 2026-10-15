@@ -1219,6 +1219,13 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 		if err := r.Create(context.Background(), secret); err != nil {
 			t.Fatal(err)
 		}
+		provider.Status.Phase = resolver.PhaseReady
+		if err := r.Status().Update(context.Background(), provider); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatalf("provider %s reconcile: %v", name, err)
+		}
 	}
 	sibling := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid", Finalizers: []string{externalModelFinalizer}},
@@ -1229,6 +1236,9 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	}
 	if err := r.Create(context.Background(), sibling); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sibling)}); err != nil {
+		t.Fatalf("sibling reconcile: %v", err)
 	}
 	if err := r.Delete(context.Background(), model); err != nil {
 		t.Fatal(err)
@@ -1375,6 +1385,12 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 		}
 		return render.Apply(ctx, r.Client, []unstructured.Unstructured{object})
 	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&providerA)}); err != nil {
+		t.Fatalf("provider reconcile: %v", err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+		t.Fatalf("provider-b reconcile: %v", err)
+	}
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: model.Namespace, Name: "routing-overlay"})
 	if err != nil {
 		t.Fatal(err)
@@ -1488,6 +1504,13 @@ func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T
 		Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
 		t.Fatal(err)
 	}
+	providerB.Status.Phase = resolver.PhaseReady
+	if err := r.Status().Update(ctx, providerB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+		t.Fatalf("provider-b reconcile: %v", err)
+	}
 	weightOne, weightTwo := 1, 2
 	bad := healthy.DeepCopy()
 	bad.Name, bad.UID, bad.ResourceVersion = "bad", "bad-uid", ""
@@ -1566,6 +1589,13 @@ func TestCrossModelSelectionConflictsDoNotBlockUnrelatedModel(t *testing.T) {
 			if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
 				Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
 				t.Fatal(err)
+			}
+			providerB.Status.Phase = resolver.PhaseReady
+			if err := r.Status().Update(ctx, providerB); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+				t.Fatalf("provider-b reconcile: %v", err)
 			}
 			newAlias := func(name string, refs []v1alpha1.ExternalProviderRef) *v1alpha1.ExternalModel {
 				for i := range refs {
