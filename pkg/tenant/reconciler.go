@@ -434,7 +434,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// ConfigMap unless the operator force-annotated the MaasTenantConfig.
 	if err := r.ensurePluginsConfigMapMigrationAllowed(ctx, mtc, gatewayNamespace, tenantID); err != nil {
 		log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// Re-validate the owning AITenant live, immediately before writing cluster
