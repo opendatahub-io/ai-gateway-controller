@@ -177,7 +177,15 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n  tls:\n    mode: self_signed\n\n")
-	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
+	// headers must stay first: it strips caller credentials and internal MaaS
+	// identity headers before intelligent_route / credential_inject run, so
+	// credential_inject's injected provider credential is never clobbered by
+	// the strip and the caller's own credential never reaches the upstream.
+	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: headers\n        request_remove:\n")
+	for _, header := range GuardedRequestHeaders {
+		fmt.Fprintf(&b, "          - %s\n", header)
+	}
+	b.WriteString("      - filter: intelligent_route\n")
 	b.WriteString("        overlay_file: /etc/praxis/routing/routing-overlay.json\n")
 	b.WriteString("        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [")
 	for i, cluster := range clusters {
