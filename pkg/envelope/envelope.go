@@ -62,10 +62,15 @@ type SecretRef struct {
 	Key       string `json:"key"`
 }
 
-// Credential is the final-hop credential reference. Field set is exact:
-// the consumer rejects unknown fields inside credential objects.
+// Credential is the final-hop credential reference. The wire field set is
+// exact: the consumer rejects unknown fields inside credential objects, so
+// Header never serializes (json:"-"). Header is a controller-internal carrier
+// for the provider-boundary request header the credential_inject filter must
+// inject into (see defaultAuthHeaders); it threads from StrategyFor into the
+// ExtProc credential entry (pkg/tenant/extproc.go), never onto the overlay.
 type Credential struct {
 	Strategy  string    `json:"strategy"`
+	Header    string    `json:"-"`
 	SecretRef SecretRef `json:"secretRef"`
 }
 
@@ -214,13 +219,14 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				group := group
 				cand.SelectionGroup = &group
 			}
-			strategy, err := StrategyFor(r)
+			strategy, header, err := StrategyFor(r)
 			if err != nil {
 				return Envelope{}, fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
 			}
 			if strategy != "" {
 				cand.Credential = &Credential{
 					Strategy: strategy,
+					Header:   header,
 					SecretRef: SecretRef{
 						Name:      r.SecretName,
 						Namespace: r.Namespace,
@@ -350,14 +356,31 @@ func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 	return err
 }
 
+// defaultAuthHeaders maps a qualified api-key provider to the provider-boundary
+// request header its credential_inject entry must target. It mirrors the praxis
+// credential_inject filter's defaultAuthHeaders map so the controller renders
+// the same header the data plane would otherwise default to, and overrides that
+// default where a provider diverges: anthropic uses x-api-key (the filter's own
+// apikey default, rendered explicitly so the entry is self-describing) while
+// Azure OpenAI uses api-key. Providers are absent here only when their strategy
+// fixes the header on the filter side (bearer_token always targets
+// Authorization: Bearer, so openai carries no override).
+var defaultAuthHeaders = map[string]string{
+	"anthropic":    "x-api-key",
+	"azure":        "api-key",
+	"azure-openai": "api-key",
+}
+
 // StrategyFor maps only the currently qualified provider API-key contracts to
-// Praxis wire strategies: openai + openai-chat maps to bearer_token
-// (Authorization: Bearer at the provider boundary) and anthropic + messages
-// maps to apikey (the credential_inject filter injects the Secret value into
-// its configured header, x-api-key by default). The wire stays reference-only
-// either way. Provider API keys are not interchangeable: other provider/
-// API-format combinations fail closed until their header semantics are
-// explicitly supported.
+// Praxis wire strategies, returning the strategy and — for apikey strategies —
+// the provider-boundary header the credential_inject filter must inject into
+// (see defaultAuthHeaders): openai + openai-chat maps to bearer_token
+// (Authorization: Bearer at the provider boundary, header fixed filter-side so
+// none is returned); anthropic + messages and azure/azure-openai + openai-chat
+// map to apikey, injected into x-api-key and api-key respectively. The wire
+// stays reference-only either way. Provider API keys are not interchangeable:
+// other provider/API-format combinations fail closed until their header
+// semantics are explicitly supported.
 //
 // This is the single qualification authority: Render stamps overlay
 // candidates with the strategy this function returns, and the tenant
@@ -365,22 +388,24 @@ func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 // configuration through it as well. Both consumers must agree because the
 // data plane rejects a candidate whose strategy differs from the configured
 // credential entry (praxis-ai #1172); disagreement fails closed with a 503.
-func StrategyFor(route resolver.Route) (string, error) {
+func StrategyFor(route resolver.Route) (strategy, header string, err error) {
 	switch route.AuthType {
 	case "":
-		return "", nil
+		return "", "", nil
 	case "apikey":
-		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
-			return "bearer_token", nil
+		switch {
+		case route.ProviderType == "openai" && route.APIFormat == "openai-chat":
+			return "bearer_token", "", nil
+		case route.ProviderType == "anthropic" && route.APIFormat == "messages":
+			return "apikey", defaultAuthHeaders["anthropic"], nil
+		case (route.ProviderType == "azure" || route.ProviderType == "azure-openai") && route.APIFormat == "openai-chat":
+			return "apikey", defaultAuthHeaders[route.ProviderType], nil
 		}
-		if route.ProviderType == "anthropic" && route.APIFormat == "messages" {
-			return "apikey", nil
-		}
-		return "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
+		return "", "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
 	case "sigv4", "oauth2":
-		return "", fmt.Errorf("%w: auth.type %q", ErrUnsupportedCredential, route.AuthType)
+		return "", "", fmt.Errorf("%w: auth.type %q", ErrUnsupportedCredential, route.AuthType)
 	default:
-		return "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
+		return "", "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
 	}
 }
 

@@ -102,6 +102,43 @@ func TestExternalModelConfigOmitsCredentialFilterWithoutReferences(t *testing.T)
 	}
 }
 
+func TestExtprocCredentialsRenderPerEntryHeader(t *testing.T) {
+	// An apikey provider that diverges from the filter default (Azure → api-key)
+	// must render an explicit header on its entry, while a bearer_token entry
+	// (header fixed filter-side) must not.
+	candidates := []envelope.Candidate{
+		{
+			Cluster:  "provider-azure",
+			StableID: envelope.CandidateStableID("model-azure", "azure"),
+			Credential: &envelope.Credential{
+				Strategy:  "apikey",
+				Header:    "api-key",
+				SecretRef: envelope.SecretRef{Name: "azure-secret", Namespace: "tenant-a", Key: "api-key"},
+			},
+		},
+		{
+			Cluster:  "provider-openai",
+			StableID: envelope.CandidateStableID("model-openai", "openai"),
+			Credential: &envelope.Credential{
+				Strategy:  "bearer_token",
+				SecretRef: envelope.SecretRef{Name: "openai-secret", Namespace: "tenant-a", Key: "api-key"},
+			},
+		},
+	}
+	credentials, err := extprocCredentials("tenant-a", candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := extprocPostAuthConfig(candidates, credentials)
+	if !strings.Contains(config, "strategy: apikey\n            header: api-key\n") {
+		t.Fatalf("azure entry must render api-key header between strategy and file:\n%s", config)
+	}
+	// The bearer_token entry carries no header override.
+	if strings.Contains(config, "strategy: bearer_token\n            header:") {
+		t.Fatalf("bearer_token entry must not render a header line:\n%s", config)
+	}
+}
+
 func TestExtprocCredentialsRejectCrossNamespaceProvider(t *testing.T) {
 	candidates := []envelope.Candidate{{
 		StableID: envelope.CandidateStableID("model", "provider"),

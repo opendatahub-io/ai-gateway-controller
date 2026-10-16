@@ -615,7 +615,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
 	for _, route := range runtimeSet.Routes() {
-		strategy, err := envelope.StrategyFor(route)
+		strategy, header, err := envelope.StrategyFor(route)
 		if err != nil {
 			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}
@@ -626,6 +626,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		if strategy != "" {
 			candidate.Credential = &envelope.Credential{
 				Strategy:  strategy,
+				Header:    header,
 				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
 			}
 		}

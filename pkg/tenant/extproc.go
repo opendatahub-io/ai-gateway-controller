@@ -30,7 +30,13 @@ type extprocCredential struct {
 	namespace string
 	key       string
 	strategy  string
-	file      string
+	// header is the provider-boundary request header the credential_inject
+	// filter injects the credential into. Empty for strategies that fix their
+	// header filter-side (bearer_token → Authorization: Bearer); set for
+	// apikey providers that diverge from the filter default (e.g. Azure's
+	// api-key). See envelope.defaultAuthHeaders.
+	header string
+	file   string
 }
 
 // configureExternalModelExtProc completes the dedicated ExternalModel ExtProc
@@ -149,14 +155,14 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 		if ref.Name == "" || ref.Key == "" {
 			return nil, fmt.Errorf("candidate %s has an incomplete credential reference", candidate.StableID)
 		}
-		identity := ref.Namespace + "/" + ref.Name + "/" + ref.Key + "/" + candidate.Credential.Strategy
+		identity := ref.Namespace + "/" + ref.Name + "/" + ref.Key + "/" + candidate.Credential.Strategy + "/" + candidate.Credential.Header
 		if seen[identity] {
 			continue
 		}
 		seen[identity] = true
 		hash := sha256.Sum256([]byte(ref.Namespace + "/" + ref.Name + "/" + ref.Key))
 		path := fmt.Sprintf("%s/%s-%s/%s", extprocCredentialDir, ref.Name, hex.EncodeToString(hash[:])[:12], ref.Key)
-		credentials = append(credentials, extprocCredential{name: ref.Name, namespace: ref.Namespace, key: ref.Key, strategy: candidate.Credential.Strategy, file: path})
+		credentials = append(credentials, extprocCredential{name: ref.Name, namespace: ref.Namespace, key: ref.Key, strategy: candidate.Credential.Strategy, header: candidate.Credential.Header, file: path})
 	}
 	sort.Slice(credentials, func(i, j int) bool {
 		return credentials[i].name+credentials[i].key+credentials[i].strategy < credentials[j].name+credentials[j].key+credentials[j].strategy
@@ -191,7 +197,11 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")
 		for _, credential := range credentials {
 			fmt.Fprintf(&b, "          - name: %s\n            namespace: %s\n", credential.name, credential.namespace)
-			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n            file: %s\n", credential.key, credential.strategy, credential.file)
+			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n", credential.key, credential.strategy)
+			if credential.header != "" {
+				fmt.Fprintf(&b, "            header: %s\n", credential.header)
+			}
+			fmt.Fprintf(&b, "            file: %s\n", credential.file)
 		}
 	}
 	b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
