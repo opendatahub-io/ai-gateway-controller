@@ -89,6 +89,34 @@ func TestResolveIPPScalingClampsMaxReplicas(t *testing.T) {
 	}
 }
 
+func TestResolveIPPScalingIgnoresNonPositiveHPABounds(t *testing.T) {
+	mtc := NewMaasTenantConfig()
+	mtc.Object["spec"] = map[string]any{
+		"payloadProcessing": map[string]any{
+			"replicas": int64(0),
+			"autoscaling": map[string]any{
+				"maxReplicas":             int64(0),
+				"targetCPUUtilization":    int64(-1),
+				"targetMemoryUtilization": int64(0),
+			},
+		},
+	}
+	got := resolveIPPScaling(mtc, logr.Discard())
+	if !got.processing.autoscaling {
+		t.Fatal("expected autoscaling enabled when autoscaling map is present")
+	}
+	if got.processing.replicas != nil {
+		t.Fatalf("replicas = %v, want nil after rejecting < 1", got.processing.replicas)
+	}
+	if got.processing.maxReplicas != defaultMaxReplicas {
+		t.Fatalf("maxReplicas = %d, want default %d", got.processing.maxReplicas, defaultMaxReplicas)
+	}
+	if got.processing.targetCPU != defaultTargetCPU || got.processing.targetMemory != defaultTargetMemory {
+		t.Fatalf("targets = %d/%d, want defaults %d/%d",
+			got.processing.targetCPU, got.processing.targetMemory, defaultTargetCPU, defaultTargetMemory)
+	}
+}
+
 func TestConfigureIPPScalingAppendsHPAAndStripsReplicas(t *testing.T) {
 	resources := []unstructured.Unstructured{
 		{

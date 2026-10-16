@@ -72,7 +72,11 @@ func resolveIPPWorkloadScaling(mtc *unstructured.Unstructured, field, logLabel s
 	}
 
 	if v, ok := nestedInt32(spec, "replicas"); ok {
-		cfg.replicas = &v
+		if v >= 1 {
+			cfg.replicas = &v
+		} else {
+			log.Info("Ignoring "+field+".replicas; must be >= 1", "value", v)
+		}
 	}
 
 	autoscaling, asFound, asErr := unstructured.NestedMap(spec, "autoscaling")
@@ -80,13 +84,25 @@ func resolveIPPWorkloadScaling(mtc *unstructured.Unstructured, field, logLabel s
 		cfg.autoscaling = true
 		log.Info(logLabel + " autoscaling enabled")
 		if v, ok := nestedInt32(autoscaling, "maxReplicas"); ok {
-			cfg.maxReplicas = v
+			if v >= 1 {
+				cfg.maxReplicas = v
+			} else {
+				log.Info("Ignoring "+field+".autoscaling.maxReplicas; must be >= 1", "value", v)
+			}
 		}
 		if v, ok := nestedInt32(autoscaling, "targetCPUUtilization"); ok {
-			cfg.targetCPU = v
+			if v >= 1 {
+				cfg.targetCPU = v
+			} else {
+				log.Info("Ignoring "+field+".autoscaling.targetCPUUtilization; must be >= 1", "value", v)
+			}
 		}
 		if v, ok := nestedInt32(autoscaling, "targetMemoryUtilization"); ok {
-			cfg.targetMemory = v
+			if v >= 1 {
+				cfg.targetMemory = v
+			} else {
+				log.Info("Ignoring "+field+".autoscaling.targetMemoryUtilization; must be >= 1", "value", v)
+			}
 		}
 	}
 
