@@ -512,7 +512,7 @@ func (r *Reconciler) ownExternalModels(ctx context.Context, namespace, gatewayNa
 	}
 	own := make([]v1alpha1.ExternalModel, 0, len(models.Items))
 	for i := range models.Items {
-		if ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
+		if models.Items[i].DeletionTimestamp.IsZero() && ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
 			own = append(own, models.Items[i])
 		}
 	}
@@ -580,7 +580,7 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
 	availableRequired := make(map[string]bool, len(required))
 	for i := range providers.Items {
-		if referenced[providers.Items[i].Name] {
+		if providers.Items[i].DeletionTimestamp.IsZero() && referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
 			if required[providers.Items[i].Name] {
 				availableRequired[providers.Items[i].Name] = true
@@ -607,31 +607,15 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
-		providerPtrs = append(providerPtrs, &providers.Items[i])
+		if providers.Items[i].DeletionTimestamp.IsZero() {
+			providerPtrs = append(providerPtrs, &providers.Items[i])
+		}
 	}
 	runtimeSet, err := resolver.ResolveAll(modelPtrs, providerPtrs)
 	if err != nil {
 		return nil, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
-	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
-	for _, route := range runtimeSet.Routes() {
-		strategy, err := envelope.StrategyFor(route)
-		if err != nil {
-			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
-		}
-		candidate := envelope.Candidate{
-			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
-			Kind: "inference_model", Name: route.ClientName, Fresh: true,
-		}
-		if strategy != "" {
-			candidate.Credential = &envelope.Credential{
-				Strategy:  strategy,
-				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
-			}
-		}
-		candidates = append(candidates, candidate)
-	}
-	return candidates, nil
+	return ExternalModelRuntimeCandidates(runtimeSet)
 }
 
 func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {

@@ -48,7 +48,19 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithObjects(objects...).Build()
-	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
+	r.readPodLogs = func(ctx context.Context, namespace, _, container string) (string, error) {
+		if container != externalModelExtProcContainer {
+			return "", fmt.Errorf("unexpected ExtProc container %q", container)
+		}
+		env, err := r.readPublishedEnvelope(ctx, namespace)
+		if err != nil || env == nil {
+			return "", err
+		}
+		revision := env.Revision.Value
+		return `accepted_revision="` + revision + `" serving_revision="` + revision + `"`, nil
+	}
+	return r
 }
 
 func legacyExternalModelRouteFilter(name, namespace, managedBy string) *unstructured.Unstructured {
@@ -1350,11 +1362,46 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	if err := r.Delete(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("deleted model withdrawal requeue = %s, want old route drain", result.RequeueAfter)
 	}
 	deletedRoute := &unstructured.Unstructured{}
 	deletedRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); err != nil {
+		t.Fatalf("deleted model route should remain until the old ExtProc drains: %v", err)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{sibling})
+	result, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("deleted model drain requeue = %s, want %s", result.RequeueAfter, withdrawalDrainDuration)
+	}
+	var drainOverlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &drainOverlay); err != nil {
+		t.Fatal(err)
+	}
+	var drainState withdrawalDrainState
+	if err := json.Unmarshal([]byte(drainOverlay.Annotations[withdrawalDrainAnnotation]), &drainState); err != nil {
+		t.Fatalf("decode drain state: %v", err)
+	}
+	drainState.StartedAt = time.Now().Add(-withdrawalDrainDuration - time.Second)
+	drainStateRaw, err := json.Marshal(drainState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainOverlay.Annotations[withdrawalDrainAnnotation] = string(drainStateRaw)
+	if err := r.Update(context.Background(), &drainOverlay); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted model route = %v, want NotFound", err)
 	}

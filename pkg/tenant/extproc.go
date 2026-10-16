@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 const extprocCredentialDir = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
@@ -44,6 +45,8 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 		return err
 	}
 	config := extprocPostAuthConfig(candidates, credentials)
+	configDigest := sha256.Sum256([]byte(config))
+	configHash := hex.EncodeToString(configDigest[:])
 
 	var configMap *unstructured.Unstructured
 	var deployment *unstructured.Unstructured
@@ -70,8 +73,7 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
 		return fmt.Errorf("write post-auth ExtProc ConfigMap data: %w", err)
 	}
-	configHash := sha256.Sum256([]byte(config))
-	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", "ai-gateway-controller.opendatahub.io/extproc-config-sha256"); err != nil {
+	if err := unstructured.SetNestedField(deployment.Object, configHash, "spec", "template", "metadata", "annotations", "ai-gateway-controller.opendatahub.io/extproc-config-sha256"); err != nil {
 		return fmt.Errorf("write post-auth ExtProc config hash: %w", err)
 	}
 
@@ -129,6 +131,54 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 		return fmt.Errorf("write post-auth ExtProc containers: %w", err)
 	}
 	return nil
+}
+
+// ExternalModelRuntimeCandidates converts resolved ExternalModel routes to the
+// exact candidate list mounted by the tenant ExternalModel ExtProc. Keeping
+// this conversion shared lets the controller verify that a serving Deployment
+// has rolled to the current provider set before pruning withdrawn routes.
+func ExternalModelRuntimeCandidates(routes *resolver.ResolvedRouteSet) ([]envelope.Candidate, error) {
+	if routes == nil {
+		return nil, errors.New("ExternalModel runtime routes are required")
+	}
+	candidates := make([]envelope.Candidate, 0, len(routes.Routes()))
+	for _, route := range routes.Routes() {
+		strategy, err := envelope.StrategyFor(route)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
+		}
+		candidate := envelope.Candidate{
+			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
+			Kind: "inference_model", Name: route.ClientName, Fresh: true,
+		}
+		if strategy != "" {
+			candidate.Credential = &envelope.Credential{
+				Strategy:  strategy,
+				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
+			}
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+// ExternalModelExtProcConfigHash returns the template annotation value used by
+// the dedicated ExternalModel ExtProc Deployment for a candidate set.
+func ExternalModelExtProcConfigHash(namespace string, candidates []envelope.Candidate) (string, error) {
+	_, configHash, err := ExternalModelExtProcConfig(namespace, candidates)
+	return configHash, err
+}
+
+// ExternalModelExtProcConfig returns the mounted config and its Deployment
+// template hash for a candidate set.
+func ExternalModelExtProcConfig(namespace string, candidates []envelope.Candidate) (string, string, error) {
+	credentials, err := extprocCredentials(namespace, candidates)
+	if err != nil {
+		return "", "", err
+	}
+	config := extprocPostAuthConfig(candidates, credentials)
+	configHash := sha256.Sum256([]byte(config))
+	return config, hex.EncodeToString(configHash[:]), nil
 }
 
 // extprocCredentials returns deterministic, reference-only file mappings.

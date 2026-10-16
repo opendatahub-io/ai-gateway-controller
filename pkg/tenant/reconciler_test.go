@@ -106,7 +106,10 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 		}
 	}
 	live, later := provider("live"), provider("later")
-	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, live).Build()
+	deleting := provider("deleted")
+	deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	deleting.Finalizers = []string{"test-cleanup"}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, live, deleting).Build()
 	r := &Reconciler{Client: fakeClient}
 	writeOverlay := func(providers ...*v1alpha1.ExternalProvider) {
 		t.Helper()
@@ -169,6 +172,35 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system")
 	if err != nil || len(candidates) != 2 {
 		t.Fatalf("ExtProc runtime candidates = %#v, err=%v; want live and later", candidates, err)
+	}
+}
+
+func TestExternalModelRuntimeExcludesDeletingModels(t *testing.T) {
+	ctx := context.Background()
+	const namespace = "tenant-ns"
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: namespace},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "active", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}}}
+	deleting := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "deleting", Namespace: namespace, DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{"test-cleanup"}},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}}}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, deleting, provider).Build()
+	r := &Reconciler{Client: fakeClient}
+	owned, err := r.ownExternalModels(ctx, namespace, "gateway", "gateway-system")
+	if err != nil || len(owned) != 1 || owned[0].Name != model.Name {
+		t.Fatalf("active ExternalModels = %#v, err=%v; want only %q", owned, err, model.Name)
+	}
+	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system")
+	if err != nil || len(candidates) != 1 || candidates[0].StableID != "active/provider-provider" {
+		t.Fatalf("runtime candidates = %#v, err=%v; want only active model", candidates, err)
 	}
 }
 

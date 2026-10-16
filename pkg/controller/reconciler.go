@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -83,6 +84,10 @@ type Reconciler struct {
 	// content-addressed overlay provenance.
 	ProducerVersion string
 	Log             logr.Logger
+	// readPodLogs reads the current ExtProc container's recent log stream. The
+	// withdrawal gate requires process-reported accepted and serving revisions,
+	// not only Kubernetes rollout status.
+	readPodLogs func(context.Context, string, string, string) (string, error)
 	// ApplyResource and PublishOverlay are test seams. Production leaves them
 	// nil, selecting the real SSA renderer and publisher below. Applying one
 	// object at a time preserves the production order and lets tests inject a
@@ -96,6 +101,20 @@ type Reconciler struct {
 // changes fan out to models that reference the provider; Secret and tenant
 // changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.readPodLogs == nil {
+		kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+		if err != nil {
+			return fmt.Errorf("create Kubernetes client for ExternalModel serving-state checks: %w", err)
+		}
+		r.readPodLogs = func(ctx context.Context, namespace, podName, container string) (string, error) {
+			tailLines := int64(300)
+			body, err := kubeClient.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+				Container: container,
+				TailLines: &tailLines,
+			}).Do(ctx).Raw()
+			return string(body), err
+		}
+	}
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
 	if err := builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
@@ -301,11 +320,25 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		if apierrors.IsNotFound(err) {
 			// Clean resources left by a provider that predated the provider
 			// finalizer. All cleanup remains label-gated to this provider.
+			inUse, useErr := r.providerTransportStillInUse(ctx, req.Namespace, req.Name)
+			if useErr != nil {
+				return reconcile.Result{}, useErr
+			}
+			if inUse {
+				return reconcile.Result{RequeueAfter: withdrawalRequeueInterval}, nil
+			}
 			return reconcile.Result{}, r.cleanupProviderTransport(ctx, req.Namespace, req.Name)
 		}
 		return reconcile.Result{}, err
 	}
 	if !provider.DeletionTimestamp.IsZero() {
+		inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if inUse {
+			return reconcile.Result{RequeueAfter: withdrawalRequeueInterval}, nil
+		}
 		if !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
 			return reconcile.Result{}, r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
 		}
@@ -418,16 +451,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// resource labels as its independent ownership proof.
 	if !model.DeletionTimestamp.IsZero() {
 		if err := r.reconcileDeletingModel(ctx, &model); err != nil {
+			var pending *pendingWithdrawalError
+			if errors.As(err, &pending) {
+				return reconcile.Result{RequeueAfter: pending.After}, nil
+			}
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
 	}
 	if len(model.Spec.GatewayRefs) > 0 {
-		return r.reconcileAttachedModel(ctx, &model)
+		result, err := r.reconcileAttachedModel(ctx, &model)
+		var pending *pendingWithdrawalError
+		if errors.As(err, &pending) {
+			return reconcile.Result{RequeueAfter: pending.After}, nil
+		}
+		return result, err
 	}
-	return r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
+	result, err := r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
 		return r.updateModelStatus(ctx, &model, ready, reason, message, env)
 	})
+	var pending *pendingWithdrawalError
+	if errors.As(err, &pending) {
+		return reconcile.Result{RequeueAfter: pending.After}, nil
+	}
+	return result, err
 }
 
 // modelStatusReporter receives the home path's model status. Models with
@@ -462,8 +509,10 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		if !tenant.ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
 			continue
 		}
-		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
+		if models.Items[i].DeletionTimestamp.IsZero() {
+			modelPtrs = append(modelPtrs, &models.Items[i])
+		}
 	}
 	set, err := resolver.Resolve(modelPtrs, providerPtrs)
 	if err != nil {
@@ -507,7 +556,15 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners); err != nil {
+	previousOverlay, err := r.readPublishedEnvelope(ctx, req.Namespace)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	transportRoutes, withdrawalPending, err := r.transportRoutesForPublication(ctx, req.Namespace, set.Routes(), previousOverlay)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.applyTransport(ctx, transportRoutes, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -516,7 +573,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err := r.cleanupExternalModelRouteFilters(ctx, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace); err != nil {
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupModelTransport(ctx, req.Namespace, set.Routes()); err != nil {
+	if err := r.cleanupModelTransport(ctx, req.Namespace, transportRoutes); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -545,6 +602,14 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
 	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
 		return reconcile.Result{}, err
+	}
+	remaining, err := r.finishProviderWithdrawal(ctx, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()),
+		gatewayName, gatewayNamespace, modelPtrs, modelOwners, set.Routes(), result.Envelope.Revision.Value, withdrawalPending)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if remaining > 0 {
+		return reconcile.Result{RequeueAfter: remaining}, nil
 	}
 	return reconcile.Result{}, nil
 }
@@ -830,7 +895,15 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
 	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners); err != nil {
+	previousOverlay, err := r.readPublishedEnvelope(ctx, deleted.Namespace)
+	if err != nil {
+		return err
+	}
+	transportRoutes, withdrawalPending, err := r.transportRoutesForPublication(ctx, deleted.Namespace, set.Routes(), previousOverlay)
+	if err != nil {
+		return err
+	}
+	if err := r.applyTransport(ctx, transportRoutes, deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -839,7 +912,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
 		return err
 	}
-	if err := r.cleanupModelTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
+	if err := r.cleanupModelTransport(ctx, deleted.Namespace, transportRoutes); err != nil {
 		return err
 	}
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
@@ -850,12 +923,21 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if publish == nil {
 		publish = pub.Publish
 	}
-	if _, err := publish(ctx, set, envelope.Scope{
+	result, err := publish(ctx, set, envelope.Scope{
 		Network: r.Network, Gateway: gatewayName, Namespace: deleted.Namespace, LocalSite: r.localSite(),
 	}, envelope.Options{
 		KnownClusters: r.KnownClusters, SourceUID: string(modelPtrs[0].UID), ProducerVersion: r.ProducerVersion,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
+	}
+	remaining, err := r.finishProviderWithdrawal(ctx, deleted.Namespace, tenantID, gatewayName,
+		gatewayNamespace, modelPtrs, modelOwners, set.Routes(), result.Envelope.Revision.Value, withdrawalPending)
+	if err != nil {
+		return err
+	}
+	if remaining > 0 {
+		return &pendingWithdrawalError{After: remaining}
 	}
 	return nil
 }
@@ -1800,7 +1882,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			}},
 			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
 			"filters":     []any{providerURLRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
-			"timeouts":    map[string]any{"request": "300s"},
+			"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 		})
 		// Body-routed requests enter on a model header rather than the
 		// canonical path. The selected-provider header is still authoritative
@@ -1812,14 +1894,14 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			}}},
 			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
 			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
-			"timeouts":    map[string]any{"request": "300s"},
+			"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 		})
 	}
 	sinkName := providerSelectionSinkName(route.Model)
 	rules = append(rules, map[string]any{
 		"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": path}}},
 		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
-		"timeouts":    map[string]any{"request": "300s"},
+		"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 	})
 	// Keep the body-routing rule for requests whose path is not the canonical
 	// model path. The post-auth ExtProc selection header is authoritative for
@@ -1828,7 +1910,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 	rules = append(rules, map[string]any{
 		"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
 		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
-		"timeouts":    map[string]any{"request": "300s"},
+		"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 	})
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",

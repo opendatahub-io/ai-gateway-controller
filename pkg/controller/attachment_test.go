@@ -312,10 +312,16 @@ func TestRebindingAwayFromOwnTenantRemovesHomeRoute(t *testing.T) {
 	if err := r.Update(context.Background(), got); err != nil {
 		t.Fatal(err)
 	}
-	reconcileModel(t, r, model)
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("home withdrawal requeue = %s, want old route drain", result.RequeueAfter)
+	}
 
-	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); !apierrors.IsNotFound(err) {
-		t.Fatalf("the old home route survived rebinding to another Gateway: %v", err)
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); err != nil {
+		t.Fatalf("the old home route should remain until its serving ExtProc drains: %v", err)
 	}
 	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-other"); err != nil {
 		t.Fatalf("a sibling's route was removed: %v", err)
