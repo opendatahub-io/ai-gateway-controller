@@ -931,7 +931,7 @@ func TestReconcileAppliesHPAsWhenAutoscalingConfigured(t *testing.T) {
 	}
 	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
@@ -963,7 +963,7 @@ func TestReconcileDeletesOrphanedHPAsWhenAutoscalingRemoved(t *testing.T) {
 	orphan.SetNamespace("openshift-ingress")
 	orphan.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, orphan).WithInterceptorFuncs(rec.funcs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, orphan, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
