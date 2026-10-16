@@ -127,3 +127,98 @@ func TestExtprocCredentialsRejectsUnsupportedAuth(t *testing.T) {
 		t.Fatalf("expected unsupported-auth rejection, got %v", err)
 	}
 }
+
+func TestSharedExtProcConfigDefaultOff(t *testing.T) {
+	config := sharedExtProcConfig(false)
+	for _, want := range []string{"filter: request_id", "name: ipp", "allow_unbounded_body: true"} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("default shared config missing %q:\n%s", want, config)
+		}
+	}
+	for _, forbidden := range []string{
+		"anthropic_messages_to_chat_completions",
+		"path_rewrite",
+		"/v1/messages",
+	} {
+		if strings.Contains(config, forbidden) {
+			t.Fatalf("default shared config must not contain %q:\n%s", forbidden, config)
+		}
+	}
+}
+
+func TestSharedExtProcConfigAPITranslation(t *testing.T) {
+	config := sharedExtProcConfig(true)
+	for _, want := range []string{
+		"filter: request_id",
+		"filter: anthropic_messages_to_chat_completions",
+		"filter: anthropic_messages_to_chat_completions_stream",
+		"filter: path_rewrite",
+		"path: \"/v1/messages\"",
+		"pattern: \"^/v1/messages$\"",
+		"replacement: \"/v1/chat/completions\"",
+		"content-type: \"text/event-stream\"",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("apiTranslation shared config missing %q:\n%s", want, config)
+		}
+	}
+}
+
+func TestConfigureSharedExtProcRewritesConfigAndHashesDeployment(t *testing.T) {
+	tenantID := "redteam"
+	gatewayNS := "openshift-ingress"
+	resources := []unstructured.Unstructured{
+		{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{
+				"name": PayloadProcessingPluginsConfigMapForTenant(tenantID), "namespace": gatewayNS,
+			},
+			"data": map[string]any{
+				"pre-extproc.yaml": "pre",
+				"extproc.yaml":     "old-shared",
+			},
+		}},
+		{Object: map[string]any{
+			"apiVersion": "apps/v1", "kind": "Deployment",
+			"metadata": map[string]any{
+				"name": PayloadProcessingDeploymentName(tenantID), "namespace": gatewayNS,
+			},
+			"spec": map[string]any{"template": map[string]any{
+				"metadata": map[string]any{"annotations": map[string]any{}},
+				"spec":     map[string]any{"containers": []any{map[string]any{"name": "payload-processing"}}},
+			}},
+		}},
+		// ExternalModel CM must stay untouched.
+		{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{
+				"name": PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), "namespace": "tenant-a",
+			},
+			"data": map[string]any{"extproc.yaml": "external-old"},
+		}},
+	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNS, true); err != nil {
+		t.Fatal(err)
+	}
+	data, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data["pre-extproc.yaml"] != "pre" {
+		t.Fatalf("pre-extproc.yaml was rewritten: %q", data["pre-extproc.yaml"])
+	}
+	if !strings.Contains(data["extproc.yaml"], "anthropic_messages_to_chat_completions") {
+		t.Fatalf("shared extproc.yaml missing Anthropic filters:\n%s", data["extproc.yaml"])
+	}
+	hash, found, err := unstructured.NestedString(resources[1].Object, "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation)
+	if err != nil || !found || hash == "" {
+		t.Fatalf("shared config hash missing: found=%v err=%v hash=%q", found, err, hash)
+	}
+	external, _, err := unstructured.NestedStringMap(resources[2].Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if external["extproc.yaml"] != "external-old" {
+		t.Fatalf("ExternalModel ConfigMap was rewritten: %q", external["extproc.yaml"])
+	}
+}

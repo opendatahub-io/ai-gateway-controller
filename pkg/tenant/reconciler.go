@@ -405,6 +405,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, APITranslationEnabled(aitenant)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
+	}
 	if hasModels {
 		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)

@@ -51,6 +51,19 @@ func IsFailed(aitenant *unstructured.Unstructured) bool {
 	return Phase(aitenant) == AITenantPhaseFailed
 }
 
+// APITranslationEnabled reports whether the owning AITenant opted into
+// Praxis API translation via spec.payloadProcessing.apiTranslation.
+// Missing or false means passthrough (default-off), matching Praxis
+// upstream and RHOAIENG-99096. AIGC treats AITenant as authoritative even
+// if MaasTenantConfig later mirrors the same nested field.
+func APITranslationEnabled(aitenant *unstructured.Unstructured) bool {
+	if aitenant == nil {
+		return false
+	}
+	enabled, found, err := unstructured.NestedBool(aitenant.Object, "spec", "payloadProcessing", "apiTranslation")
+	return err == nil && found && enabled
+}
+
 // StatusIsCurrent reports whether the AITenant's Ready condition was computed
 // for the object's current spec generation — i.e. status.phase and
 // status.gatewayRef reflect the live spec, not an in-flight older one that

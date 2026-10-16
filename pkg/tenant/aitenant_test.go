@@ -65,6 +65,39 @@ func TestNewAITenantSetsGVK(t *testing.T) {
 	}
 }
 
+func TestAPITranslationEnabled(t *testing.T) {
+	withFlag := func(enabled any) *unstructured.Unstructured {
+		u := aitenantFixture(AITenantPhaseActive, "gw", "gw-ns")
+		if enabled == nil {
+			return u
+		}
+		u.Object["spec"] = map[string]any{
+			"payloadProcessing": map[string]any{
+				"apiTranslation": enabled,
+			},
+		}
+		return u
+	}
+	cases := []struct {
+		name string
+		u    *unstructured.Unstructured
+		want bool
+	}{
+		{"nil AITenant", nil, false},
+		{"absent spec", aitenantFixture(AITenantPhaseActive, "gw", "gw-ns"), false},
+		{"false", withFlag(false), false},
+		{"true", withFlag(true), true},
+		{"wrong type", withFlag("true"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := APITranslationEnabled(c.u); got != c.want {
+				t.Fatalf("APITranslationEnabled() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestIsFailed(t *testing.T) {
 	if IsFailed(aitenantFixture("Pending", "", "")) {
 		t.Fatal("IsFailed(Pending) = true, want false")
