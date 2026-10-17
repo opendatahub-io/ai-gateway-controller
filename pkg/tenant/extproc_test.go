@@ -115,6 +115,64 @@ func TestExtprocCredentialsRejectCrossNamespaceProvider(t *testing.T) {
 	}
 }
 
+func TestExtprocPostAuthConfigLeadsWithHeadersGuard(t *testing.T) {
+	config := extprocPostAuthConfig(nil, nil)
+	headersIdx := strings.Index(config, "filter: headers")
+	if headersIdx == -1 {
+		t.Fatalf("post-auth config missing headers guard filter:\n%s", config)
+	}
+	routeIdx := strings.Index(config, "filter: intelligent_route")
+	if routeIdx == -1 {
+		t.Fatalf("post-auth config missing intelligent_route filter:\n%s", config)
+	}
+	if headersIdx > routeIdx {
+		t.Fatalf("headers guard filter must precede intelligent_route:\n%s", config)
+	}
+	for _, header := range GuardedRequestHeaders {
+		if !strings.Contains(config, "- "+header+"\n") {
+			t.Fatalf("post-auth config missing guarded header %q:\n%s", header, config)
+		}
+	}
+}
+
+// TestGuardedRequestHeadersCoversDenyList pins GuardedRequestHeaders as a
+// superset of maas-controller's deny-client-identity-headers AuthPolicy
+// predicate list (maasauthpolicy_controller.go). This module does not import
+// maas-controller (see package doc), so the deny-list is mirrored here by
+// name; update both lists together whenever a new x-maas-* identity header
+// is introduced on either side.
+func TestGuardedRequestHeadersCoversDenyList(t *testing.T) {
+	denyList := []string{
+		"x-maas-username",
+		"x-maas-group",
+		"x-maas-keyname",
+		"x-maas-subscription-rate-limit-id",
+		"x-maas-organization-id",
+		"x-maas-cost-center",
+		"x-maas-identity",
+		"x-maas-admin-scope",
+	}
+	guarded := make(map[string]bool, len(GuardedRequestHeaders))
+	for _, header := range GuardedRequestHeaders {
+		guarded[header] = true
+	}
+	for _, header := range denyList {
+		if !guarded[header] {
+			t.Fatalf("GuardedRequestHeaders is missing deny-listed header %q", header)
+		}
+	}
+}
+
+func TestExtprocPostAuthConfigIsDeterministic(t *testing.T) {
+	candidates := []envelope.Candidate{{Cluster: "provider-a", StableID: envelope.CandidateStableID("model", "provider-a")}}
+	credentials := []extprocCredential{{name: "a-secret", namespace: "tenant-a", key: "api-key", strategy: "bearer_token", file: "/etc/praxis/credentials/a-secret/api-key"}}
+	first := extprocPostAuthConfig(candidates, credentials)
+	second := extprocPostAuthConfig(candidates, credentials)
+	if first != second {
+		t.Fatalf("extprocPostAuthConfig is not deterministic:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
 func TestExtprocCredentialsRejectsUnsupportedAuth(t *testing.T) {
 	candidates := []envelope.Candidate{{
 		StableID: envelope.CandidateStableID("model", "provider"),
