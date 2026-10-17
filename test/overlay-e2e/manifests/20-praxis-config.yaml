@@ -36,9 +36,14 @@ data:
     filter_chains:
       - name: main
         filters:
-          - filter: json_body_field
-            field: model
-            header: X-Model
+          - filter: headers
+            request_remove:
+                - X-Model
+          - filter: json_body
+            request_extract:
+              - pointer: /model
+                header: X-Model
+            on_invalid: continue
 
           - filter: intelligent_route
             overlay_file: /etc/praxis/routing/routing-overlay.json
