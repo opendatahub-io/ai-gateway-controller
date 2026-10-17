@@ -4,10 +4,93 @@ import (
 	"reflect"
 	"testing"
 
+	netwv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
+
+func TestExternalModelNetworkPolicyRemovedOnTenantCleanup(t *testing.T) {
+	policy, err := externalModelNetworkPolicy("demo", "tenant-a", "gateway", "gateway-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+	c := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(&policy).Build()
+	if err := (&Reconciler{Client: c}).cleanup(t.Context(), "demo", "gateway-system", "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), client.ObjectKeyFromObject(&policy), &policy); !apierrors.IsNotFound(err) {
+		t.Fatalf("tenant cleanup must remove the isolation policy: %v", err)
+	}
+}
+
+func TestExternalModelNetworkPolicyDoesNotOverlapSharedPolicies(t *testing.T) {
+	for _, namespace := range []string{"tenant-a", "gateway-system"} {
+		t.Run(namespace, func(t *testing.T) {
+			rendered, err := render.Build(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resources := render.PostRender(rendered, render.Params{Namespace: "gateway-system", GatewayName: "gateway", Image: "extproc:dev"})
+			resources, err = Rename(resources, "demo", "gateway-system")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resources, err = SplitPostAuthResources(resources, "demo", "gateway-system", namespace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			podLabels := labels.Set{LabelTenantInstance: PayloadProcessingExternalModelDeploymentName("demo"), "app": PayloadProcessingExternalModelName}
+			for _, resource := range resources {
+				if resource.GetKind() != "NetworkPolicy" || resource.GetNamespace() != namespace {
+					continue
+				}
+				var policy netwv1.NetworkPolicy
+				if err := runtime.DefaultUnstructuredConverter.FromUnstructured(resource.Object, &policy); err != nil {
+					t.Fatal(err)
+				}
+				selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if selector.Matches(podLabels) {
+					t.Fatalf("shared policy %s also selects ExternalModel ExtProc", policy.Name)
+				}
+			}
+			resource, err := externalModelNetworkPolicy("demo", namespace, "gateway", "gateway-system")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var policy netwv1.NetworkPolicy
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(resource.Object, &policy); err != nil {
+				t.Fatal(err)
+			}
+			selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
+			if err != nil || !selector.Matches(podLabels) {
+				t.Fatal("dedicated policy must select ExternalModel ExtProc")
+			}
+			peer := policy.Spec.Ingress[0].From[0]
+			gateways, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !gateways.Matches(labels.Set{"gateway.networking.k8s.io/gateway-name": "gateway"}) || gateways.Matches(labels.Set{"gateway.networking.k8s.io/gateway-name": "other-gateway"}) {
+				t.Fatal("only the resolved Gateway may connect")
+			}
+			namespaces, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
+			if err != nil || !namespaces.Matches(labels.Set{"kubernetes.io/metadata.name": "gateway-system"}) || namespaces.Matches(labels.Set{"kubernetes.io/metadata.name": "other-system"}) {
+				t.Fatal("Gateway namespace must be restricted")
+			}
+		})
+	}
+}
 
 //nolint:gocyclo // The test checks every namespace/ownership boundary in one rendered resource set.
 func TestSplitPostAuthResourcesUsesResolvedTenantNamespace(t *testing.T) {

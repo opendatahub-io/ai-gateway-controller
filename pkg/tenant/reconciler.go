@@ -412,6 +412,12 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	} else {
 		resources = RemoveExternalModelResources(resources, tenantID)
 	}
+	// Keep isolation on draining pods even when models are disabled.
+	policy, err := externalModelNetworkPolicy(tenantID, tenantNamespace, gatewayName, gatewayNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resources = append(resources, policy)
 	if r.SkipNetworkPolicy {
 		filtered := make([]unstructured.Unstructured, 0, len(resources))
 		for _, resource := range resources {
@@ -831,6 +837,9 @@ func (r *Reconciler) removeFinalizer(ctx context.Context, mtc *unstructured.Unst
 // references that one role, so deleting it would break every other
 // praxis tenant sharing the cluster.
 func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
+	if err := r.deleteResourceIfOwned(ctx, gvkNetworkPolicy, ResourceName("external-model-extproc", tenantID), tenantNamespace); err != nil {
+		return err
+	}
 	type target struct {
 		gvk       schema.GroupVersionKind
 		name      string

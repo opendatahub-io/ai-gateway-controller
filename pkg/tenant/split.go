@@ -14,8 +14,48 @@ import (
 	"errors"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+	netwv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+func externalModelNetworkPolicy(tenantID, namespace, gatewayName, gatewayNamespace string) (unstructured.Unstructured, error) {
+	port := func(protocol corev1.Protocol, number int) netwv1.NetworkPolicyPort {
+		value := intstr.FromInt(number)
+		return netwv1.NetworkPolicyPort{Protocol: &protocol, Port: &value}
+	}
+	namespaceSelector := func(name string) *metav1.LabelSelector {
+		return &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": name}}
+	}
+	policy := &netwv1.NetworkPolicy{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{Name: ResourceName("external-model-extproc", tenantID), Namespace: namespace},
+		Spec: netwv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{LabelTenantInstance: PayloadProcessingExternalModelDeploymentName(tenantID)}},
+			PolicyTypes: []netwv1.PolicyType{netwv1.PolicyTypeIngress, netwv1.PolicyTypeEgress},
+			Ingress: []netwv1.NetworkPolicyIngressRule{
+				{From: []netwv1.NetworkPolicyPeer{{
+					NamespaceSelector: namespaceSelector(gatewayNamespace),
+					PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"gateway.networking.k8s.io/gateway-name": gatewayName}},
+				}}, Ports: []netwv1.NetworkPolicyPort{port(corev1.ProtocolTCP, 9004)}},
+				{From: []netwv1.NetworkPolicyPeer{
+					{NamespaceSelector: namespaceSelector("openshift-monitoring")},
+					{NamespaceSelector: namespaceSelector("openshift-user-workload-monitoring")},
+				}, Ports: []netwv1.NetworkPolicyPort{port(corev1.ProtocolTCP, 9090)}},
+			},
+			Egress: []netwv1.NetworkPolicyEgressRule{{Ports: []netwv1.NetworkPolicyPort{
+				port(corev1.ProtocolUDP, 53), port(corev1.ProtocolTCP, 53),
+				port(corev1.ProtocolUDP, 5353), port(corev1.ProtocolTCP, 5353),
+				port(corev1.ProtocolTCP, 5432),
+			}}},
+		},
+	}
+	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(policy)
+	return unstructured.Unstructured{Object: object}, err
+}
 
 // SplitPostAuthResources preserves the rendered MaaS/KServe payload-
 // processing resources in the Gateway namespace and adds only the dedicated
@@ -66,7 +106,7 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 				}
 				out = append(out, *u, *external)
 			case u.GetKind() == "NetworkPolicy":
-				if err := filterTenantInstanceSelectorValues(u, []string{PayloadProcessingDeploymentName(tenantID), PayloadProcessingExternalModelDeploymentName(tenantID)}); err != nil {
+				if err := filterTenantInstanceSelectorValues(u, []string{PayloadProcessingDeploymentName(tenantID), PayloadPreProcessingDeploymentName(tenantID)}); err != nil {
 					return nil, err
 				}
 				out = append(out, *u)
@@ -129,7 +169,7 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 			out = append(out, *u)
 			post := u.DeepCopy()
 			post.SetNamespace(tenantNamespace)
-			if err := filterTenantInstanceSelectorValues(post, []string{PayloadProcessingDeploymentName(tenantID), PayloadProcessingExternalModelDeploymentName(tenantID)}); err != nil {
+			if err := filterTenantInstanceSelectorValues(post, []string{PayloadProcessingDeploymentName(tenantID)}); err != nil {
 				return nil, err
 			}
 			out = append(out, *post)

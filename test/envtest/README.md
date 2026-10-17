@@ -31,6 +31,9 @@ API server, including on failure. The current kubeconfig is never used.
 
 ## Contracts covered
 
+- ExternalModel ExtProc has exactly one selecting controller policy before model
+  creation, while serving a model and after model deletion, restricting ingress
+  to its resolved Gateway.
 - Given an existing Praxis tenant and a configured provider, creating an
   ExternalModel publishes the requested model/provider mapping and an HTTPRoute
   attached to the tenant's gateway, reports the current generation Ready, and
