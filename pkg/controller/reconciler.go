@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -109,6 +110,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
+		// Gateway attachments: route acceptance is reported in HTTPRoute
+		// status, and a model-name change can decide a conflict on another
+		// namespace's attachment.
+		WatchesRawSource(source.Kind(mgr.GetCache(), newHTTPRoute(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.attachmentRouteModels))).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.sameNameModels), builder.WithPredicates(inScope)).
 		Complete(r); err != nil {
 		return err
 	}
@@ -424,6 +430,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	if len(model.Spec.GatewayRefs) > 0 {
 		return r.reconcileAttachedModel(ctx, &model)
+	}
+	// With every gatewayRef removed, no attachment route remains.
+	if err := r.removeDetachedRoutes(ctx, &model); err != nil {
+		return reconcile.Result{}, err
 	}
 	return r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
 		return r.updateModelStatus(ctx, &model, ready, reason, message, env)
@@ -822,10 +832,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 		if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
 			return err
 		}
-		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
-			return err
-		}
-		return r.removeExternalModelFinalizer(ctx, deleted)
+		return r.cleanupOverlay(ctx, deleted.Namespace)
 	}
 	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
@@ -876,11 +883,17 @@ func (r *Reconciler) cleanupModelTransport(ctx context.Context, namespace string
 	for _, route := range routes {
 		models[route.Model] = true
 	}
+	// Attachment routes from this namespace use their models' selection sinks.
+	sinks, err := r.attachedModelSinks(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	maps.Copy(sinks, models)
 	resources := []struct {
 		kind, group, version, label string
 		keep                        map[string]bool
 	}{
-		{"Service", "", "v1", "inference.opendatahub.io/external-model", models},
+		{"Service", "", "v1", "inference.opendatahub.io/external-model", sinks},
 		{"HTTPRoute", "gateway.networking.k8s.io", "v1", "inference.opendatahub.io/external-model", models},
 	}
 	for _, resource := range resources {
@@ -1792,7 +1805,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			continue
 		}
 		seenProviders[candidate.Provider] = true
-		stableID := envelope.CandidateStableID(route.Model, candidate.Provider)
+		stableID := envelope.RouteStableID(candidate)
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},

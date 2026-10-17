@@ -12,11 +12,13 @@ package envelope
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/gowebpki/jcs"
 
@@ -180,19 +182,11 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	}
 
 	candidates := make([]Candidate, 0)
-	known := make(map[string]bool, len(opts.KnownClusters))
-	for _, c := range opts.KnownClusters {
-		known[c] = true
-	}
-
 	for _, m := range routes.Models {
-		if err := checkUniformWeights(m); err != nil {
+		if err := ValidateModel(m, opts); err != nil {
 			return Envelope{}, err
 		}
 		for _, r := range m.Routes {
-			if len(known) > 0 && !known[r.Cluster] {
-				return Envelope{}, fmt.Errorf("%w: %s (model %s)", ErrUnknownCluster, r.Cluster, r.Model)
-			}
 			// Candidate names are the client-visible model identity.  This must
 			// match resolver.Route.ClientName and the HTTPRoute body/header
 			// matches; the ExternalModel object name is control-plane identity.
@@ -204,7 +198,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			// The Cluster stays shared (one transport per provider).
 			cand := Candidate{
 				Cluster:  r.Cluster,
-				StableID: CandidateStableID(r.Model, r.Provider),
+				StableID: RouteStableID(r),
 				Kind:     "inference_model",
 				Name:     r.ClientName,
 				Site:     scope.LocalSite,
@@ -214,11 +208,8 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				group := group
 				cand.SelectionGroup = &group
 			}
-			strategy, err := StrategyFor(r)
-			if err != nil {
-				return Envelope{}, fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
-			}
-			if strategy != "" {
+			// ValidateModel has already qualified the strategy.
+			if strategy, _ := StrategyFor(r); strategy != "" {
 				cand.Credential = &Credential{
 					Strategy: strategy,
 					SecretRef: SecretRef{
@@ -391,6 +382,62 @@ func StrategyFor(route resolver.Route) (string, error) {
 // so two models sharing the same provider produce distinct candidates.
 func CandidateStableID(model, provider string) string {
 	return model + "/provider-" + provider
+}
+
+// maxStableIDBytes is the Praxis stable_id length limit.
+const maxStableIDBytes = 256
+
+// ScopedStableID is the stable_id for a candidate whose model or provider is
+// outside the tenant namespace: <modelNamespace>/<model>/<providerNamespace>/<provider>,
+// or sha256:<hex> over the length-prefixed fields when that exceeds the
+// Praxis limit. Kubernetes names contain no "/", so the existing form (one
+// slash), this form (three) and the hash form (none) never collide.
+func ScopedStableID(modelNamespace, model, providerNamespace, provider string) string {
+	fields := []string{modelNamespace, model, providerNamespace, provider}
+	if id := strings.Join(fields, "/"); len(id) <= maxStableIDBytes {
+		return id
+	}
+	h := sha256.New()
+	for _, field := range fields {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
+		h.Write(size[:])
+		h.Write([]byte(field))
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// RouteStableID returns the route's stable_id: its explicit scoped override,
+// otherwise the existing CandidateStableID form.
+func RouteStableID(route resolver.Route) string {
+	if route.StableID != "" {
+		return route.StableID
+	}
+	return CandidateStableID(route.Model, route.Provider)
+}
+
+// ValidateModel applies Render's per-model checks: provider selection (equal
+// weights, no repeated provider), known clusters and qualified credential
+// strategies. The controller also runs it on a contribution from another
+// namespace in isolation, so a model Render would reject is excluded before it
+// can fail the whole tenant overlay.
+func ValidateModel(m resolver.ModelRoutes, opts Options) error {
+	if _, err := deriveSelectionMetadata(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{m}}); err != nil {
+		return err
+	}
+	known := make(map[string]bool, len(opts.KnownClusters))
+	for _, c := range opts.KnownClusters {
+		known[c] = true
+	}
+	for _, r := range m.Routes {
+		if len(known) > 0 && !known[r.Cluster] {
+			return fmt.Errorf("%w: %s (model %s)", ErrUnknownCluster, r.Cluster, r.Model)
+		}
+		if _, err := StrategyFor(r); err != nil {
+			return fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
+		}
+	}
+	return nil
 }
 
 // checkUniformWeights enforces the R1 guard for one model group.

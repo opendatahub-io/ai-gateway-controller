@@ -89,6 +89,10 @@ type Route struct {
 	AuthType          string // merged auth type: apikey|sigv4|oauth2
 	SecretName        string // credential secret (same namespace as provider)
 	SecretKey         string // fixed "api-key" per the CRD contract
+	// StableID overrides the existing stable_id derivation for a route
+	// contributed to a tenant from another namespace. Empty keeps the
+	// existing <model>/provider-<provider> form.
+	StableID string
 }
 
 // ModelRoutes is the per-model outcome: resolved routes in ref order (the
