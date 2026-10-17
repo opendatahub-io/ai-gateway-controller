@@ -59,6 +59,7 @@ func main() {
 		probeAddr            string
 		enableLeaderElection bool
 		image                string
+		meteringURL          string
 		manifestPath         string
 		maasAPIRouteName     string
 		resyncInterval       time.Duration
@@ -80,6 +81,10 @@ func main() {
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
 	flag.StringVar(&image, "image", resolveExtprocImage(),
 		"Container image for the payload-processing and payload-pre-processing Deployments.")
+	flag.StringVar(&meteringURL, "metering-url", os.Getenv("METERING_URL"),
+		"External metering service endpoint. When set, the external_metering filter is wired into the "+
+			"post-auth ExtProc chains for MaaS usage/billing. Empty disables metering. "+
+			"Defaults to the METERING_URL environment variable.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/external-model/overlays/odh",
 		"Path to the controller-owned overlay that composes vendored praxis-extproc manifests and ExternalModel patches.")
 	flag.StringVar(&maasAPIRouteName, "maas-api-route-name", "maas-api-route",
@@ -161,6 +166,7 @@ func main() {
 		APIReader:            mgr.GetAPIReader(),
 		ManifestPath:         manifestPath,
 		Image:                image,
+		MeteringURL:          meteringURL,
 		SkipNetworkPolicy:    skipNetworkPolicy,
 		MaaSAPIRouteNameBase: maasAPIRouteName,
 		ResyncInterval:       resyncInterval,

@@ -43,6 +43,15 @@ spec:
                 key: praxis-extproc-image
                 name: ai-gateway-controller-parameters
                 optional: true
+          # External metering service endpoint. The manager reads this as the
+          # --metering-url default; empty disables metering. Set the
+          # metering-url key in ai-gateway-controller-parameters to enable it.
+          - name: METERING_URL
+            valueFrom:
+              configMapKeyRef:
+                key: metering-url
+                name: ai-gateway-controller-parameters
+                optional: true
         image: ai-gateway-controller
         name: manager
         imagePullPolicy: Always

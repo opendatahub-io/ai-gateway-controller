@@ -518,10 +518,45 @@ func TestValidateProviderAuthenticationStrategies(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{Endpoint: "provider.example.com",
+			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com",
 				Auth: v1alpha1.AuthConfig{Type: tc.authType, SecretRef: v1alpha1.NameReference{Name: "credentials"}},
 			}}
 			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: tc.secretData}
+			r := controllerTestClient(t, provider, secret)
+			err := r.validateProvider(context.Background(), provider)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("validateProvider() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateProvider() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateProviderRejectsUnsupportedProviderType(t *testing.T) {
+	// openai/anthropic resolve end-to-end (envelope.StrategyFor); others must be
+	// marked Failed here so their routes never reach tenant ExtProc rendering.
+	tests := []struct {
+		name     string
+		provider string
+		want     string
+	}{
+		{name: "openai", provider: "openai"},
+		{name: "anthropic", provider: "anthropic"},
+		{name: "empty rejected", provider: "", want: "unsupported provider"},
+		{name: "unknown rejected", provider: "cohere", want: "unsupported provider"},
+		{name: "miscased rejected", provider: "OpenAI", want: "unsupported provider"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{Provider: tc.provider, Endpoint: "provider.example.com",
+				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+			}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("fixture")}}
 			r := controllerTestClient(t, provider, secret)
 			err := r.validateProvider(context.Background(), provider)
 			if tc.want == "" {

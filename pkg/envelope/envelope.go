@@ -350,13 +350,49 @@ func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 	return err
 }
 
+// providerContractKey identifies a qualified provider contract by the
+// (ExternalProvider.spec.provider, resolved API format) tuple.
+type providerContractKey struct {
+	providerType string
+	apiFormat    string
+}
+
+// apiKeyContract is what a qualified api-key provider contract resolves to.
+type apiKeyContract struct {
+	// strategy is the Praxis wire credential strategy for the contract.
+	strategy string
+	// tokenKind is the Praxis token_count ProviderKind whose response parser
+	// matches the contract's wire format; external_metering reads the token.*
+	// metadata that filter writes.
+	tokenKind string
+}
+
+// apiKeyContracts is the single qualification authority for api-key providers.
+// Each entry maps a (providerType, apiFormat) tuple the gateway can route and
+// meter end-to-end to its wire credential strategy and the token_count
+// ProviderKind that parses its responses. StrategyFor, TokenCountProviderKind,
+// and SupportsProviderType all derive from this map, so adding a provider is a
+// single entry and routing, credential injection, and metering stay in
+// lockstep rather than drifting across three hand-maintained copies.
+//
+// Expand it as contracts qualify. Two pending expansions and their caveats:
+//   - Azure openai-chat (PR #129): azure/azure-openai responses are OpenAI-shaped,
+//     so tokenKind is "openai", not "azure".
+//   - aws-bedrock sigv4 (issue #17): sigv4 is not an api-key strategy, so it needs
+//     its own auth dimension here; bedrock's tokenKind is "bedrock" or
+//     "bedrock_invoke_model" depending on the invocation API format.
+var apiKeyContracts = map[providerContractKey]apiKeyContract{
+	{providerType: "openai", apiFormat: "openai-chat"}: {strategy: "bearer_token", tokenKind: "openai"},
+	{providerType: "anthropic", apiFormat: "messages"}: {strategy: "apikey", tokenKind: "anthropic"},
+}
+
 // StrategyFor maps only the currently qualified provider API-key contracts to
-// Praxis wire strategies: openai + openai-chat maps to bearer_token
-// (Authorization: Bearer at the provider boundary) and anthropic + messages
-// maps to apikey (the credential_inject filter injects the Secret value into
-// its configured header, x-api-key by default). The wire stays reference-only
-// either way. Provider API keys are not interchangeable: other provider/
-// API-format combinations fail closed until their header semantics are
+// Praxis wire strategies (see apiKeyContracts): openai + openai-chat maps to
+// bearer_token (Authorization: Bearer at the provider boundary) and anthropic +
+// messages maps to apikey (the credential_inject filter injects the Secret value
+// into its configured header, x-api-key by default). The wire stays
+// reference-only either way. Provider API keys are not interchangeable: other
+// provider/API-format combinations fail closed until their header semantics are
 // explicitly supported.
 //
 // This is the single qualification authority: Render stamps overlay
@@ -370,11 +406,8 @@ func StrategyFor(route resolver.Route) (string, error) {
 	case "":
 		return "", nil
 	case "apikey":
-		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
-			return "bearer_token", nil
-		}
-		if route.ProviderType == "anthropic" && route.APIFormat == "messages" {
-			return "apikey", nil
+		if contract, ok := apiKeyContracts[providerContractKey{route.ProviderType, route.APIFormat}]; ok {
+			return contract.strategy, nil
 		}
 		return "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
 	case "sigv4", "oauth2":
@@ -382,6 +415,32 @@ func StrategyFor(route resolver.Route) (string, error) {
 	default:
 		return "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
 	}
+}
+
+// TokenCountProviderKind returns the Praxis token_count ProviderKind that parses
+// usage from a qualified route's responses, keyed on the same (providerType,
+// apiFormat) tuple as StrategyFor so metering can never fall out of step with
+// routing. It fails closed for an unqualified tuple: wiring external_metering
+// without a matching token_count would silently book zero tokens.
+func TokenCountProviderKind(route resolver.Route) (string, error) {
+	if contract, ok := apiKeyContracts[providerContractKey{route.ProviderType, route.APIFormat}]; ok {
+		return contract.tokenKind, nil
+	}
+	return "", fmt.Errorf("%w: no token_count ProviderKind for provider %q and API format %q; metering would book zero tokens", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
+}
+
+// SupportsProviderType reports whether any qualified contract can route the given
+// ExternalProvider.spec.provider value. The controller fails such providers
+// closed at reconcile (see pkg/controller validateProvider) instead of resolving
+// a route StrategyFor would later reject. Derived from apiKeyContracts, it widens
+// automatically as contracts qualify.
+func SupportsProviderType(providerType string) bool {
+	for key := range apiKeyContracts {
+		if key.providerType == providerType {
+			return true
+		}
+	}
+	return false
 }
 
 // CandidateStableID returns the canonical stable_id for a model-provider
