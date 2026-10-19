@@ -1,13 +1,19 @@
 # ai-gateway-controller
 
-Installs the `praxis-extproc` dataplane manifests. Deployed by
-`ai-gateway-operator` as a sibling of `maas-controller`.
+Installs the `praxis-extproc` dataplane manifests and reconciles
+`ExternalModel` / `ExternalProvider`. Deployed by `ai-gateway-operator` as a
+sibling of `maas-controller`.
 
-See [DESIGN.md](./DESIGN.md) for scope, architecture rationale, and what is
-explicitly deferred. Read `DESIGN.md` before adding code.
+## Documentation
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for the PR process, CI checks, and
-development setup.
+| Doc | Audience |
+| --- | --- |
+| [Architecture](./docs/architecture.md) | Deployment topology and who owns what |
+| [Dataplane selection](./docs/dataplane-selection.md) | Praxis vs IPP per tenant; handoff states |
+| [External models](./docs/external-models.md) | When and how ExternalModels are served |
+| [Praxis dataplane evolution](./docs/praxis-dataplane-evolution.md) | Request-path map (Envoy filters → Praxis) |
+| [DESIGN.md](./DESIGN.md) | Implementer detail — read before adding code |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | PR process, CI checks, development setup |
 
 ## Production image contract
 
