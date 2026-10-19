@@ -1,4 +1,6 @@
 varReference:
+  - path: metadata/namespace
+    kind: Certificate
   - path: spec/dnsNames
     kind: Certificate
   - path: spec/issuerRef/name

@@ -58,11 +58,6 @@ replacements:
           name: ai-gateway-controller-rolebinding
         fieldPaths:
           - subjects.0.namespace
-      - select:
-          kind: Certificate
-          name: ai-gateway-controller-metrics
-        fieldPaths:
-          - metadata.namespace
 
 patches:
   # cert-manager provisions metrics TLS on xKS; OpenShift service-ca is unavailable.

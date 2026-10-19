@@ -2,6 +2,7 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: ai-gateway-controller-metrics
+  namespace: $(NAMESPACE)
 spec:
   secretName: ai-gateway-controller-metrics-tls
   issuerRef:
