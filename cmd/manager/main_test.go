@@ -24,8 +24,6 @@ import (
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 const wantFallbackImage = "quay.io/opendatahub/odh-praxis-extproc:odh-stable"
@@ -122,20 +120,8 @@ func TestApplyLogDevelopmentUnsetLeavesDefault(t *testing.T) {
 	}
 }
 
-func metricsServerOptions(bindAddress string, secure bool) metricsserver.Options {
-	opts := metricsserver.Options{
-		BindAddress:   bindAddress,
-		SecureServing: secure,
-	}
-	if secure {
-		opts.FilterProvider = filters.WithAuthenticationAndAuthorization
-		opts.CertDir = metricsCertDir
-	}
-	return opts
-}
-
 func TestBuildMetricsServerOptionsSecure(t *testing.T) {
-	opts := metricsServerOptions(":8443", true)
+	opts := buildMetricsServerOptions(":8443", true)
 	if opts.BindAddress != ":8443" {
 		t.Fatalf("BindAddress = %q, want :8443", opts.BindAddress)
 	}
@@ -151,7 +137,7 @@ func TestBuildMetricsServerOptionsSecure(t *testing.T) {
 }
 
 func TestBuildMetricsServerOptionsInsecure(t *testing.T) {
-	opts := metricsServerOptions(":8080", false)
+	opts := buildMetricsServerOptions(":8080", false)
 	if opts.BindAddress != ":8080" {
 		t.Fatalf("BindAddress = %q, want :8080", opts.BindAddress)
 	}

@@ -5,7 +5,8 @@ resources:
   - ../../rbac
   - ../../manager
   - cert-manager/
-  # monitoring is excluded on xKS (OpenShift-specific ServiceMonitor/NetworkPolicy)
+  - networkpolicy.yaml
+  # ServiceMonitor excluded on xKS (OpenShift-specific CRD/CA bundle)
 
 labels:
   - pairs:
@@ -32,6 +33,36 @@ replacements:
           name: ai-gateway-controller
         fieldPaths:
           - spec.template.spec.containers.[name=manager].image
+  - source:
+      kind: ConfigMap
+      name: ai-gateway-controller-parameters
+      fieldPath: data.namespace
+    targets:
+      - select:
+          kind: Deployment
+          name: ai-gateway-controller
+        fieldPaths:
+          - metadata.namespace
+      - select:
+          kind: Service
+          name: ai-gateway-controller-metrics
+        fieldPaths:
+          - metadata.namespace
+      - select:
+          kind: ServiceAccount
+          name: ai-gateway-controller
+        fieldPaths:
+          - metadata.namespace
+      - select:
+          kind: ClusterRoleBinding
+          name: ai-gateway-controller-rolebinding
+        fieldPaths:
+          - subjects.0.namespace
+      - select:
+          kind: Certificate
+          name: ai-gateway-controller-metrics
+        fieldPaths:
+          - metadata.namespace
 
 patches:
   # cert-manager provisions metrics TLS on xKS; OpenShift service-ca is unavailable.
