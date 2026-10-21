@@ -652,3 +652,56 @@ func TestRender_TopLevelWireFields(t *testing.T) {
 		}
 	}
 }
+
+// TestTokenCountProviderKindMatchesContracts asserts every routable api-key
+// contract resolves a non-empty token_count ProviderKind through the shared
+// authority — a missing kind would silently book zero tokens for that provider.
+func TestTokenCountProviderKindMatchesContracts(t *testing.T) {
+	for key, contract := range apiKeyContracts {
+		if contract.tokenKind == "" {
+			t.Errorf("contract %+v has no token_count ProviderKind; metering would book zero tokens", key)
+		}
+		r := route("m1", "p1", 1)
+		r.ProviderType = key.providerType
+		r.APIFormat = key.apiFormat
+		kind, err := TokenCountProviderKind(r)
+		if err != nil {
+			t.Errorf("TokenCountProviderKind(%+v): %v", key, err)
+			continue
+		}
+		if kind != contract.tokenKind {
+			t.Errorf("TokenCountProviderKind(%+v) = %q, want %q", key, kind, contract.tokenKind)
+		}
+	}
+}
+
+// TestTokenCountProviderKindFailsClosed asserts an unqualified tuple errors
+// rather than wiring metering that would record zero tokens.
+func TestTokenCountProviderKindFailsClosed(t *testing.T) {
+	r := route("m1", "p1", 1)
+	r.ProviderType = "myspecialcloud"
+	r.APIFormat = "openai-chat"
+	_, err := TokenCountProviderKind(r)
+	if err == nil || !strings.Contains(err.Error(), "token_count ProviderKind") {
+		t.Fatalf("expected fail-closed token_count error, got %v", err)
+	}
+	if !errors.Is(err, ErrUnsupportedCredential) {
+		t.Fatalf("error must wrap ErrUnsupportedCredential, got %v", err)
+	}
+}
+
+// TestSupportsProviderType asserts the controller's fail-closed gate is derived
+// from the same contracts as routing (qualified providers pass; everything else,
+// including values with the wrong casing, fails closed).
+func TestSupportsProviderType(t *testing.T) {
+	for _, p := range []string{"openai", "anthropic"} {
+		if !SupportsProviderType(p) {
+			t.Errorf("SupportsProviderType(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{"", "cohere", "OpenAI", "azure", "aws-bedrock"} {
+		if SupportsProviderType(p) {
+			t.Errorf("SupportsProviderType(%q) = true, want false", p)
+		}
+	}
+}

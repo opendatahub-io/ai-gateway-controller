@@ -1200,6 +1200,15 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 	if err := validateProviderEndpoint(p.Spec.Endpoint); err != nil {
 		return err
 	}
+	// Fail closed on provider types the gateway cannot route end-to-end, derived
+	// from envelope's single qualification authority so this check never lags
+	// StrategyFor as new provider contracts qualify. Matching is exact (as
+	// StrategyFor compares), so an unsupported value or one with the wrong casing
+	// is marked Failed here and excluded from routing instead of resolving into a
+	// route that later fails tenant ExtProc rendering.
+	if !envelope.SupportsProviderType(p.Spec.Provider) {
+		return fmt.Errorf("unsupported provider %q; it has no qualified routing contract", p.Spec.Provider)
+	}
 	authType := strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type))
 	if authType != "apikey" {
 		if authType == "" {
