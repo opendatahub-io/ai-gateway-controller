@@ -342,7 +342,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	}
 	// An explicit IPP selection is a handoff command. Remove only resources
 	// owned by Praxis and release our finalizer; IPP remains the status owner.
-	if !live.missingConfig && !live.selected {
+	if !praxisSelected(live) {
 		if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -350,6 +350,9 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 			return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, &provider)
 		}
 		return reconcile.Result{}, nil
+	}
+	if err := r.ensureExternalProviderFinalizer(ctx, &provider); err != nil {
+		return reconcile.Result{}, err
 	}
 	if message := providerTenantReadinessMessage(live); message != "" {
 		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonTenantNotReady, message)
@@ -378,9 +381,6 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, nil
 	}
 
-	if err := r.ensureExternalProviderFinalizer(ctx, &provider); err != nil {
-		return reconcile.Result{}, err
-	}
 	valid, err := r.livePraxisBeforeWrite(ctx, provider.Namespace, want)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -1067,14 +1067,21 @@ type tenantResolution struct {
 	status        string
 }
 
+// praxisSelected mirrors maas-controller: absent MaasTenantConfig defaults to
+// Praxis (3.6 default dataplane). Only an explicit IPP annotation opts out.
+func praxisSelected(live tenantResolution) bool {
+	return live.missingConfig || live.selected
+}
+
 // providerTenantReadinessMessage explains why provider transport is waiting
 // for the Praxis tenant handoff to become ready. An empty message means the
 // tenant gate is open.
 func providerTenantReadinessMessage(live tenantResolution) string {
 	switch {
-	case live.missingConfig:
-		return "MaasTenantConfig/default-tenant is missing"
 	case live.mtc == nil:
+		if live.missingConfig {
+			return "MaasTenantConfig/default-tenant is missing; waiting for maas-controller to create it"
+		}
 		return "MaasTenantConfig/default-tenant is not resolvable"
 	case !live.mtc.GetDeletionTimestamp().IsZero():
 		return "MaasTenantConfig/default-tenant is being deleted"
@@ -1141,7 +1148,7 @@ func (r *Reconciler) liveTenantResolution(ctx context.Context, namespace string)
 	mtc := tenant.NewMaasTenantConfig()
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
 		if apierrors.IsNotFound(err) {
-			return tenantResolution{missingConfig: true}, nil
+			return tenantResolution{missingConfig: true, selected: true}, nil
 		}
 		return tenantResolution{}, fmt.Errorf("live get MaasTenantConfig %s/%s: %w", namespace, tenant.MaasTenantConfigInstanceName, err)
 	}
@@ -1169,7 +1176,7 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 	if err != nil {
 		return false, err
 	}
-	if live.missingConfig || !live.selected || live.status != tenant.PayloadProcessingStatusSteady || live.mtc == nil || live.aitenant == nil {
+	if !praxisSelected(live) || live.status != tenant.PayloadProcessingStatusSteady || live.mtc == nil || live.aitenant == nil {
 		return false, nil
 	}
 	if !live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() {
