@@ -809,6 +809,9 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 				}
 				return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
 			}
+			// Credential.Header is json:"-" and is lost on the overlay round-trip;
+			// restore it from the trusted copy Secret stamped at attach time.
+			candidate.Credential.Header = copySecret.GetAnnotations()[AnnotationCredentialHeader]
 		}
 		attached = append(attached, candidate)
 	}

@@ -389,8 +389,26 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 		path := fmt.Sprintf("%s/%s-%s/%s", extprocCredentialDir, ref.Name, hex.EncodeToString(hash[:])[:12], ref.Key)
 		credentials = append(credentials, extprocCredential{name: ref.Name, namespace: ref.Namespace, key: ref.Key, strategy: candidate.Credential.Strategy, header: candidate.Credential.Header, file: path})
 	}
+	// Total order over the full dedup identity (namespace/name/key/strategy/
+	// header). The sort key must include every field that distinguishes a
+	// retained entry, or two providers sharing a Secret but diverging on header
+	// (e.g. Azure api-key vs. a bearer_token candidate) could render in either
+	// order, churning the config hash and restarting ExtProc for no reason.
 	sort.Slice(credentials, func(i, j int) bool {
-		return credentials[i].name+credentials[i].key+credentials[i].strategy < credentials[j].name+credentials[j].key+credentials[j].strategy
+		a, b := credentials[i], credentials[j]
+		if a.namespace != b.namespace {
+			return a.namespace < b.namespace
+		}
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		if a.key != b.key {
+			return a.key < b.key
+		}
+		if a.strategy != b.strategy {
+			return a.strategy < b.strategy
+		}
+		return a.header < b.header
 	})
 	return credentials, nil
 }
@@ -437,7 +455,12 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		for _, credential := range credentials {
 			fmt.Fprintf(&b, "          - name: %s\n            namespace: %s\n", credential.name, credential.namespace)
 			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n", credential.key, credential.strategy)
-			if credential.header != "" {
+			// header is an apikey-only field: the credential_inject filter hard-
+			// rejects the whole config if a bearer_token entry carries one (it
+			// fixes Authorization: Bearer itself), which would take the tenant's
+			// entire ExtProc config down, not just this entry. Guard the emit so a
+			// stray header on a non-apikey entry can never reach the filter.
+			if credential.strategy == "apikey" && credential.header != "" {
 				fmt.Fprintf(&b, "            header: %s\n", credential.header)
 			}
 			fmt.Fprintf(&b, "            file: %s\n", credential.file)

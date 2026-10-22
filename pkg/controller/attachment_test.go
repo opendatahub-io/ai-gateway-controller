@@ -252,7 +252,7 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 		t.Fatalf("model-namespace provider Service: %v", err)
 	}
 	ruleName := attachmentDestinationRuleName(gatewayB, "team", "openai")
-	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key")
+	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")
 	assertAttachmentUnpublished := func() {
 		t.Helper()
 		if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName); !apierrors.IsNotFound(err) {
@@ -1200,7 +1200,7 @@ func assertAttachmentWithdrawn(t *testing.T, r *Reconciler) {
 		t.Fatalf("attachment DestinationRule remains: %v", err)
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); !apierrors.IsNotFound(err) {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); !apierrors.IsNotFound(err) {
 		t.Fatalf("credential copy remains: %v", err)
 	}
 }
@@ -1374,11 +1374,130 @@ func TestTransientCredentialReadKeepsServedAttachment(t *testing.T) {
 		t.Fatal("a failed Secret read withdrew the served attachment")
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
 		t.Fatalf("a failed Secret read deleted the credential copy: %v", err)
 	}
 	if got := getModel(t, r, model); readyReason(got) != reasonReconcileFailed {
 		t.Fatalf("reason = %q, want %q", readyReason(got), reasonReconcileFailed)
+	}
+}
+
+func TestServedAzureAttachmentStampsCredentialHeaderAnnotation(t *testing.T) {
+	// Azure apikey auth qualifies to strategy apikey + api-key header. The
+	// header is json:"-" on Credential and cannot survive the overlay
+	// round-trip, so attach time stamps it on the credential copy Secret for
+	// the tenant reconciler to restore. See envelope.StrategyFor /
+	// tenant.AnnotationCredentialHeader.
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "team", UID: types.UID("provider-azure-team")},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "azure-key"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "azure-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("azure-secret")}}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team", UID: types.UID("uid-team-azure-chat"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
+		Spec: v1alpha1.ExternalModelSpec{
+			ModelName: "chat-model",
+			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+				Ref: v1alpha1.ExternalProviderReference{Name: "azure"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			}},
+			GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB},
+		},
+	}
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("azure attachment is not served")
+	}
+
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "azure-key", "api-key", "api-key")}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if got := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("credential-header annotation = %q, want %q", got, "api-key")
+	}
+}
+
+func TestSharedSecretWithDivergentHeadersGetsDistinctCopies(t *testing.T) {
+	// The injected header is provider-scoped and part of the credential copy
+	// identity (credentialCopyName), so a source Secret qualified under two
+	// different headers yields two distinct copies, each with its own header
+	// annotation, rather than one copy whose single annotation a later apply
+	// could overwrite. credentialCopyName is a pure function of (tenant, source
+	// Secret, header), so the guarantee holds across separate attached models
+	// that share the Secret too. Here one model binds azure (api-key) and openai
+	// (bearer_token, no header) to the same Secret; each gets its own copy.
+	azure := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "team", UID: types.UID("provider-azure-team")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "shared-key"}}},
+	}
+	openai := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "team", UID: types.UID("provider-openai-team")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "openai.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "shared-key"}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "shared-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("k")}}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team", UID: types.UID("uid-team-shared-chat"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
+		Spec: v1alpha1.ExternalModelSpec{
+			ModelName: "chat-model",
+			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
+				{Ref: v1alpha1.ExternalProviderReference{Name: "azure"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+				{Ref: v1alpha1.ExternalProviderReference{Name: "openai"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			},
+			GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB},
+		},
+	}
+	objects := append([]client.Object{azure, openai, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); readyReason(got) == reasonReconcileFailed {
+		t.Fatalf("model sharing a Secret under distinct headers must be served, got %+v", got.Status.Conditions)
+	}
+
+	// azure qualifies to the api-key header; openai to bearer_token with none.
+	// The header is part of the identity, so the two copies have distinct names.
+	azureCopyName := credentialCopyName("tenant-b", "team", "shared-key", "api-key", "api-key")
+	openaiCopyName := credentialCopyName("tenant-b", "team", "shared-key", "api-key", "")
+	if azureCopyName == openaiCopyName {
+		t.Fatal("divergent headers must produce distinct copy names")
+	}
+	var azureCopy corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: azureCopyName}, &azureCopy); err != nil {
+		t.Fatalf("azure credential copy: %v", err)
+	}
+	if got := azureCopy.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("azure copy header annotation = %q, want api-key", got)
+	}
+	var openaiCopy corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: openaiCopyName}, &openaiCopy); err != nil {
+		t.Fatalf("openai credential copy: %v", err)
+	}
+	if got, ok := openaiCopy.GetAnnotations()[tenant.AnnotationCredentialHeader]; ok {
+		t.Fatalf("bearer_token copy must carry no header annotation, got %q", got)
+	}
+}
+
+func TestServedBearerAttachmentOmitsCredentialHeaderAnnotation(t *testing.T) {
+	// openai + openai-chat qualifies to bearer_token, whose header is fixed
+	// data-plane side; no header annotation is stamped on the copy Secret.
+	r, _ := servedAttachmentFixture(t)
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if got, ok := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; ok {
+		t.Fatalf("bearer_token copy must not carry a credential-header annotation, got %q", got)
 	}
 }
 
@@ -1627,7 +1746,7 @@ func TestSharedProviderStateStaysWhileAnAttachmentUsesIt(t *testing.T) {
 		t.Fatalf("shared provider Service removed while another attachment uses it: %v", err)
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
 		t.Fatalf("shared credential copy removed while another attachment uses it: %v", err)
 	}
 	detach(other)

@@ -114,9 +114,12 @@ type attachmentResult struct {
 }
 
 // credentialCopy is a credential Secret from outside the tenant namespace
-// copied into it, referenced key only.
+// copied into it, referenced key only. header is the provider-boundary request
+// header for the credential (envelope.Credential.Header), carried onto the copy
+// Secret so the tenant reconciler can restore it when reading attached
+// candidates back from the published overlay (where Header does not serialize).
 type credentialCopy struct {
-	name, sourceNamespace, sourceName, key string
+	name, sourceNamespace, sourceName, key, header string
 }
 
 func (c credentialCopy) source() string {
@@ -182,8 +185,15 @@ func attachmentDestinationRuleName(gateway v1alpha1.NamespacedObjectReference, p
 	return base + "-" + hash
 }
 
-func credentialCopyName(tenantNamespace, sourceNamespace, sourceName, key string) string {
-	return credentialCopyPrefix + shortHash(tenantNamespace, sourceNamespace, sourceName, key)
+// credentialCopyName derives the tenant-namespace copy name for a source
+// credential Secret. The provider-boundary header is part of the identity so a
+// single source Secret qualified under two different headers (e.g. Azure's
+// api-key and Anthropic's x-api-key) yields two distinct copies, each carrying
+// its own AnnotationCredentialHeader. Without it a later attached model could
+// apply the same copy name with a different header and overwrite the annotation
+// the tenant reconciler restores for every candidate referencing that copy.
+func credentialCopyName(tenantNamespace, sourceNamespace, sourceName, key, header string) string {
+	return credentialCopyPrefix + shortHash(tenantNamespace, sourceNamespace, sourceName, key, header)
 }
 
 func newHTTPRoute() *unstructured.Unstructured {
@@ -858,9 +868,21 @@ func localizeRoutes(tenantNamespace string, routes []resolver.Route) []credentia
 		if route.AuthType == "" || source == tenantNamespace {
 			continue
 		}
+		// ValidateModel above has already qualified the strategy, so deriving the
+		// provider-boundary header here cannot fail. It is carried onto the copy
+		// Secret because Credential.Header does not survive the overlay round-trip.
+		_, header, _ := envelope.StrategyFor(*route)
 		copied := credentialCopy{
-			name:            credentialCopyName(tenantNamespace, source, route.SecretName, route.SecretKey),
+			// The header is part of the copy identity (credentialCopyName), so two
+			// providers that share a source Secret but diverge on the injected
+			// header get distinct copies, each with its own header annotation. This
+			// holds across separate attached models sharing one source Secret: each
+			// candidate references the copy for its own header, so no apply can
+			// overwrite another provider's annotation and attachedOverlayCandidates
+			// always restores the correct one.
+			name:            credentialCopyName(tenantNamespace, source, route.SecretName, route.SecretKey, header),
 			sourceNamespace: source, sourceName: route.SecretName, key: route.SecretKey,
+			header: header,
 		}
 		if !slices.Contains(copies, copied) {
 			copies = append(copies, copied)
@@ -1343,6 +1365,10 @@ func (r *Reconciler) applyCredentialCopies(ctx context.Context, a attachedModel,
 		if !ok {
 			return fmt.Errorf("%w: Secret %s/%s is missing key %s", errCredentialNotReady, copied.sourceNamespace, copied.sourceName, copied.key)
 		}
+		annotations := map[string]any{annotationCredentialSource: copied.source()}
+		if copied.header != "" {
+			annotations[tenant.AnnotationCredentialHeader] = copied.header
+		}
 		copies = append(copies, unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "v1", "kind": "Secret",
 			"metadata": map[string]any{
@@ -1351,7 +1377,7 @@ func (r *Reconciler) applyCredentialCopies(ctx context.Context, a attachedModel,
 					"app.kubernetes.io/managed-by": "ai-gateway-controller",
 					tenant.LabelCredentialCopy:     "true",
 				},
-				"annotations": map[string]any{annotationCredentialSource: copied.source()},
+				"annotations": annotations,
 			},
 			"type": string(corev1.SecretTypeOpaque),
 			"data": map[string]any{copied.key: base64.StdEncoding.EncodeToString(value)},
