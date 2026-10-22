@@ -2581,3 +2581,43 @@ func TestAmbiguousPrePRDestinationRuleIsPreserved(t *testing.T) {
 		t.Fatalf("owned DestinationRule cleanup error = %v, want NotFound", err)
 	}
 }
+
+func TestReconcileProviderClaimsOwnershipWhenMaasTenantConfigMissing(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+	r := controllerTestClient(t, provider, secret)
+	r.Namespace = "tenant-a"
+
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+		t.Fatal("expected ExternalProvider cleanup finalizer when MaasTenantConfig is absent (Praxis default)")
+	}
+	if got.Status.Phase != providerPhasePending {
+		t.Fatalf("status phase = %q, want Pending while waiting for MaasTenantConfig", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Conditions[0].Message, "MaasTenantConfig/default-tenant is missing") {
+		t.Fatalf("status message = %q", got.Status.Conditions[0].Message)
+	}
+}
+
+func TestProviderTenantReadinessMessageAbsentMaasTenantConfig(t *testing.T) {
+	msg := providerTenantReadinessMessage(tenantResolution{missingConfig: true, selected: true})
+	if msg == "" {
+		t.Fatal("expected pending message while MaasTenantConfig is absent")
+	}
+	if !strings.Contains(msg, "missing") {
+		t.Fatalf("message = %q", msg)
+	}
+}
