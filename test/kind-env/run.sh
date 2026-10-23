@@ -298,6 +298,7 @@ seed_failed_home_model_before_tenant() {
 qualify_failed_home_model_bootstrap() {
   local provider_phase='' model_phase='' mtc_ready=false aitenant_ready=false shared_ready=false overlay_present=false
   for _ in $(seq 1 120); do
+    mtc_ready=false aitenant_ready=false shared_ready=false
     provider_phase=$("${KCTL[@]}" -n models-as-a-service get externalprovider failed-bootstrap-provider -o jsonpath='{.status.phase}' 2>/dev/null || true)
     model_phase=$("${KCTL[@]}" -n models-as-a-service get externalmodel failed-bootstrap-model -o jsonpath='{.status.phase}' 2>/dev/null || true)
     if "${KCTL[@]}" -n models-as-a-service get configmap routing-overlay >/dev/null 2>&1; then
