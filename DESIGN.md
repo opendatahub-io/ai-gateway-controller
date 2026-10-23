@@ -65,6 +65,20 @@ behavior remain outside this change in issue #106. Partial provider withdrawal
 ordering remains a separate issue tracked in
 [#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
 
+### API translation opt-in compatibility
+
+`MaasTenantConfig.spec.apiTranslation.enabled` is an opt-in rendering switch.
+When omitted or false, ExternalModel overlays omit the Praxis provider profile
+fields, the selected-provider translation filters are absent, and OpenAI
+Chat Completions requests keep the client-supplied `model` value. Enabling the
+setting permits Messages candidates and provider-specific request conversion;
+it also allows the selected provider's `ExternalProviderRef.targetModel` to
+replace the OpenAI request body's `model`, including when that provider speaks
+the OpenAI-compatible API. There is no separate target-model rewrite setting.
+This keeps translation-specific fields and their ExtProc compatibility
+requirement opt-in while retaining the route and provider selection supported
+by `origin/main` when translation is disabled.
+
 If a deleting ExternalModel has no resolvable `MaasTenantConfig`/`AITenant` and
 there are sibling models, deletion is conservative: it will not rebuild shared
 Praxis serving state without a live, steady tenant handoff. The ExternalModel
@@ -99,7 +113,9 @@ manifests only.
 **Phase 2 (EA2, implemented)** primarily watches `MaasTenantConfig` and, per
 opted-in tenant, applies and cleans up its own per-tenant ExtProc resources.
 It also watches `ExternalModel` / `ExternalProvider` and publishes dynamic
-per-model routing, provider transport, and reference-only credentials.
+per-model routing, provider transport, and reference-only credentials
+(credentials from outside a tenant namespace are delivered through copies; see
+[Gateway attachments](#gateway-attachments)).
 
 ## Deployment architecture
 
@@ -196,7 +212,13 @@ manager (no `opendatahub-operator/v2` dependency) that primarily watches
 `TenantReconciler`, which watches the same object — and, for every tenant
 whose payload-processing annotation is `praxis`, does kustomize build →
 placeholder post-render → per-tenant rename/patch → SSA apply into that
-tenant's Gateway namespace. Both controllers watching the same primary
+tenant's Gateway namespace. On that path it also honors
+`MaasTenantConfig.spec.payloadProcessing` /
+`spec.payloadPreProcessing` (`replicas`, `autoscaling`, `resources`): when
+`autoscaling` is set it creates gateway-namespace HPAs (parity with
+maas-controller's legacy IPP behavior) and omits Deployment `spec.replicas`
+so SSA does not fight the HPA; when autoscaling is removed it deletes the
+orphaned HPAs. Both controllers watching the same primary
 object (rather than `ai-gateway-controller` watching `AITenant` while
 `maas-controller` watches `MaasTenantConfig`) means a backend-selection
 write is a single watch event both sides observe together, with no
@@ -302,12 +324,131 @@ compatibility one-pager; this records how it is implemented.
   (`status.gatewayRef`) → its `MaasTenantConfig` (`GatewayNotManaged`,
   `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
   `steady`, otherwise `TenantNotSteady` (existing state retained) or
-  `TenantNotPraxis`. Status reports the first failing attachment in
-  `gatewayRefs` order; per-Gateway status is [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
+  `TenantNotPraxis` (a cleanup request: the attachment's route is removed).
+- **Status** ([RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802)).
+  `status.gateways` holds one result per `gatewayRefs` entry: a `Ready`
+  condition at the model generation with the attachment's own reason (the
+  Gateway's reason for an unaccepted route, the winning model for
+  `ModelNameConflict`), and `httpRouteRef` only while it is Ready. The
+  top-level status is written in the same update: Ready requires every
+  attachment, otherwise it reports the first failing one in `gatewayRefs`
+  order. `httpRouteName` names a single attachment's route, is empty for
+  several, and is cleared while an extra attachment is not Ready; a home route
+  keeps its existing behavior. Removing a Gateway removes its result; removing every
+  `gatewayRefs` entry removes them all.
+- **Authorization.** The attachment's HTTPRoute is created in the model
+  namespace first and the Gateway enforces its listener `allowedRoutes`.
+  DestinationRules, credential copies and overlay entries are published only
+  after the route's parent status for that Gateway is `Accepted=True`, and are
+  withdrawn if acceptance is lost; `Accepted=False` reports the Gateway's reason.
+  Default MaaS Gateways use `allowedRoutes.from: Same`, so user-namespace models
+  need an administrator-configured namespace selector.
+- **Identifiers.** Extra attachments use only new, disjoint forms: HTTPRoute
+  `external-model-<model>-<hash12>` (`external-model--<hash12>` above 253
+  characters, which no home route can match), Gateway DestinationRule
+  `provider-<provider>-<hash12>`, `stable_id`
+  `<modelNamespace>/<model>/<providerNamespace>/<provider>` (`sha256:` above 256
+  bytes) and credential copy `agc-cred-<hash12>`. Hashed objects carry identity
+  annotations and are never adopted or deleted when they do not match.
+  Attachment DestinationRules are labelled
+  `inference.opendatahub.io/attachment-tenant` instead of the provider's tenant
+  label, so the provider's own reconciler never adopts or collects them.
+  Model-namespace provider Services keep `provider-<provider>` for providers in
+  the model namespace (see [Cross-namespace providers](#cross-namespace-providers)).
+  Tenant-local cleanup, and a provider's cleanup when its namespace selects
+  IPP, keep the transport attachment routes use.
+- **Publication.** Each tenant keeps one overlay and one route EnvoyFilter. The
+  tenant-local path publishes its own candidates and routes, then the admitted
+  attachments; an attachment republishes the attachments and preserves the
+  tenant's own published candidates and route patches verbatim. Both rely on
+  ExternalModel reconciles running one at a time. Attachments are admitted per
+  model, oldest first. A model-name conflict (across namespaces only: the
+  tenant's own models win, then the oldest; same-namespace models share the
+  name and are validated together as one selection group, as on the
+  tenant-local path), a resolution or credential failure or more than 7
+  providers (`TooManyProviders`) excludes the model: it loses its route,
+  overlay entry, DestinationRules and copies. Over the 1024-candidate overlay
+  limit (`OverlayCapacityExceeded`) a model keeps its accepted route but nothing
+  else. Capacity is decided, and the handoff re-checked live, before anything is
+  written into the tenant; a failed API read is retried, never treated as the
+  model's failure. When the tenant's own models serve nothing (none resolve, or
+  the last one is deleted), its attachments stay published and only its own
+  transport is removed.
+- **Credential copies.** Secrets in the tenant namespace are mounted directly,
+  as before. Others (a provider or model override outside the tenant
+  namespace) are copied, referenced key only, into the tenant namespace after
+  route acceptance; the candidate references the copy, so the ExtProc mount
+  logic is unchanged. Copies follow their source (a deleted source excludes the
+  model) and are deleted when no accepted attachment route references them, and
+  on tenant teardown or switch-away. This is the only departure from the
+  reference-only credential model and it is exposure, not isolation: a copy is
+  readable by anyone who can read Secrets or create pods in the tenant
+  namespace, the same tier as tenant-local credentials. Writing copies needs the
+  Secret permission from
+  [RHOAIENG-90808](https://redhat.atlassian.net/browse/RHOAIENG-90808).
+- **Lifecycle.** Removing a Gateway from `gatewayRefs` removes its route and
+  collects the DestinationRules and copies no accepted route references and, in
+  a namespace no Praxis tenant serves, the provider Services, ServiceEntries
+  and selection sinks no route uses; the tenant's overlay drops
+  the entry on its next publish, and until then the entry is inert because no
+  route reaches it. A model with extra attachments carries the
+  `inference.opendatahub.io/external-model-attachment-cleanup` finalizer:
+  deleting it removes those objects for every extra attachment without
+  waiting for any tenant, including tenant state whose route namespace or
+  foreground deletion already removed, and the shared overlay and route filter are not
+  rebuilt; the tenant ExtProc stops mounting a removed copy. The home
+  attachment keeps its own finalizer and existing deletion, including its
+  conservative wait for a steady tenant while siblings remain. A tenant serving
+  only attachments keeps its ExtProc while its overlay is unreadable. A
+  single-namespace controller (`--external-model-namespace`) serves no
+  attachments from other namespaces.
 
-Serving a model through another tenant's Gateway follows in the next changes:
-until then such an attachment reports `AttachmentPending` and receives no
-serving state.
+### Cross-namespace providers
+
+A provider reference with another namespace
+([RHOAIENG-90804](https://redhat.atlassian.net/browse/RHOAIENG-90804),
+`pkg/controller/referencegrant.go`) is served only when a `ReferenceGrant` in
+the provider namespace permits `inference.opendatahub.io` `ExternalModel`s from
+the model namespace to reference that `ExternalProvider` (or all of them). An
+omitted or equal namespace stays local and needs no grant.
+
+- **Authorization.** Grants are re-evaluated on every reconcile and watched, so
+  adding a grant recovers the model and removing or narrowing it withdraws the
+  reference; a revoked reference that is being served never keeps the last
+  serving state, which is otherwise retained as before. A missing
+  and an unpermitted provider report the same `RefNotPermitted` reason (for an
+  attachment, also in its `status.gateways` result), so the reference does not
+  disclose whether the provider exists; the model's permitted references keep
+  serving. A same-named local provider never stands
+  in. The grant authorizes only this reference: credentials follow the source
+  rules below, and HTTPRoute-to-Gateway attachment still follows
+  `allowedRoutes`.
+- **Validation.** The provider is validated by the model reconciler, like an
+  attachment's provider, because its namespace may have no tenant. Its status
+  and its own namespace's transport keep their existing writer.
+- **Identifiers.** Only new forms: model-namespace Service and ServiceEntry
+  `provider-<provider>-<hash12>` (within 63 characters, labelled
+  `inference.opendatahub.io/external-provider-namespace` instead of the local
+  provider label, identity-annotated), which is also the overlay `cluster`;
+  `stable_id` `<modelNamespace>/<model>/<providerNamespace>/<provider>`; Gateway
+  DestinationRule `provider-<provider>-<hash12>`. A local provider whose name
+  produces a hashed name is refused, as is the reverse. HTTPRoute rules are keyed by
+  provider namespace and name, so same-named providers from two namespaces
+  both keep their rules and candidates.
+- **Credentials.** Inherited auth uses the provider's Secret in the provider
+  namespace; a model override uses the Secret in the model namespace, with no
+  fallback to a same-named provider-namespace Secret. A provider whose own
+  Secret is not ready skips only the references that inherit it (`ProviderNotReady`);
+  references that override it keep serving. Secrets outside the
+  tenant namespace are delivered as credential copies, as for attachments.
+  The provider's transport lives in the model namespace, so a grant trusts it:
+  whoever can edit Services or HTTPRoutes there can redirect requests that
+  carry the provider namespace's credential.
+- **Tenant-local models.** A tenant's own model referencing another
+  namespace's provider gets the attachment DestinationRule and copy, recorded
+  on its HTTPRoute so collection keeps them; its overlay candidate is kept as
+  the tenant's own. Model-namespace transport is collected after the reconcile,
+  once no HTTPRoute in the namespace uses it.
 
 ## Scope
 
@@ -390,12 +531,15 @@ auth uses the provider-local Secret; an override uses the model-local Secret.
 Secret references remain name-only. Preserve the installed schema's accepted
 names and `auth.type: simple`; schema acceptance does not add auth behavior.
 The schema compatibility test pins the legacy MaaS validation baseline.
-Until cross-namespace authorization is implemented, the resolver skips a
-provider reference to another namespace and never substitutes a local provider.
+A provider reference to another namespace requires a `ReferenceGrant` (see
+[Cross-namespace providers](#cross-namespace-providers)) and never substitutes
+a local provider.
 
 Schema installation alone does not enable serving these fields. Attachment
-ownership, status publication, provider authorization/credential delivery,
-and MaaS selection belong to the follow-up stories. Activation requires
+reconciliation and per-Gateway status are implemented (see
+[Gateway attachments](#gateway-attachments)), as is provider authorization (see
+[Cross-namespace providers](#cross-namespace-providers)); MaaS selection
+belongs to the follow-up stories. Activation requires
 aligned packaged schemas and serving implementations, verified tenant
 cleanup/claim ownership (including shared models/providers), and the serving,
 status, MaaS and installed-package checks.
@@ -483,7 +627,7 @@ alone:
   visibly (event, status, metric) once status is written.
 - Whether `payload-processing-reader`'s RBAC needs to grow once more Praxis
   filters land (today's rules cover exactly the `request_id` /
-  `model_to_header` filter chains in use).
+  `json_body` filter chains in use).
 - `Params.MaaSAPIRouteName`'s fidelity is unverified against a live
   maas-api `HTTPRoute` — revisit once this controller integrates with one.
 - End-to-end verification of the `ai-gateway-operator` wiring described in
