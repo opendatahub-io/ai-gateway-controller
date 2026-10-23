@@ -141,6 +141,31 @@ func TestExternalModelConfigMatchesMainWhenTranslationIsOff(t *testing.T) {
 filter_chains:
   - name: post-auth
     filters:
+      - filter: headers
+        request_remove:
+          - authorization
+          - x-api-key
+          - x-origin-cluster
+          - x-maas-username
+          - x-maas-username-oc
+          - x-maas-username-token
+          - x-maas-group
+          - x-maas-group-oc
+          - x-maas-group-token
+          - x-maas-keyname
+          - x-maas-key-id
+          - x-maas-subscription
+          - x-maas-subscription-rate-limit-id
+          - x-maas-cost-center
+          - x-maas-organization-id
+          - x-maas-identity
+          - x-maas-admin-scope
+          - x-maas-tenant
+          - x-maas-invocation-mode
+          - x-maas-policy-revision
+          - x-maas-responses-owner
+          - x-maas-return-all-models
+          - x-maas-model
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Gateway-Model-Name
@@ -269,6 +294,64 @@ func TestExtprocCredentialsRejectCrossNamespaceProvider(t *testing.T) {
 	}}
 	if _, err := extprocCredentials("tenant-a", candidates); err == nil || !strings.Contains(err.Error(), "cross-namespace") {
 		t.Fatalf("expected cross-namespace rejection, got %v", err)
+	}
+}
+
+func TestExtprocPostAuthConfigLeadsWithHeadersGuard(t *testing.T) {
+	config := extprocPostAuthConfig(nil, nil, false)
+	headersIdx := strings.Index(config, "filter: headers")
+	if headersIdx == -1 {
+		t.Fatalf("post-auth config missing headers guard filter:\n%s", config)
+	}
+	routeIdx := strings.Index(config, "filter: intelligent_route")
+	if routeIdx == -1 {
+		t.Fatalf("post-auth config missing intelligent_route filter:\n%s", config)
+	}
+	if headersIdx > routeIdx {
+		t.Fatalf("headers guard filter must precede intelligent_route:\n%s", config)
+	}
+	for _, header := range GuardedRequestHeaders {
+		if !strings.Contains(config, "- "+header+"\n") {
+			t.Fatalf("post-auth config missing guarded header %q:\n%s", header, config)
+		}
+	}
+}
+
+// TestGuardedRequestHeadersCoversDenyList pins GuardedRequestHeaders as a
+// superset of maas-controller's deny-client-identity-headers AuthPolicy
+// predicate list (maasauthpolicy_controller.go). This module does not import
+// maas-controller (see package doc), so the deny-list is mirrored here by
+// name; update both lists together whenever a new x-maas-* identity header
+// is introduced on either side.
+func TestGuardedRequestHeadersCoversDenyList(t *testing.T) {
+	denyList := []string{
+		"x-maas-username",
+		"x-maas-group",
+		"x-maas-keyname",
+		"x-maas-subscription-rate-limit-id",
+		"x-maas-organization-id",
+		"x-maas-cost-center",
+		"x-maas-identity",
+		"x-maas-admin-scope",
+	}
+	guarded := make(map[string]bool, len(GuardedRequestHeaders))
+	for _, header := range GuardedRequestHeaders {
+		guarded[header] = true
+	}
+	for _, header := range denyList {
+		if !guarded[header] {
+			t.Fatalf("GuardedRequestHeaders is missing deny-listed header %q", header)
+		}
+	}
+}
+
+func TestExtprocPostAuthConfigIsDeterministic(t *testing.T) {
+	candidates := []envelope.Candidate{{Cluster: "provider-a", StableID: envelope.CandidateStableID("model", "provider-a")}}
+	credentials := []extprocCredential{{name: "a-secret", namespace: "tenant-a", key: "api-key", strategy: "bearer_token", file: "/etc/praxis/credentials/a-secret/api-key"}}
+	first := extprocPostAuthConfig(candidates, credentials, false)
+	second := extprocPostAuthConfig(candidates, credentials, false)
+	if first != second {
+		t.Fatalf("extprocPostAuthConfig is not deterministic:\nfirst:\n%s\nsecond:\n%s", first, second)
 	}
 }
 
