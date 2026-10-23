@@ -102,6 +102,31 @@ Replace `<run-id>` consistently. The normal qualification does not apply the
 optional OpenAI resources; that workflow must opt in explicitly through its
 documented OpenAI command path.
 
+To exercise tenant bootstrap with an unusable home provider before the first
+Praxis handoff, set `LOCAL_ENV_SEED_FAILED_HOME_MODEL=true` for provisioning and
+the canonical E2E entrypoint:
+
+```sh
+LOCAL_ENV_CLUSTER=failed-home-model-<run-id> \
+LOCAL_ENV_SEED_FAILED_HOME_MODEL=true \
+LOCAL_ENV_EVIDENCE_ROOT="$PWD/evidence/<run-id>" ./run.sh --provision
+LOCAL_ENV_CLUSTER=failed-home-model-<run-id> \
+LOCAL_ENV_SEED_FAILED_HOME_MODEL=true \
+LOCAL_ENV_EVIDENCE="$PWD/evidence/<run-id>/extproc" ./e2e.sh
+LOCAL_ENV_CLUSTER=failed-home-model-<run-id> \
+LOCAL_ENV_TRANSLATION_EVIDENCE="$PWD/evidence/<run-id>/api-translation" \
+./e2e-api-translation.py
+```
+
+That opt-in applies a test-only ExternalProvider with a deliberately absent
+Secret reference and its ExternalModel before creating the AITenant. The
+provisioner records the failed status and absent overlay before the tenant
+exists, then requires the shared ExtProc Deployment and EnvoyFilter, the
+MaaSTenantConfig, and the AITenant to become Ready while the failure remains.
+The normal authenticated model request and no-key denial then run with that
+failed model still present. This fixture creates no provider credential and
+does not alter the normal provisioning path.
+
 ### Shared External Model resources
 
 The reusable Provider A/B identities, optional `gpt-4o-mini` OpenAI CR chain,

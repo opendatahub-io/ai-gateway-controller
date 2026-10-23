@@ -2451,6 +2451,70 @@ func TestProviderReadinessIsReconciledIndependentlyFromModels(t *testing.T) {
 	}
 }
 
+func TestFailedHomeModelRemainsFailedBesideHealthySibling(t *testing.T) {
+	r, healthyModel := reconcilerFixture(t)
+	ctx := context.Background()
+	providerKey := client.ObjectKey{Namespace: "tenant-a", Name: "provider"}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: providerKey}); err != nil {
+		t.Fatalf("reconcile healthy provider: %v", err)
+	}
+
+	failedProvider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-provider", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "failed.example.com"},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: providerPhaseFailed},
+	}
+	failedModel := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-model", Namespace: "tenant-a"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: failedProvider.Name}, TargetModel: "failed-upstream",
+			APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}
+	if err := r.Create(ctx, failedProvider); err != nil {
+		t.Fatalf("create failed provider: %v", err)
+	}
+	if err := r.Create(ctx, failedModel); err != nil {
+		t.Fatalf("create failed model: %v", err)
+	}
+
+	failedRequest := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(failedModel)}
+	if _, err := r.Reconcile(ctx, failedRequest); err != nil {
+		t.Fatalf("reconcile failed model beside healthy sibling: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthyModel)}); err != nil {
+		t.Fatalf("reconcile healthy sibling: %v", err)
+	}
+
+	var gotFailed v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(failedModel), &gotFailed); err != nil {
+		t.Fatal(err)
+	}
+	if gotFailed.Status.Phase != "Failed" {
+		t.Fatalf("failed model phase = %q, want Failed", gotFailed.Status.Phase)
+	}
+	var gotHealthy v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthyModel), &gotHealthy); err != nil {
+		t.Fatal(err)
+	}
+	if gotHealthy.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("healthy sibling phase = %q, want Ready", gotHealthy.Status.Phase)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("get shared routing overlay: %v", err)
+	}
+	if !strings.Contains(overlay.Data["routing-overlay.json"], "provider-provider") ||
+		strings.Contains(overlay.Data["routing-overlay.json"], "provider-failed-provider") {
+		t.Fatalf("shared overlay does not contain only the healthy provider candidate: %s", overlay.Data["routing-overlay.json"])
+	}
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(healthyModel.Name)}, route); err != nil {
+		t.Fatalf("healthy sibling HTTPRoute was not retained: %v", err)
+	}
+}
+
 func TestUnsupportedActiveProviderPreservesLastKnownServingState(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	ctx := context.Background()

@@ -110,6 +110,33 @@ rg -q 'MAAS_API_TRANSLATION_SCHEMA_REV' <<<"$run_source" || {
   echo "the MaaS apiTranslation schema fixture is not revision-pinned" >&2
   exit 1
 }
+rg -q 'LOCAL_ENV_SEED_FAILED_HOME_MODEL' <<<"$run_source" && \
+  rg -q 'failed-home-model-bootstrap.yaml.tmpl' <<<"$run_source" && \
+  rg -q 'qualify_failed_home_model_bootstrap' <<<"$run_source" || {
+  echo "the Kind provisioner does not expose the fresh failed-home-model bootstrap fixture" >&2
+  exit 1
+}
+rg -q 'unauth_before_a=.*provider_request_count katan-a' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'unauth_after_a=.*provider_request_count katan-a' "$ROOT/test/kind-env/e2e-extproc.sh" || {
+  echo "the Kind E2E does not prove the no-key request reaches no provider" >&2
+  exit 1
+}
+rg -q 'wait_preauth_unavailable' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'preauth_healthy_endpoint_count' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'preauth-\$label-envoy-clusters.json' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'preauth-\$label-envoy-stats.json' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'preauth_endpoint_address_count' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'live_pods_including_terminating' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  rg -q 'extproc_connect_fail_delta' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  ! rg -q 'deletionTimestamp == null and .status.phase' "$ROOT/test/kind-env/e2e-extproc.sh" && \
+  ! rg -q 'preauth_envoy_healthy_endpoint_count' "$ROOT/test/kind-env/e2e-extproc.sh" || {
+  echo "the pre-auth trust-boundary check must use Kubernetes backends and Envoy failure counters, not Service-VIP health flags" >&2
+  exit 1
+}
+if rg -F -q 'ISTIOCTL, "proxy-config"' "$ROOT/test/kind-env/e2e-api-translation.py"; then
+  echo "translation E2E istioctl calls must use the run-owned Kind context" >&2
+  exit 1
+fi
 rg -q 'set image "deployment/\$api_deployment" "maas-api=\$\{MAAS_API_RUNTIME_IMAGE\}"' <<<"$run_source" || {
   echo "tenant API Deployments do not select the run-owned source image" >&2
   exit 1
