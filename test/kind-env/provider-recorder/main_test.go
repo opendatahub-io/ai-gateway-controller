@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"testing"
@@ -20,17 +21,43 @@ func TestSafeRoutingDiagnosticAcceptsOnlyBoundedHarnessIDs(t *testing.T) {
 	}
 }
 
-func TestSafeRoutingCandidateAllowsOnlyTranslationFixtureCandidates(t *testing.T) {
+func TestSafeRoutingCandidateAllowsOnlyProviderAwareFixtureCandidates(t *testing.T) {
 	t.Parallel()
 
 	for input, want := range map[string]string{
-		"demo-model/provider-api-translation-openai":    "demo-model/provider-api-translation-openai",
-		"demo-model/provider-api-translation-anthropic": "demo-model/provider-api-translation-anthropic",
-		"spoofed-candidate":                             "",
+		"demo-model/provider-api-translation-openai":         "demo-model/provider-api-translation-openai",
+		"demo-model/provider-api-translation-anthropic":      "demo-model/provider-api-translation-anthropic",
+		"demo-model/provider-api-translation-bedrock-mantle": "demo-model/provider-api-translation-bedrock-mantle",
+		"spoofed-candidate": "",
 	} {
 		if got := safeRoutingCandidate(input); got != want {
 			t.Errorf("safeRoutingCandidate(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestProviderAwareRecorderSelectsBedrockCredentialByTargetModel(t *testing.T) {
+	t.Parallel()
+
+	config := recorderConfig{
+		responseMode:       "provider-aware",
+		openAICredential:   "openai-test-key",
+		bedrockCredential:  "bedrock-test-key",
+		credentialRequired: true,
+	}
+	request := httptest.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", nil)
+	request.Header.Set("Authorization", "Bearer bedrock-test-key")
+
+	if !config.validCredential(request, map[string]any{"model": "openai.gpt-oss-20b"}) {
+		t.Fatal("Bedrock target model should validate against its bearer fixture key")
+	}
+	if config.validCredential(request, map[string]any{"model": "mock-openai-model"}) {
+		t.Fatal("Bedrock key must not validate for ordinary OpenAI target model")
+	}
+	request.Header.Del("Authorization")
+	request.Header.Set("X-Api-Key", "bedrock-test-key")
+	if config.validCredential(request, map[string]any{"model": "openai.gpt-oss-20b"}) {
+		t.Fatal("Bedrock Mantle fixture must require a Bearer credential")
 	}
 }
 

@@ -367,6 +367,8 @@ func supportedProviderFormat(providerType, apiFormat string) bool {
 	switch {
 	case providerType == "openai" && apiFormat == "openai-chat":
 		return true
+	case providerType == "bedrock-openai" && apiFormat == "openai-chat":
+		return true
 	case providerType == "anthropic" && apiFormat == "messages":
 		return true
 	default:

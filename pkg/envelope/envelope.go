@@ -374,12 +374,13 @@ func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 }
 
 // StrategyFor maps only the currently qualified provider API-key contracts to
-// Praxis wire strategies: openai + openai-chat maps to bearer_token
-// (Authorization: Bearer at the provider boundary) and anthropic + messages
-// maps to apikey (the credential_inject filter injects the Secret value into
-// its configured header, x-api-key by default). The wire stays reference-only
-// either way. Provider API keys are not interchangeable: other provider/
-// API-format combinations fail closed until their header semantics are
+// Praxis wire strategies: openai and bedrock-openai + openai-chat map to
+// bearer_token (Authorization: Bearer at the provider boundary), while
+// anthropic + messages maps to apikey (the credential_inject filter injects
+// the Secret value into its configured header, x-api-key by default). Bedrock
+// support is limited to its Mantle OpenAI-compatible API; it does not cover
+// Bedrock Runtime SigV4 or Converse. The wire stays reference-only either way.
+// Other provider/API-format combinations fail closed until their semantics are
 // explicitly supported.
 //
 // This is the single qualification authority: Render stamps overlay
@@ -394,6 +395,9 @@ func StrategyFor(route resolver.Route) (string, error) {
 		return "", nil
 	case "apikey":
 		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
+			return "bearer_token", nil
+		}
+		if route.ProviderType == "bedrock-openai" && route.APIFormat == "openai-chat" {
 			return "bearer_token", nil
 		}
 		if route.ProviderType == "anthropic" && route.APIFormat == "messages" {

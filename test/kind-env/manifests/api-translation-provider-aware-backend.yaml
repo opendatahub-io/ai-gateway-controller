@@ -45,13 +45,15 @@ spec:
             - name: RESPONSE_MODE
               value: provider-aware
             - name: EXPECTED_HOSTS
-              value: provider-translation-ext.maas-system.svc.cluster.local,provider-translation-openai-ext.maas-system.svc.cluster.local
+              value: provider-translation-ext.maas-system.svc.cluster.local,provider-translation-openai-ext.maas-system.svc.cluster.local,provider-translation-bedrock-ext.maas-system.svc.cluster.local
             - name: ENABLE_TEST_OBSERVATIONS
               value: "true"
             - name: OPENAI_CREDENTIAL_FILE
               value: /etc/provider-credentials/openai/api-key
             - name: ANTHROPIC_CREDENTIAL_FILE
               value: /etc/provider-credentials/anthropic/api-key
+            - name: BEDROCK_CREDENTIAL_FILE
+              value: /etc/provider-credentials/bedrock/api-key
             - name: STREAM_EVENT_DELAY
               value: 400ms
             - name: OVERLAY_RELOAD_STREAM_EVENT_DELAY
@@ -79,6 +81,9 @@ spec:
             - name: anthropic-credential
               mountPath: /etc/provider-credentials/anthropic
               readOnly: true
+            - name: bedrock-credential
+              mountPath: /etc/provider-credentials/bedrock
+              readOnly: true
       volumes:
         - name: tls
           secret:
@@ -92,6 +97,12 @@ spec:
         - name: anthropic-credential
           secret:
             secretName: api-translation-anthropic-backend-credential
+            items:
+              - key: api-key
+                path: api-key
+        - name: bedrock-credential
+          secret:
+            secretName: api-translation-bedrock-backend-credential
             items:
               - key: api-key
                 path: api-key
@@ -117,6 +128,21 @@ apiVersion: v1
 kind: Service
 metadata:
   name: provider-translation-openai-ext
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e
+spec:
+  selector:
+    app: api-translation-provider-aware-mock
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-translation-bedrock-ext
   namespace: maas-system
   labels:
     app.kubernetes.io/managed-by: api-translation-kind-e2e
