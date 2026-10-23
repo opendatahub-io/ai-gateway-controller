@@ -147,7 +147,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(required) != 1 || !required["live"] {
+	if len(required) != 1 || !required[envelope.CandidateStableID("model", "live")] {
 		t.Fatalf("required providers with stale refs = %#v, want only live", required)
 	}
 	if ready, reason, err := r.routingOverlayReady(ctx, namespace, required, unavailable, rejected); err != nil || !ready {
@@ -160,7 +160,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(required) != 2 || !required["live"] || !required["later"] {
+	if len(required) != 2 || !required[envelope.CandidateStableID("model", "live")] || !required[envelope.CandidateStableID("model", "later")] {
 		t.Fatalf("required providers after add = %#v, want live and later", required)
 	}
 	if ready, _, err := r.routingOverlayReady(ctx, namespace, required, unavailable, rejected); err != nil || ready {
@@ -230,11 +230,11 @@ func TestDisabledAnthropicTranslationDoesNotBlockAttachmentOnlyOverlay(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(required) != 1 || !required["anthropic"] {
+	if len(required) != 1 || !required[envelope.CandidateStableID("home-model", "anthropic")] {
 		t.Fatalf("enabled Anthropic binding required providers = %#v, want anthropic", required)
 	}
 	ready, reason, err = r.routingOverlayReady(ctx, namespace, required, unavailable, rejected)
-	if err != nil || ready || !strings.Contains(reason, "provider anthropic") {
+	if err != nil || ready || !strings.Contains(reason, "home-model/provider-anthropic") {
 		t.Fatalf("enabled Anthropic binding without its candidate: ready=%t reason=%q err=%v, want not ready", ready, reason, err)
 	}
 
@@ -265,8 +265,107 @@ func TestMissingHomeProviderKeepsRuntimeConfiguration(t *testing.T) {
 		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, allRuntimeRoutesExcludedByPolicy(set))
 	}
 	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
-	if _, err := combineRuntimeCandidates(nil, attachment, err, allRuntimeRoutesExcludedByPolicy(set)); !errors.Is(err, resolver.ErrNoRoutes) {
-		t.Fatalf("missing home provider with attachment error = %v, want ErrNoRoutes to retain last config", err)
+	if candidates, err := combineRuntimeCandidates(nil, attachment, err, allRuntimeRoutesExcludedByPolicy(set)); err != nil || len(candidates) != 1 || candidates[0].StableID != attachment[0].StableID {
+		t.Fatalf("missing home provider with attachment = %#v, error = %v; want the attached candidate", candidates, err)
+	}
+	if _, err := combineRuntimeCandidates(nil, nil, err, false); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("missing home provider without attachment error = %v, want ErrNoRoutes to retain last config", err)
+	}
+}
+
+func TestFailedHomeProviderDoesNotBlockSameNamedAttachment(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	home := openAIExternalModel("failed-home", namespace, "openai")
+	failed := openAIExternalProvider("openai", namespace, "Failed")
+	attachment := envelope.Candidate{
+		Cluster: "provider-openai", StableID: envelope.ScopedStableID("user-ns", "attached", "user-ns", "openai"),
+		Kind: "inference_model", Name: "attached", Site: "local", Fresh: true,
+	}
+	overlay := externalModelOverlay(t, namespace, nil, nil, attachment)
+	r, rec := newPraxisReconcileFixture(t, namespace, home, failed, overlay)
+
+	result, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || result.RequeueAfter != time.Hour {
+		t.Fatalf("reconcile attachment beside failed same-named home provider = %#v, %v; want attachment config applied", result, err)
+	}
+	cm := recordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), namespace)
+	config, found, err := unstructured.NestedString(cm.Object, "data", "extproc.yaml")
+	if err != nil || !found || !strings.Contains(config, `provider_hop_clusters: ["provider-openai"]`) {
+		t.Fatalf("attached provider not configured: found=%t err=%v config=%q", found, err, config)
+	}
+}
+
+func TestRejectedHomeModelDoesNotBlockAttachmentRuntime(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	home := openAIExternalModel("rejected-home", namespace, "openai")
+	home.Generation = 3
+	home.Status.ObservedGeneration = 3
+	home.Status.Phase = "Failed"
+	home.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ReconcileFailed"}}
+	provider := openAIExternalProvider("openai", namespace, resolver.PhaseReady)
+	// This binding cannot be configured by the runtime. Its rejected model
+	// must not prevent an independently published attachment from serving.
+	provider.Spec.Auth.Type = "oauth2"
+	attachment := envelope.Candidate{
+		Cluster: "provider-attached", StableID: envelope.ScopedStableID("user-ns", "attached", "user-ns", "provider"),
+		Kind: "inference_model", Name: "attached", Site: "local", Fresh: true,
+	}
+	overlay := externalModelOverlay(t, namespace, nil, nil, attachment)
+	r, rec := newPraxisReconcileFixture(t, namespace, home, provider, overlay)
+
+	result, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || result.RequeueAfter != time.Hour {
+		t.Fatalf("reconcile attachment beside rejected home model = %#v, %v; want attachment config applied", result, err)
+	}
+	cm := recordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), namespace)
+	config, found, err := unstructured.NestedString(cm.Object, "data", "extproc.yaml")
+	if err != nil || !found || !strings.Contains(config, `provider_hop_clusters: ["provider-attached"]`) || strings.Contains(config, "provider-openai") {
+		t.Fatalf("runtime config must contain only the published attachment: found=%t err=%v config=%q", found, err, config)
+	}
+}
+
+func TestAttachmentWaitsWhileFormerHomeCandidateRemainsPublished(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	home := openAIExternalModel("home", namespace, "failed")
+	failed := openAIExternalProvider("failed", namespace, "Failed")
+	staleHome := envelope.Candidate{
+		Cluster: "provider-old", StableID: envelope.CandidateStableID("home", "old"),
+		Kind: "inference_model", Name: "home", Site: "local", Fresh: true,
+	}
+	attachment := envelope.Candidate{
+		Cluster: "provider-openai", StableID: envelope.ScopedStableID("user-ns", "attached", "user-ns", "openai"),
+		Kind: "inference_model", Name: "attached", Site: "local", Fresh: true,
+	}
+	overlay := externalModelOverlay(t, namespace, nil, nil, staleHome, attachment)
+	r, rec := newPraxisReconcileFixture(t, namespace, home, failed, overlay)
+
+	result, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || result.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("reconcile while former home route remains published = %#v, %v; want retry", result, err)
+	}
+	assertRecordedResource(t, rec, gvkEnvoyFilter, PayloadProcessingEnvoyFilterName("redteam"), "gateway-ns")
+	assertNoRecordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), namespace)
+}
+
+func TestAttachedProviderClusterDoesNotSatisfyRequiredHomeCandidate(t *testing.T) {
+	const namespace = "tenant-ns"
+	home := openAIExternalModel("home", namespace, "openai")
+	ready := openAIExternalProvider("openai", namespace, resolver.PhaseReady)
+	attachment := envelope.Candidate{
+		Cluster: "provider-openai", StableID: envelope.ScopedStableID("user-ns", "attached", "user-ns", "openai"),
+		Kind: "inference_model", Name: "attached", Site: "local", Fresh: true,
+	}
+	overlay := externalModelOverlay(t, namespace, nil, nil, attachment)
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(home, ready, overlay).Build()}
+	_, required, unavailable, rejected, err := r.providersForTenant(context.Background(), namespace, "gateway", "gateway-ns", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready, _, err := r.routingOverlayReady(context.Background(), namespace, required, unavailable, rejected); err != nil || ready {
+		t.Fatalf("attached provider with same cluster satisfied a missing home candidate: ready=%t err=%v", ready, err)
 	}
 }
 
@@ -918,13 +1017,17 @@ func openAIExternalProvider(name, namespace, phase string) *v1alpha1.ExternalPro
 	}
 }
 
-func externalModelOverlay(t *testing.T, namespace string, models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) *corev1.ConfigMap {
+func externalModelOverlay(t *testing.T, namespace string, models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, preserved ...envelope.Candidate) *corev1.ConfigMap {
 	t.Helper()
-	set, err := resolver.Resolve(models, providers)
-	if err != nil {
-		t.Fatalf("resolve ExternalModel overlay: %v", err)
+	set := &resolver.ResolvedRouteSet{}
+	if len(models) > 0 {
+		var err error
+		set, err = resolver.Resolve(models, providers)
+		if err != nil {
+			t.Fatalf("resolve ExternalModel overlay: %v", err)
+		}
 	}
-	rendered, err := envelope.Render(set, envelope.Scope{Network: "external-model", Gateway: "gateway", Namespace: namespace, LocalSite: "local"}, envelope.Revision{}, envelope.Options{})
+	rendered, err := envelope.Render(set, envelope.Scope{Network: "external-model", Gateway: "gateway", Namespace: namespace, LocalSite: "local"}, envelope.Revision{}, envelope.Options{PreservedCandidates: preserved})
 	if err != nil {
 		t.Fatalf("render ExternalModel overlay: %v", err)
 	}
