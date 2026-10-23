@@ -399,10 +399,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	if !overlayReady {
-		log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
-		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+		log.Info("ExternalModel ExtProc is not ready; applying shared tenant resources", "reason", reason, "namespace", tenantNamespace)
 	}
-	if !serving {
+	if overlayReady && !serving {
 		if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
 			return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
 		}
@@ -412,11 +411,16 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
-	if serving {
+	if overlayReady && serving {
 		if err := configureExternalModelExtProc(resources, tenantID, tenantNamespace, runtimeCandidates, apiTranslation); err != nil {
-			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
+			log.Info("ExternalModel ExtProc configuration is not ready", "reason", err.Error(), "namespace", tenantNamespace)
+			overlayReady = false
 		}
-	} else {
+	}
+	if !overlayReady || !serving {
+		// The model-specific render cannot be updated safely yet. Keep any
+		// previously applied ExternalModel resources while applying the shared
+		// tenant resources, which do not depend on the routing overlay.
 		resources = RemoveExternalModelResources(resources, tenantID)
 	}
 	if r.SkipNetworkPolicy {
@@ -488,6 +492,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
+	if !overlayReady {
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
@@ -537,7 +544,7 @@ func (r *Reconciler) resolvePraxisRuntimeCandidates(
 	}
 	candidates, err := combineRuntimeCandidates(homeCandidates, attached, homeErr, policyExcludedOnly)
 	if err != nil {
-		return nil, false, false, "", err
+		return nil, true, false, fmt.Sprintf("ExternalModel runtime candidates are not ready: %v", err), nil
 	}
 	return candidates, true, true, "", nil
 }

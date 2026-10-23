@@ -634,6 +634,114 @@ func TestReconcileAppliesSharedResourcesWithOnlyDisabledMessagesModel(t *testing
 	}
 }
 
+func TestReconcileAppliesSharedResourcesWhileModelOverlayIsNotReady(t *testing.T) {
+	requireManifests(t)
+	const tenantNamespace = "tenant-ns"
+	const gatewayNamespace = "gateway-system"
+	const tenantID = "redteam"
+	provider := func(name, phase string) *v1alpha1.ExternalProvider {
+		return &v1alpha1.ExternalProvider{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tenantNamespace},
+			Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: name + ".example.com",
+				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: name + "-key"}}},
+			Status: v1alpha1.ExternalProviderStatus{Phase: phase},
+		}
+	}
+	model := func(name, providerName string) *v1alpha1.ExternalModel {
+		return &v1alpha1.ExternalModel{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tenantNamespace},
+			Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+				Ref: v1alpha1.ExternalProviderReference{Name: providerName}, TargetModel: "gpt",
+				APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			}}},
+		}
+	}
+	failedModel, failedProvider := model("failed", "failed-provider"), provider("failed-provider", "Failed")
+	healthyModel, healthyProvider := model("healthy", "healthy-provider"), provider("healthy-provider", resolver.PhaseReady)
+	set, err := resolver.Resolve([]*v1alpha1.ExternalModel{healthyModel}, []*v1alpha1.ExternalProvider{healthyProvider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := envelope.Render(set, envelope.Scope{Network: "test", Gateway: "my-gateway", Namespace: tenantNamespace, LocalSite: "site"}, envelope.Revision{}, envelope.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialOverlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: tenantNamespace,
+			Labels: map[string]string{managedByLabel: render.FieldOwner}},
+		Data: map[string]string{praxisOverlayDataKey: string(raw)},
+	}
+	emptyEnv, err := envelope.Render(&resolver.ResolvedRouteSet{}, envelope.Scope{
+		Network: "test", Gateway: "my-gateway", Namespace: tenantNamespace, LocalSite: "site",
+	}, envelope.Revision{}, envelope.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyRaw, err := json.Marshal(emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyOverlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: tenantNamespace,
+			Labels: map[string]string{managedByLabel: render.FieldOwner}},
+		Data: map[string]string{praxisOverlayDataKey: string(emptyRaw)},
+	}
+
+	for _, tc := range []struct {
+		name   string
+		models []client.Object
+	}{
+		{name: "absent overlay", models: []client.Object{failedModel, failedProvider}},
+		{name: "partial overlay with healthy sibling", models: []client.Object{failedModel, failedProvider, healthyModel, healthyProvider, partialOverlay}},
+		{name: "valid overlay with unresolved model", models: []client.Object{model("missing", "missing-provider"), emptyOverlay}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mtc := withMarker(newMTC(tenantNamespace, tenantID, PayloadProcessingBackendPraxis, tenantID, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+			aitenant := newAITenantOwner(tenantID, "ai-tenants", AITenantPhaseActive, "my-gateway", gatewayNamespace, tenantNamespace)
+			oldModelConfig := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+				Name: PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), Namespace: tenantNamespace,
+				Labels: map[string]string{managedByLabel: render.FieldOwner},
+			}}
+			objects := []client.Object{mtc, aitenant, newGateway("my-gateway", gatewayNamespace), oldModelConfig}
+			objects = append(objects, tc.models...)
+			rec := &recorder{}
+			fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(objects...).WithInterceptorFuncs(rec.funcs()).Build()
+			r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+			result, err := r.Reconcile(context.Background(), mtcRequest(tenantNamespace))
+			if err != nil || result.RequeueAfter != constants.NotReadyRequeueInterval {
+				t.Fatalf("Reconcile: result=%#v err=%v, want shared apply and short requeue", result, err)
+			}
+			patched, _, deleted := rec.snapshot()
+			kinds := rec.kindSnapshot()
+			sharedFilterApplied := false
+			for i, name := range patched {
+				if name == PayloadProcessingEnvoyFilterName(tenantID) && kinds[i] == "EnvoyFilter" {
+					sharedFilterApplied = true
+				}
+				if name == PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID) ||
+					name == PayloadProcessingExternalModelDeploymentName(tenantID) ||
+					name == PayloadProcessingExternalModelFilterNameForTenant(tenantID) {
+					t.Fatalf("model-specific resource %s was applied before overlay readiness: %v", name, patched)
+				}
+			}
+			if !sharedFilterApplied || !slices.Contains(patched, PayloadProcessingPluginsConfigMapForTenant(tenantID)) {
+				t.Fatalf("shared ExtProc filter or config was not applied: names=%v kinds=%v", patched, kinds)
+			}
+			if slices.Contains(deleted, oldModelConfig.Name) {
+				t.Fatalf("existing model-specific config was deleted: %v", deleted)
+			}
+			var retained corev1.ConfigMap
+			if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(oldModelConfig), &retained); err != nil {
+				t.Fatalf("existing model-specific config was not retained: %v", err)
+			}
+		})
+	}
+}
+
 func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	scheme := mtcSchemeForTests()
 	mtc := newMTC("ai-tenant-redteam", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")
