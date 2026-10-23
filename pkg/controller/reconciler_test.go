@@ -2438,7 +2438,7 @@ func TestUnsupportedActiveProviderPreservesLastKnownServingState(t *testing.T) {
 	if err := r.Get(ctx, providerKey, &provider); err != nil {
 		t.Fatal(err)
 	}
-	provider.Spec.Provider = "azure-openai"
+	provider.Spec.Provider = "vertex-openai"
 	if err := r.Update(ctx, &provider); err != nil {
 		t.Fatal(err)
 	}
@@ -2456,7 +2456,7 @@ func TestUnsupportedActiveProviderPreservesLastKnownServingState(t *testing.T) {
 	if !errors.Is(err, resolver.ErrProviderCapabilityUnsupported) {
 		t.Fatalf("reconcile error = %v, want ErrProviderCapabilityUnsupported", err)
 	}
-	if !strings.Contains(err.Error(), "azure-openai") || !strings.Contains(err.Error(), "openai-chat") {
+	if !strings.Contains(err.Error(), "vertex-openai") || !strings.Contains(err.Error(), "openai-chat") {
 		t.Fatalf("unsupported capability error lacks provider/API format: %v", err)
 	}
 	if applyCalls != 0 || publishCalls != 0 {
