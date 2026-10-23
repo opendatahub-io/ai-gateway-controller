@@ -179,7 +179,8 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !required["local"] || !required["own"] || required["elsewhere"] || len(required) != 2 {
+	if !required[envelope.CandidateStableID("local", "local")] || !required[envelope.CandidateStableID("own", "own")] ||
+		required[envelope.CandidateStableID("elsewhere", "elsewhere")] || len(required) != 2 {
 		t.Fatalf("required providers = %v, want only local providers of models the tenant Gateway serves", required)
 	}
 	if len(unavailable) != 0 {

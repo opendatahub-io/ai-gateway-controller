@@ -669,6 +669,7 @@ func (r *Reconciler) providersForTenant(
 	}
 	referenced := map[string]bool{}
 	required := map[string]bool{}
+	unavailable := map[string]bool{}
 	rejectedModelCandidates := map[string]bool{}
 	for i := range models {
 		rejectedModel := modelHasCurrentReconcileFailure(&models[i])
@@ -679,38 +680,31 @@ func (r *Reconciler) providersForTenant(
 				continue
 			}
 			referenced[name] = true
+			candidateID := envelope.CandidateStableID(models[i].Name, name)
 			if rejectedModel {
-				rejectedModelCandidates[envelope.CandidateStableID(models[i].Name, name)] = true
+				rejectedModelCandidates[candidateID] = true
 				continue
 			}
 			provider := providerByName[name]
 			providerReady := provider != nil && provider.Status.Phase == resolver.PhaseReady
+			if !providerReady {
+				unavailable[candidateID] = true
+			}
 			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && provider != nil && provider.Spec.Provider == "anthropic"
 			if providerReady && (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
-				required[name] = true
+				required[candidateID] = true
 			}
 		}
 	}
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
-	availableRequired := make(map[string]bool, len(required))
-	unavailable := make(map[string]bool)
-	for name := range referenced {
-		provider := providerByName[name]
-		if provider == nil || provider.Status.Phase != resolver.PhaseReady {
-			unavailable["provider-"+name] = true
-		}
-	}
 	for i := range providers.Items {
 		if referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
-			if required[providers.Items[i].Name] && providers.Items[i].Status.Phase == resolver.PhaseReady {
-				availableRequired[providers.Items[i].Name] = true
-			}
 		}
 	}
-	// A stale reference to a deleted provider cannot appear in the serving
-	// overlay. Do not let it prevent the remaining providers from loading.
-	return result, availableRequired, unavailable, rejectedModelCandidates, nil
+	// Missing providers are not required. If an old candidate for one remains
+	// published, the unavailable map keeps its last runtime config in place.
+	return result, required, unavailable, rejectedModelCandidates, nil
 }
 
 // modelHasCurrentReconcileFailure recognizes a current-generation model that
@@ -737,6 +731,12 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
 	for i := range models {
+		// A current-generation reconciliation failure cannot publish this
+		// model's routes. Resolve the remaining models independently; overlay
+		// readiness below waits if an older route for this model still exists.
+		if modelHasCurrentReconcileFailure(&models[i]) {
+			continue
+		}
 		// Providers in other namespaces are loaded from the published overlay
 		// (attachedOverlayCandidates), so a model referencing only those has
 		// no local runtime candidates.
@@ -807,11 +807,12 @@ func allRuntimeRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
 	return sawExclusion
 }
 
-// combineRuntimeCandidates allows an intentional policy exclusion to leave
-// only attached candidates. Other ErrNoRoutes causes preserve the last
-// applied runtime configuration by returning the error.
+// combineRuntimeCandidates can serve published attachments when no home route
+// resolves. routingOverlayReady first ensures the overlay has no stale home
+// candidates, so the runtime and published routes remain paired. Without an
+// attachment, a provider failure preserves the last applied runtime config.
 func combineRuntimeCandidates(home, attached []envelope.Candidate, homeErr error, policyExcludedOnly bool) ([]envelope.Candidate, error) {
-	if errors.Is(homeErr, resolver.ErrNoRoutes) && policyExcludedOnly {
+	if errors.Is(homeErr, resolver.ErrNoRoutes) && (policyExcludedOnly || len(attached) > 0) {
 		home = nil
 		homeErr = nil
 	}
@@ -909,16 +910,19 @@ func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, 
 		if rejectedModelCandidates[candidate.StableID] {
 			return false, fmt.Sprintf("routing overlay still contains rejected ExternalModel candidate %s", candidate.StableID), nil
 		}
-		available[candidate.Cluster] = true
-	}
-	for cluster := range unavailableProviders {
-		if available[cluster] {
-			return false, fmt.Sprintf("routing overlay still contains unavailable provider %s", strings.TrimPrefix(cluster, "provider-")), nil
+		if unavailableProviders[candidate.StableID] {
+			return false, fmt.Sprintf("routing overlay still contains unavailable ExternalModel candidate %s", candidate.StableID), nil
 		}
+		// A former home route may still be published after its reference was
+		// removed. Keep the last runtime config until that route is withdrawn.
+		if !envelope.IsScopedStableID(candidate.StableID) && !requiredProviders[candidate.StableID] {
+			return false, fmt.Sprintf("routing overlay still contains stale ExternalModel candidate %s", candidate.StableID), nil
+		}
+		available[candidate.StableID] = true
 	}
-	for provider := range requiredProviders {
-		if !available["provider-"+provider] {
-			return false, fmt.Sprintf("routing overlay does not contain provider %s", provider), nil
+	for candidateID := range requiredProviders {
+		if !available[candidateID] {
+			return false, fmt.Sprintf("routing overlay does not contain ExternalModel candidate %s", candidateID), nil
 		}
 	}
 	return true, "routing overlay is controller-owned and digest-valid", nil
