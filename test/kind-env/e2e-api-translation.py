@@ -3288,7 +3288,8 @@ def capture_provider_cluster_endpoints(label, cluster_names):
         snapshot["provider_clusters"][cluster] = item
 
     if gateway_pod:
-        result = run([ISTIOCTL, "proxy-config", "endpoints", gateway_pod, "-n", "maas-system", "-o", "json"],
+        result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", "endpoints", gateway_pod,
+                      "-n", "maas-system", "-o", "json"],
                      check=False, timeout=90)
         snapshot["istioctl_proxy_config_endpoints_exit"] = result.returncode
         try:
