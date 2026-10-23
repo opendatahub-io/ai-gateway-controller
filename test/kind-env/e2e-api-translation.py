@@ -1329,7 +1329,8 @@ def capture_envoy(label):
     if not pod:
         raise RuntimeError("no Ready maas-default-gateway Envoy pod")
     for resource in ("all", "listeners", "routes", "clusters", "endpoints"):
-        result = run([ISTIOCTL, "proxy-config", resource, pod, "-n", "maas-system", "-o", "json"],
+        result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", resource, pod,
+                      "-n", "maas-system", "-o", "json"],
                      check=False, timeout=90)
         if result.returncode != 0:
             (EVIDENCE / f"envoy-{label}-{resource}.json").write_text(result.stdout or result.stderr)
@@ -1550,7 +1551,8 @@ end'''
 
     last = ""
     for _ in range(60):
-        result = run([ISTIOCTL, "proxy-config", "listeners", gateway_pod, "-n", "maas-system", "-o", "json"],
+        result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", "listeners", gateway_pod,
+                      "-n", "maas-system", "-o", "json"],
                      check=False, timeout=90)
         last = result.stdout or result.stderr
         input_filter_order = auth_policy_input_filter_order(last)
@@ -2170,7 +2172,8 @@ def capture_provider_cluster_endpoints(label, cluster_names):
         snapshot["provider_clusters"][cluster] = item
 
     if gateway_pod:
-        result = run([ISTIOCTL, "proxy-config", "endpoints", gateway_pod, "-n", "maas-system", "-o", "json"],
+        result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", "endpoints", gateway_pod,
+                      "-n", "maas-system", "-o", "json"],
                      check=False, timeout=90)
         snapshot["istioctl_proxy_config_endpoints_exit"] = result.returncode
         try:

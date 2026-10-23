@@ -28,6 +28,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -393,16 +394,16 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
 	}
 	tenantNamespace := mtc.GetNamespace()
-	runtimeCandidates, serving, overlayReady, reason, err := r.resolvePraxisRuntimeCandidates(
+	runtimeCandidates, serving, overlayReady, reason, routeErr := r.resolvePraxisRuntimeCandidates(
 		ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !overlayReady {
+	routeConfigReady := routeErr == nil && overlayReady
+	if routeErr != nil {
+		log.Info("ExternalModel ExtProc configuration is not ready; shared ExtProc will still be applied and the last route configuration retained",
+			"error", routeErr, "namespace", tenantNamespace)
+	} else if !overlayReady {
 		log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
-		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
-	if !serving {
+	if routeConfigReady && !serving {
 		if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
 			return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
 		}
@@ -412,7 +413,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
-	if serving {
+	if !routeConfigReady {
+		// Applying an incomplete or absent overlay as an empty runtime config
+		// would withdraw working ExternalModel routes. Omit only these
+		// route-specific resources from SSA so the shared tenant filter can
+		// install while any last-known-good ExternalModel resources remain as-is.
+		resources = RemoveExternalModelResources(resources, tenantID)
+	} else if serving {
 		if err := configureExternalModelExtProc(resources, tenantID, tenantNamespace, runtimeCandidates, apiTranslation); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
 		}
@@ -488,6 +495,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
+	if !routeConfigReady {
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
@@ -524,11 +534,11 @@ func (r *Reconciler) resolvePraxisRuntimeCandidates(
 		return nil, false, true, "", nil
 	}
 
-	_, requiredProviders, err := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
+	_, requiredProviders, unavailableProviders, rejectedModelCandidates, err := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
 	if err != nil {
 		return nil, false, false, "", err
 	}
-	ready, reason, err := r.routingOverlayReady(ctx, tenantNamespace, requiredProviders)
+	ready, reason, err := r.routingOverlayReady(ctx, tenantNamespace, requiredProviders, unavailableProviders, rejectedModelCandidates)
 	if err != nil {
 		return nil, false, false, "", fmt.Errorf("check routing overlay: %w", err)
 	}
@@ -538,6 +548,15 @@ func (r *Reconciler) resolvePraxisRuntimeCandidates(
 	candidates, err := combineRuntimeCandidates(homeCandidates, attached, homeErr, policyExcludedOnly)
 	if err != nil {
 		return nil, false, false, "", err
+	}
+	if len(rejectedModelCandidates) > 0 {
+		selectable := candidates[:0]
+		for _, candidate := range candidates {
+			if !rejectedModelCandidates[candidate.StableID] {
+				selectable = append(selectable, candidate)
+			}
+		}
+		candidates = selectable
 	}
 	return candidates, true, true, "", nil
 }
@@ -631,22 +650,28 @@ func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID
 	return nil
 }
 
-func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
+func (r *Reconciler) providersForTenant(
+	ctx context.Context,
+	namespace, gatewayName, gatewayNamespace string,
+	apiTranslationEnabled bool,
+) ([]v1alpha1.ExternalProvider, map[string]bool, map[string]bool, map[string]bool, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
-		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
 	}
-	providerTypes := make(map[string]string, len(providers.Items))
+	providerByName := make(map[string]*v1alpha1.ExternalProvider, len(providers.Items))
 	for i := range providers.Items {
-		providerTypes[providers.Items[i].Name] = providers.Items[i].Spec.Provider
+		providerByName[providers.Items[i].Name] = &providers.Items[i]
 	}
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	referenced := map[string]bool{}
 	required := map[string]bool{}
+	rejectedModelCandidates := map[string]bool{}
 	for i := range models {
+		rejectedModel := modelHasCurrentReconcileFailure(&models[i])
 		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
@@ -654,25 +679,51 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 				continue
 			}
 			referenced[name] = true
-			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && providerTypes[name] == "anthropic"
-			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
+			if rejectedModel {
+				rejectedModelCandidates[envelope.CandidateStableID(models[i].Name, name)] = true
+				continue
+			}
+			provider := providerByName[name]
+			providerReady := provider != nil && provider.Status.Phase == resolver.PhaseReady
+			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && provider != nil && provider.Spec.Provider == "anthropic"
+			if providerReady && (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
 				required[name] = true
 			}
 		}
 	}
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
 	availableRequired := make(map[string]bool, len(required))
+	unavailable := make(map[string]bool)
+	for name := range referenced {
+		provider := providerByName[name]
+		if provider == nil || provider.Status.Phase != resolver.PhaseReady {
+			unavailable["provider-"+name] = true
+		}
+	}
 	for i := range providers.Items {
 		if referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
-			if required[providers.Items[i].Name] {
+			if required[providers.Items[i].Name] && providers.Items[i].Status.Phase == resolver.PhaseReady {
 				availableRequired[providers.Items[i].Name] = true
 			}
 		}
 	}
 	// A stale reference to a deleted provider cannot appear in the serving
 	// overlay. Do not let it prevent the remaining providers from loading.
-	return result, availableRequired, nil
+	return result, availableRequired, unavailable, rejectedModelCandidates, nil
+}
+
+// modelHasCurrentReconcileFailure recognizes a current-generation model that
+// the ExternalModel reconciler rejected before publishing its routes (for
+// example, because its HTTPRoute would exceed the Gateway API rule limit).
+// ProviderNotReady is deliberately excluded: that path can publish healthy
+// sibling references from the same model.
+func modelHasCurrentReconcileFailure(model *v1alpha1.ExternalModel) bool {
+	if model == nil || model.Status.Phase != "Failed" || model.Status.ObservedGeneration != model.Generation {
+		return false
+	}
+	ready := apiMeta.FindStatusCondition(model.Status.Conditions, "Ready")
+	return ready != nil && ready.Status == metav1.ConditionFalse && ready.Reason == "ReconcileFailed"
 }
 
 func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, bool, error) {
@@ -827,7 +878,7 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 	return attached, false, nil
 }
 
-func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
+func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders, unavailableProviders, rejectedModelCandidates map[string]bool) (bool, string, error) {
 	var configMap corev1.ConfigMap
 	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -855,7 +906,15 @@ func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, 
 	}
 	available := make(map[string]bool, len(env.Overlay.Candidates))
 	for _, candidate := range env.Overlay.Candidates {
+		if rejectedModelCandidates[candidate.StableID] {
+			return false, fmt.Sprintf("routing overlay still contains rejected ExternalModel candidate %s", candidate.StableID), nil
+		}
 		available[candidate.Cluster] = true
+	}
+	for cluster := range unavailableProviders {
+		if available[cluster] {
+			return false, fmt.Sprintf("routing overlay still contains unavailable provider %s", strings.TrimPrefix(cluster, "provider-")), nil
+		}
 	}
 	for provider := range requiredProviders {
 		if !available["provider-"+provider] {

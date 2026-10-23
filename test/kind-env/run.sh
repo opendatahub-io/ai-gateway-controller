@@ -29,6 +29,7 @@ MAAS_API_TRANSLATION_SCHEMA_REPO=${MAAS_API_TRANSLATION_SCHEMA_REPO:-}
 MAAS_API_TRANSLATION_SCHEMA_REV=${MAAS_API_TRANSLATION_SCHEMA_REV:-bce7ddd52657a2ad4c2444757761806a8290db44}
 MAAS_API_TRANSLATION_SCHEMA_PATH=deployment/base/maas-controller/crd/bases/maas.opendatahub.io_maastenantconfigs.yaml
 APPLY_REAL_OPENAI_FIXTURE=${APPLY_REAL_OPENAI_FIXTURE:-false}
+SEED_FAILED_HOME_MODEL=${LOCAL_ENV_SEED_FAILED_HOME_MODEL:-false}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
 KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
 PRAXIS_EXTPROC_REPO=${PRAXIS_EXTPROC_REPO:-"$DEPS_DIR/praxis-extproc"}
@@ -52,6 +53,9 @@ KCTL=(kubectl --context "kind-$CLUSTER")
 failures=0
 fail() { echo "FAIL: $*" | tee -a "$EVIDENCE/failures.txt"; failures=$((failures + 1)); }
 check_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
+if [[ "$SEED_FAILED_HOME_MODEL" != true && "$SEED_FAILED_HOME_MODEL" != false ]]; then
+  fail "LOCAL_ENV_SEED_FAILED_HOME_MODEL must be true or false"
+fi
 create_run_registry() {
   local network_owner container_owner node network_names expected_id runtime_id runtime_info expected_repo_digest node_repo_digest node_tag_present repository hosts_dir config_before config_after
 
@@ -243,6 +247,105 @@ wait_for_praxis_handoff() {
   "${KCTL[@]}" -n "$namespace" get maastenantconfig default-tenant -o json >"$EVIDENCE/maas-payload-handoff-${namespace}.json" 2>&1 || true
   fail "MaaS/Praxis handoff did not reach steady for $namespace"
   return 1
+}
+seed_failed_home_model_before_tenant() {
+  local provider_phase='' model_phase='' existing_owner=''
+  # No AITenant/MaasTenantConfig exists yet. This deliberately leaves the
+  # controller without a usable provider route before the first tenant handoff.
+  EXTERNAL_MODEL_NAMESPACE=models-as-a-service \
+  EXTERNAL_MODEL_RUN_ID="$CLUSTER" \
+    envsubst '${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_RUN_ID}' \
+      <"$ROOT/test/kind-env/fixtures/failed-home-model-bootstrap.yaml.tmpl" \
+      | "${KCTL[@]}" apply -f -
+  if "${KCTL[@]}" -n models-as-a-service get maastenantconfig default-tenant >/dev/null 2>&1; then
+    fail "failed-model bootstrap fixture requires a fresh tenant with no MaasTenantConfig before AITenant creation"
+    return 1
+  fi
+  if "${KCTL[@]}" -n maas-system get deployment payload-processing -o json >"$EVIDENCE/failed-home-model-shared-deployment-before-tenant.json" 2>/dev/null; then
+    existing_owner=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' "$EVIDENCE/failed-home-model-shared-deployment-before-tenant.json")
+    [[ "$existing_owner" != ai-gateway-controller ]] || { fail "controller-owned shared ExtProc Deployment exists before failed-model bootstrap"; return 1; }
+  else
+    printf '{"present":false}\n' >"$EVIDENCE/failed-home-model-shared-deployment-before-tenant.json"
+  fi
+  if "${KCTL[@]}" -n maas-system get envoyfilter payload-processing -o json >"$EVIDENCE/failed-home-model-shared-filter-before-tenant.json" 2>/dev/null; then
+    existing_owner=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' "$EVIDENCE/failed-home-model-shared-filter-before-tenant.json")
+    [[ "$existing_owner" != ai-gateway-controller ]] || { fail "controller-owned shared ExtProc EnvoyFilter exists before failed-model bootstrap"; return 1; }
+  else
+    printf '{"present":false}\n' >"$EVIDENCE/failed-home-model-shared-filter-before-tenant.json"
+  fi
+  for _ in $(seq 1 90); do
+    provider_phase=$("${KCTL[@]}" -n models-as-a-service get externalprovider failed-bootstrap-provider -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    model_phase=$("${KCTL[@]}" -n models-as-a-service get externalmodel failed-bootstrap-model -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    if [[ "$provider_phase" == Failed && "$model_phase" == Failed ]]; then
+      break
+    fi
+    sleep 2
+  done
+  "${KCTL[@]}" -n models-as-a-service get externalprovider failed-bootstrap-provider -o yaml >"$EVIDENCE/failed-home-model-provider-before-tenant.yaml" 2>&1 || true
+  "${KCTL[@]}" -n models-as-a-service get externalmodel failed-bootstrap-model -o yaml >"$EVIDENCE/failed-home-model-before-tenant.yaml" 2>&1 || true
+  "${KCTL[@]}" -n models-as-a-service get events --sort-by=.lastTimestamp >"$EVIDENCE/failed-home-model-events-before-tenant.txt" 2>&1 || true
+  if [[ "$provider_phase" != Failed || "$model_phase" != Failed ]]; then
+    fail "bootstrap failure fixture did not reach Failed before AITenant creation (provider=$provider_phase model=$model_phase)"
+    return 1
+  fi
+  if "${KCTL[@]}" -n models-as-a-service get configmap routing-overlay >"$EVIDENCE/failed-home-model-overlay-before-tenant.yaml" 2>&1; then
+    fail "bootstrap failure fixture unexpectedly published a routing overlay before tenant creation"
+    return 1
+  fi
+  printf 'provider_phase=%s\nmodel_phase=%s\nrouting_overlay=absent\naitenant_created=false\n' \
+    "$provider_phase" "$model_phase" >"$EVIDENCE/failed-home-model-before-tenant.txt"
+}
+qualify_failed_home_model_bootstrap() {
+  local provider_phase='' model_phase='' mtc_ready=false aitenant_ready=false shared_ready=false overlay_present=false
+  for _ in $(seq 1 120); do
+    provider_phase=$("${KCTL[@]}" -n models-as-a-service get externalprovider failed-bootstrap-provider -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    model_phase=$("${KCTL[@]}" -n models-as-a-service get externalmodel failed-bootstrap-model -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    if "${KCTL[@]}" -n models-as-a-service get configmap routing-overlay >/dev/null 2>&1; then
+      overlay_present=true
+    else
+      overlay_present=false
+    fi
+    if "${KCTL[@]}" -n models-as-a-service get maastenantconfig default-tenant -o json 2>/dev/null \
+      | jq -e '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1' >/dev/null; then
+      mtc_ready=true
+    fi
+    if "${KCTL[@]}" -n ai-tenants get aitenant models-as-a-service -o json 2>/dev/null \
+      | jq -e '.status.phase == "Active" and ([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1)' >/dev/null; then
+      aitenant_ready=true
+    fi
+    if "${KCTL[@]}" -n maas-system get deployment payload-processing -o json 2>/dev/null \
+      | jq -e '.metadata.labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller" and (.status.readyReplicas // 0) >= 1' >/dev/null \
+      && "${KCTL[@]}" -n maas-system get envoyfilter payload-processing -o json 2>/dev/null \
+      | jq -e '.metadata.labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller"' >/dev/null; then
+      shared_ready=true
+    fi
+    if [[ "$provider_phase" == Failed && "$model_phase" == Failed && "$overlay_present" == false &&
+      "$mtc_ready" == true && "$aitenant_ready" == true && "$shared_ready" == true ]]; then
+      break
+    fi
+    sleep 2
+  done
+  "${KCTL[@]}" -n models-as-a-service get maastenantconfig default-tenant -o yaml >"$EVIDENCE/failed-home-model-mtc-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n ai-tenants get aitenant models-as-a-service -o yaml >"$EVIDENCE/failed-home-model-aitenant-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n models-as-a-service get externalprovider failed-bootstrap-provider -o yaml >"$EVIDENCE/failed-home-model-provider-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n models-as-a-service get externalmodel failed-bootstrap-model -o yaml >"$EVIDENCE/failed-home-model-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n maas-system get deployment payload-processing -o yaml >"$EVIDENCE/failed-home-model-shared-extproc-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n maas-system get envoyfilter payload-processing -o yaml >>"$EVIDENCE/failed-home-model-shared-extproc-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n models-as-a-service get configmap routing-overlay -o yaml >"$EVIDENCE/failed-home-model-overlay-after-handoff.yaml" 2>&1 || true
+  "${KCTL[@]}" -n models-as-a-service get events --sort-by=.lastTimestamp >"$EVIDENCE/failed-home-model-events-after-handoff.txt" 2>&1 || true
+  cat >"$EVIDENCE/failed-home-model-bootstrap-result.txt" <<EOF
+provider_phase=$provider_phase
+model_phase=$model_phase
+routing_overlay_present=$overlay_present
+maas_tenant_config_ready=$mtc_ready
+ai_tenant_ready=$aitenant_ready
+shared_extproc_ready=$shared_ready
+EOF
+  if [[ "$provider_phase" != Failed || "$model_phase" != Failed || "$overlay_present" != false ||
+    "$mtc_ready" != true || "$aitenant_ready" != true || "$shared_ready" != true ]]; then
+    fail "failed-model bootstrap isolation did not converge (see failed-home-model-bootstrap-result.txt)"
+    return 1
+  fi
 }
 check_repo() { local name=$1 path=${!1:-}; [[ -n "$path" ]] && git -C "$path" rev-parse --git-dir >/dev/null 2>&1 || fail "$name checkout missing: ${path:-unset}"; }
 dirty_hash() {
@@ -855,6 +958,9 @@ PY
     ] + $extra_known)}
   ]')
   "${KCTL[@]}" -n opendatahub patch deployment ai-gateway-controller --type=json -p="$controller_patch"
+  if [[ "$SEED_FAILED_HOME_MODEL" == true ]]; then
+    seed_failed_home_model_before_tenant || exit 2
+  fi
   # Tenant-local ExtProc resources are now rendered and owned by ai-gateway-controller from
   # ExternalProvider references. Do not apply the former static tenant
   # Deployments here; doing so would create an unowned same-name object and
@@ -883,6 +989,9 @@ PY
     "${KCTL[@]}" -n "$tenant_namespace" annotate maastenantconfig default-tenant \
       maas.opendatahub.io/payload-processing-type=praxis --overwrite
     wait_for_praxis_handoff "$tenant_namespace" || exit 2
+    if [[ "$SEED_FAILED_HOME_MODEL" == true && "$tenant_namespace" == models-as-a-service ]]; then
+      qualify_failed_home_model_bootstrap || exit 2
+    fi
   done
   transition_mtc_ready=false
   for _ in $(seq 1 90); do

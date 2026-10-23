@@ -650,12 +650,60 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		// keep serving.
 		return reconcile.Result{}, report(false, reasonProviderNotReady, message, nil)
 	}
+	if reason, message, unresolved := homeModelNoRouteStatus(set, req.String()); unresolved {
+		// Route publication is namespace-wide, but status belongs to the model
+		// being reconciled. A healthy sibling may keep the shared overlay
+		// populated while this model has no usable provider of its own.
+		return reconcile.Result{}, report(false, reason, message, nil)
+	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
 	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// homeModelNoRouteStatus keeps each ExternalModel's readiness independent from
+// routes published for its siblings. The resolved set is shared by the
+// tenant, so a non-empty set does not imply that the current model is served.
+func homeModelNoRouteStatus(set *resolver.ResolvedRouteSet, modelRef string) (reason, message string, unresolved bool) {
+	if set == nil {
+		return "", "", false
+	}
+	if translationPolicyExcludedModels(set)[modelRef] {
+		return reasonTranslationDisabled, "MaasTenantConfig.spec.apiTranslation.enabled must be true for an Anthropic Messages provider", true
+	}
+	for _, model := range set.Models {
+		if model.ModelRef != modelRef || len(model.Routes) > 0 {
+			continue
+		}
+		reason = reasonNoRoutes
+		messages := make([]string, 0, len(model.Skips))
+		for _, skip := range model.Skips {
+			if skip.Message != "" {
+				messages = append(messages, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
+			}
+			switch skip.Reason {
+			case resolver.SkipTranslationDisabled:
+				reason = reasonTranslationDisabled
+			case resolver.SkipProviderNotReady, resolver.SkipRefNotFound:
+				reason = reasonProviderNotReady
+			case resolver.SkipRefNotPermitted:
+				reason = reasonRefNotPermitted
+			case resolver.SkipWeightDisabled, resolver.SkipAPIFormatUnsupported, resolver.SkipPathUnresolved:
+				// These references are intentionally excluded from this model's
+				// routes; preserve the default NoRoutes condition and detailed skip.
+			}
+		}
+		if len(messages) > 0 {
+			message = "no routable ExternalModel provider remains: " + strings.Join(messages, "; ")
+		} else {
+			message = "no ExternalModel provider references resolved to routes"
+		}
+		return reason, message, true
+	}
+	return "", "", false
 }
 
 func (r *Reconciler) handleHomeRouteResolutionError(

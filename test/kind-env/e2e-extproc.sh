@@ -14,6 +14,7 @@ API_NS=maas-system
 EXT_DEPLOYMENT=payload-processing-external-model
 EXT_SERVICE=payload-processing-external-model
 EXT_CONFIG=payload-processing-external-model-plugins
+SEED_FAILED_HOME_MODEL=${LOCAL_ENV_SEED_FAILED_HOME_MODEL:-false}
 mkdir -p "$EVIDENCE"
 exec > >(tee "$EVIDENCE/e2e.log") 2>&1
 evidence_label() {
@@ -97,9 +98,9 @@ finish() {
       -p='[{"op":"remove","path":"/spec/externalProviderRefs/0/auth"}]' >/dev/null 2>&1 || true
   fi
   timeout 20s kubectl --context "kind-$CLUSTER" -n "$NS" delete secret "$OVERRIDE_SECRET" --ignore-not-found >/dev/null 2>&1 || true
+  if [[ "$KEY_REVOKED" != true ]]; then revoke_key; fi
   [[ -n "$APF" ]] && kill "$APF" 2>/dev/null || true
   [[ -n "$GPF" ]] && kill "$GPF" 2>/dev/null || true
-  revoke_key
   rm -f "$AUTH_CFG" "$ADMIN_CFG"
   rm -rf "$TMP_DIR"
   if jq -e '.status=="RUNNING"' "$RESULTS" >/dev/null 2>&1; then
@@ -270,6 +271,94 @@ wait_gateway_provider() {
   return 1
 }
 
+preauth_healthy_endpoint_count() {
+  local slices
+  slices=$(kctl -n "$API_NS" get endpointslices -l "kubernetes.io/service-name=payload-pre-processing" -o json 2>/dev/null || printf '{"items":[]}')
+  jq '[.items[]?.endpoints[]? | select((.conditions.ready // true) == true and (.conditions.terminating // false) == false) | .addresses[]?] | length' <<<"$slices"
+}
+
+preauth_endpoint_address_count() {
+  local slices
+  slices=$(kctl -n "$API_NS" get endpointslices -l "kubernetes.io/service-name=payload-pre-processing" -o json 2>/dev/null || printf '{"items":[]}')
+  jq '[.items[]?.endpoints[]?.addresses[]?] | length' <<<"$slices"
+}
+
+preauth_live_pod_count() {
+  local selector pods
+  selector=$(kctl -n "$API_NS" get service/payload-pre-processing -o json 2>/dev/null \
+    | jq -r '.spec.selector | to_entries | map("\(.key)=\(.value)") | join(",")')
+  [[ -n "$selector" ]] || return 1
+  pods=$(kctl -n "$API_NS" get pods -l "$selector" -o json 2>/dev/null || printf '{"items":[]}')
+  jq '[.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed")] | length' <<<"$pods"
+}
+
+capture_preauth_diagnostics() {
+  local label=$1 selector gateway_pod
+  kctl -n "$API_NS" get deployment/payload-pre-processing -o json >"$EVIDENCE/preauth-$label-deployment.json" 2>"$EVIDENCE/preauth-$label-deployment.stderr" || true
+  kctl -n "$API_NS" get service/payload-pre-processing -o json >"$EVIDENCE/preauth-$label-service.json" 2>"$EVIDENCE/preauth-$label-service.stderr" || true
+  kctl -n "$API_NS" get endpoints/payload-pre-processing -o json >"$EVIDENCE/preauth-$label-endpoints.json" 2>"$EVIDENCE/preauth-$label-endpoints.stderr" || true
+  kctl -n "$API_NS" get endpointslices -l "kubernetes.io/service-name=payload-pre-processing" -o json >"$EVIDENCE/preauth-$label-endpointslices.json" 2>"$EVIDENCE/preauth-$label-endpointslices.stderr" || true
+  selector=$(kctl -n "$API_NS" get service/payload-pre-processing -o json 2>/dev/null | jq -r '.spec.selector | to_entries | map("\(.key)=\(.value)") | join(",")')
+  if [[ -n "$selector" ]]; then
+    kctl -n "$API_NS" get pods -l "$selector" -o json >"$EVIDENCE/preauth-$label-pods.json" 2>"$EVIDENCE/preauth-$label-pods.stderr" || true
+  else
+    printf '{"items":[]}\n' >"$EVIDENCE/preauth-$label-pods.json"
+    printf 'pre-auth Service has no pod selector\n' >"$EVIDENCE/preauth-$label-pods.stderr"
+  fi
+
+  gateway_pod=$(kctl -n "$API_NS" get pods -l 'gateway.networking.k8s.io/gateway-name=maas-default-gateway' \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [[ -z "$gateway_pod" ]]; then
+    printf 'default Gateway pod not found\n' >"$EVIDENCE/preauth-$label-envoy-admin.stderr"
+    return 0
+  fi
+  printf '%s\n' "$gateway_pod" >"$EVIDENCE/preauth-$label-gateway-pod.txt"
+  timeout 15s kubectl --context "kind-$CLUSTER" -n "$API_NS" exec "pod/$gateway_pod" -c istio-proxy -- \
+    curl -fsS http://127.0.0.1:15000/clusters >"$EVIDENCE/preauth-$label-envoy-clusters.txt" \
+    2>"$EVIDENCE/preauth-$label-envoy-clusters.stderr" || true
+  timeout 15s kubectl --context "kind-$CLUSTER" -n "$API_NS" exec "pod/$gateway_pod" -c istio-proxy -- \
+    curl -fsS 'http://127.0.0.1:15000/clusters?format=json' >"$EVIDENCE/preauth-$label-envoy-clusters.json" \
+    2>"$EVIDENCE/preauth-$label-envoy-clusters-json.stderr" || true
+  timeout 15s kubectl --context "kind-$CLUSTER" -n "$API_NS" exec "pod/$gateway_pod" -c istio-proxy -- \
+    curl -fsS http://127.0.0.1:15000/config_dump >"$EVIDENCE/preauth-$label-envoy-config-dump.json" \
+    2>"$EVIDENCE/preauth-$label-envoy-config-dump.stderr" || true
+  jq -c '[.. | objects | select(.name? == "envoy.filters.http.ext_proc.external-model-pre" or .name? == "envoy.filters.http.ext_proc.ipp-pre") | {name, failure_mode_allow:(.typed_config.failure_mode_allow // null), grpc_service:(.typed_config.grpc_service // null), processing_mode:(.typed_config.processing_mode // null)}]' \
+    "$EVIDENCE/preauth-$label-envoy-config-dump.json" >"$EVIDENCE/preauth-$label-envoy-filter-config.json" 2>"$EVIDENCE/preauth-$label-envoy-filter-config.stderr" || printf '[]\n' >"$EVIDENCE/preauth-$label-envoy-filter-config.json"
+  timeout 15s kubectl --context "kind-$CLUSTER" -n "$API_NS" exec "pod/$gateway_pod" -c istio-proxy -- \
+    curl -fsS 'http://127.0.0.1:15000/stats?format=json' >"$EVIDENCE/preauth-$label-envoy-stats.json" \
+    2>"$EVIDENCE/preauth-$label-envoy-stats.stderr" || true
+  jq -r '[.stats[]? | select((.name // "") | contains("istiocustom.istio_requests_total") and contains("provider-selection-required-demo-model") and contains("response_code.500")) | .value] | add // 0' \
+    "$EVIDENCE/preauth-$label-envoy-stats.json" >"$EVIDENCE/preauth-$label-envoy-500-counter.txt" 2>/dev/null || printf 'unknown\n' >"$EVIDENCE/preauth-$label-envoy-500-counter.txt"
+  jq -r '[.cluster_statuses[]? | select(.name == "payload-pre-processing-extproc") | .host_statuses[]?.stats[]? | select(.name == "cx_connect_fail") | (.value // "0" | tonumber)] | add // 0' \
+    "$EVIDENCE/preauth-$label-envoy-clusters.json" >"$EVIDENCE/preauth-$label-envoy-extproc-connect-fail-counter.txt" 2>/dev/null || printf 'unknown\n' >"$EVIDENCE/preauth-$label-envoy-extproc-connect-fail-counter.txt"
+  jq -r '[.cluster_statuses[]? | select(.name == "payload-pre-processing-extproc") | .host_statuses[]?.stats[]? | select(.name == "rq_error") | (.value // "0" | tonumber)] | add // 0' \
+    "$EVIDENCE/preauth-$label-envoy-clusters.json" >"$EVIDENCE/preauth-$label-envoy-extproc-rq-error-counter.txt" 2>/dev/null || printf 'unknown\n' >"$EVIDENCE/preauth-$label-envoy-extproc-rq-error-counter.txt"
+}
+
+wait_preauth_unavailable() {
+  local ready observed_generation generation live_pods endpoints all_addresses
+  for _ in $(seq 1 180); do
+    ready=$(kctl -n "$API_NS" get deployment/payload-pre-processing -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+    observed_generation=$(kctl -n "$API_NS" get deployment/payload-pre-processing -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)
+    generation=$(kctl -n "$API_NS" get deployment/payload-pre-processing -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
+    live_pods=$(preauth_live_pod_count || printf 'unknown')
+    endpoints=$(preauth_healthy_endpoint_count || printf 'unknown')
+    all_addresses=$(preauth_endpoint_address_count || printf 'unknown')
+    if [[ "${ready:-0}" == 0 && -n "$generation" && "$observed_generation" == "$generation" &&
+      "$live_pods" == 0 && "$endpoints" == 0 && "$all_addresses" == 0 ]]; then
+      printf 'desired_replicas=0 ready_replicas=0 observed_generation=%s generation=%s live_pods_including_terminating=0 ready_endpoints=0 all_endpoint_addresses=0\n' \
+        "$observed_generation" "$generation" >"$EVIDENCE/preauth-unavailable-precondition.txt"
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'desired_replicas=%s ready_replicas=%s observed_generation=%s generation=%s live_pods_including_terminating=%s ready_endpoints=%s all_endpoint_addresses=%s\n' \
+    "$(kctl -n "$API_NS" get deployment/payload-pre-processing -o jsonpath='{.spec.replicas}' 2>/dev/null || printf 'unknown')" \
+    "${ready:-unknown}" "${observed_generation:-unknown}" "${generation:-unknown}" "$live_pods" "$endpoints" "$all_addresses" \
+    >"$EVIDENCE/preauth-unavailable-precondition.txt"
+  return 1
+}
+
 sanitize() {
   local input=$1 output=$2
   jq -c '{id:(.id//null),model:(.model//null),provider:(.provider//.backend//.choices[0].message.content//null),error:(.error.type//null)}|with_entries(select(.value!=null))' "$input" >"$output" 2>/dev/null || printf '{"body":"redacted"}\n' >"$output"
@@ -374,6 +463,15 @@ echo "evidence=$(evidence_label "$EVIDENCE")"
 standalone=true
 for r in deployments/praxis services/praxis configmaps/praxis-config; do kctl get "$r" -A >/dev/null 2>&1 && standalone=false; done
 [[ "$standalone" == true ]] && record 1 standalone_praxis_absent PASS "resources_absent=true" || record 1 standalone_praxis_absent FAIL "resources_present=true"
+if [[ "$SEED_FAILED_HOME_MODEL" == true ]]; then
+  failed_provider_phase=$(kctl -n "$NS" get externalprovider failed-bootstrap-provider -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  failed_model_phase=$(kctl -n "$NS" get externalmodel failed-bootstrap-model -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  if [[ "$failed_provider_phase" == Failed && "$failed_model_phase" == Failed ]]; then
+    record 38 failed_home_model_remains_failed PASS "provider_phase=Failed model_phase=Failed"
+  else
+    record 38 failed_home_model_remains_failed FAIL "provider_phase=${failed_provider_phase:-missing} model_phase=${failed_model_phase:-missing}"
+  fi
+fi
 pre=$(kctl -n "$API_NS" get deploy/payload-pre-processing -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
 post=$(kctl -n "$NS" get "deploy/$EXT_DEPLOYMENT" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
 [[ "$pre" == 1 && "$post" == 1 ]] && record 2 extproc_ready PASS "pre=$pre post=$post" || record 2 extproc_ready FAIL "pre=$pre post=$post"
@@ -415,7 +513,16 @@ key_body="$TMP_DIR/key.json"
 key_status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api.maas-system.svc.cluster.local:$API_PORT:127.0.0.1" -sS -o "$key_body" -w '%{http_code}' --config "$ADMIN_CFG" -H 'content-type: application/json' --data '{"name":"issue39-kind-e2e","ephemeral":true,"subscription":"kind-e2e-subscription"}' "https://maas-api.maas-system.svc.cluster.local:$API_PORT/v1/api-keys" 2>/dev/null||true)
 KEY_ID=$(jq -r '.id//.keyId//.metadata.id//empty' "$key_body" 2>/dev/null||true); KEY_VALUE=$(jq -r '.key//.apiKey//.token//empty' "$key_body" 2>/dev/null||true)
 if [[ "$key_status" == 201 && -n "$KEY_ID" && -n "$KEY_VALUE" ]]; then AUTH_CFG="$TMP_DIR/auth.cfg"; printf 'header = "Authorization: Bearer %s"\n' "$KEY_VALUE">"$AUTH_CFG"; chmod 600 "$AUTH_CFG"; printf 'http_status=201 key_id_present=true key_value_saved=false\n'>"$EVIDENCE/key-created.txt"; record 9 key_created PASS "http=201"; else record 9 key_created FAIL "http=$key_status"; exit 1; fi
-unauth_cfg="$TMP_DIR/unauth.cfg"; :>"$unauth_cfg"; u=$(gateway unauthenticated "$unauth_cfg"); status_assert 10 unauthenticated 401 "$u"
+unauth_cfg="$TMP_DIR/unauth.cfg"; :>"$unauth_cfg"
+unauth_before_a=$(provider_request_count katan-a); unauth_before_b=$(provider_request_count katan-b)
+u=$(gateway unauthenticated "$unauth_cfg")
+unauth_after_a=$(provider_request_count katan-a); unauth_after_b=$(provider_request_count katan-b)
+status_assert 10 unauthenticated 401 "$u"
+if [[ "$u" == 401 && "$unauth_before_a" == "$unauth_after_a" && "$unauth_before_b" == "$unauth_after_b" ]]; then
+  record 39 unauthenticated_provider_isolation PASS "http=401 provider_a_unchanged=true provider_b_unchanged=true"
+else
+  record 39 unauthenticated_provider_isolation FAIL "http=$u provider_a_before=$unauth_before_a provider_a_after=$unauth_after_a provider_b_before=$unauth_before_b provider_b_after=$unauth_after_b"
+fi
 a=$(gateway provider_a "$AUTH_CFG"); status_assert 11 provider_a_request 200 "$a"; write_result request provider_a "$a" "A"
 provider_a_body=$(cat "$EVIDENCE/provider_a-response.json")
 if [[ "$a" == 200 && "$provider_a_body" == *katan-a-* && "$provider_a_body" != *katan-b-* ]]; then
@@ -538,22 +645,59 @@ kctl -n "$NS" patch externalmodel demo-model --type=json -p='[{"op":"remove","pa
 DUPLICATE_ACTIVE=false
 if wait_model_phase Ready && wait_overlay a; then record 33 duplicate_binding_recovery PASS "restored=true"; else record 33 duplicate_binding_recovery FAIL "convergence=false"; exit 1; fi
 
-preauth_before=$(provider_request_count katan-a)
+preauth_before_a=$(provider_request_count katan-a)
+preauth_before_b=$(provider_request_count katan-b)
+capture_preauth_diagnostics before-stop
 kctl -n "$API_NS" scale deployment/payload-pre-processing --replicas=0 >/dev/null
 preauth_stopped=false
-for _ in $(seq 1 60); do
-  ready=$(kctl -n "$API_NS" get deployment/payload-pre-processing -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
-  if [[ -z "$ready" || "$ready" == 0 ]]; then preauth_stopped=true; break; fi
-  sleep 1
-done
+if wait_preauth_unavailable; then preauth_stopped=true; fi
+capture_preauth_diagnostics after-stop
+preauth_500_before=$(cat "$EVIDENCE/preauth-after-stop-envoy-500-counter.txt" 2>/dev/null || printf 'unknown')
+preauth_connect_fail_before=$(cat "$EVIDENCE/preauth-after-stop-envoy-extproc-connect-fail-counter.txt" 2>/dev/null || printf 'unknown')
+preauth_rq_error_before=$(cat "$EVIDENCE/preauth-after-stop-envoy-extproc-rq-error-counter.txt" 2>/dev/null || printf 'unknown')
 conflict_model_cfg="$TMP_DIR/conflict-model.cfg"; printf '%s\n' 'header = "X-Gateway-Model-Name: demo"' >"$conflict_model_cfg"
+preauth_request_id="preauth-unavailable-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+printf 'header = "X-Request-ID: %s"\n' "$preauth_request_id" >>"$conflict_model_cfg"
 trust_status=$(gateway_body preauth_unavailable "$AUTH_CFG" demo unauthorized-model "$conflict_model_cfg")
-preauth_after=$(provider_request_count katan-a)
-printf 'preauth_stopped=%s http=%s provider_requests_before=%s provider_requests_after=%s\n' "$preauth_stopped" "$trust_status" "$preauth_before" "$preauth_after" >"$EVIDENCE/preauth-unavailable.txt"
-if [[ "$preauth_stopped" == true && "$trust_status" != 200 && "$preauth_before" == "$preauth_after" ]]; then
-  record 34 preauth_unavailable_trust_boundary PASS "http=$trust_status provider_contact=false"
+preauth_after_a=$(provider_request_count katan-a)
+preauth_after_b=$(provider_request_count katan-b)
+capture_preauth_diagnostics after-request
+preauth_500_after=$(cat "$EVIDENCE/preauth-after-request-envoy-500-counter.txt" 2>/dev/null || printf 'unknown')
+preauth_connect_fail_after=$(cat "$EVIDENCE/preauth-after-request-envoy-extproc-connect-fail-counter.txt" 2>/dev/null || printf 'unknown')
+preauth_rq_error_after=$(cat "$EVIDENCE/preauth-after-request-envoy-extproc-rq-error-counter.txt" 2>/dev/null || printf 'unknown')
+preauth_500_delta=unknown
+preauth_connect_fail_delta=unknown
+preauth_rq_error_delta=unknown
+if [[ "$preauth_500_before" =~ ^[0-9]+$ && "$preauth_500_after" =~ ^[0-9]+$ ]]; then
+  preauth_500_delta=$((preauth_500_after - preauth_500_before))
+fi
+if [[ "$preauth_connect_fail_before" =~ ^[0-9]+$ && "$preauth_connect_fail_after" =~ ^[0-9]+$ ]]; then
+  preauth_connect_fail_delta=$((preauth_connect_fail_after - preauth_connect_fail_before))
+fi
+if [[ "$preauth_rq_error_before" =~ ^[0-9]+$ && "$preauth_rq_error_after" =~ ^[0-9]+$ ]]; then
+  preauth_rq_error_delta=$((preauth_rq_error_after - preauth_rq_error_before))
+fi
+preauth_filter_fail_closed=$(jq -r 'any(.[]; .name == "envoy.filters.http.ext_proc.external-model-pre" and .failure_mode_allow != true)' \
+  "$EVIDENCE/preauth-after-stop-envoy-filter-config.json" 2>/dev/null || printf 'false')
+preauth_filter_active=$(jq -r '[.. | objects | select(.name? == "models-as-a-service.external-model-demo-model.1") | .typed_per_filter_config["envoy.filters.http.ext_proc.external-model-pre"]? | select(. != null and .disabled != true)] | length > 0' \
+  "$EVIDENCE/preauth-after-stop-envoy-config-dump.json" 2>/dev/null || printf 'false')
+preauth_endpoints_at_request=$(preauth_healthy_endpoint_count || printf 'unknown')
+preauth_all_addresses_at_request=$(preauth_endpoint_address_count || printf 'unknown')
+preauth_pods_at_request=$(preauth_live_pod_count || printf 'unknown')
+preauth_desired_at_request=$(kctl -n "$API_NS" get deployment/payload-pre-processing -o jsonpath='{.spec.replicas}' 2>/dev/null || printf 'unknown')
+printf 'request_id=%s\npreauth_stopped=%s desired_replicas_at_request=%s live_pods_including_terminating_at_request=%s ready_endpoints_at_request=%s all_endpoint_addresses_at_request=%s http=%s response_bytes=%s provider_a_requests_before=%s provider_a_requests_after=%s provider_b_requests_before=%s provider_b_requests_after=%s envoy_500_before=%s envoy_500_after=%s envoy_500_delta=%s extproc_connect_fail_before=%s extproc_connect_fail_after=%s extproc_connect_fail_delta=%s extproc_rq_error_before=%s extproc_rq_error_after=%s extproc_rq_error_delta=%s external_model_pre_filter_fail_closed=%s external_model_pre_route_filter_active=%s\n' \
+  "$preauth_request_id" "$preauth_stopped" "$preauth_desired_at_request" "$preauth_pods_at_request" "$preauth_endpoints_at_request" "$preauth_all_addresses_at_request" "$trust_status" \
+  "$(wc -c <"$TMP_DIR/preauth_unavailable.raw" 2>/dev/null || printf 'unknown')" "$preauth_before_a" "$preauth_after_a" "$preauth_before_b" "$preauth_after_b" \
+  "$preauth_500_before" "$preauth_500_after" "$preauth_500_delta" "$preauth_connect_fail_before" "$preauth_connect_fail_after" "$preauth_connect_fail_delta" \
+  "$preauth_rq_error_before" "$preauth_rq_error_after" "$preauth_rq_error_delta" "$preauth_filter_fail_closed" "$preauth_filter_active" >"$EVIDENCE/preauth-unavailable.txt"
+kctl -n "$API_NS" logs deployment/maas-default-gateway-istio -c istio-proxy --since=2m >"$EVIDENCE/preauth-unavailable-gateway-logs.txt" 2>&1 || true
+if [[ "$preauth_stopped" == true && "$preauth_desired_at_request" == 0 && "$preauth_pods_at_request" == 0 && "$preauth_endpoints_at_request" == 0 && "$preauth_all_addresses_at_request" == 0 &&
+  "$preauth_filter_fail_closed" == true && "$preauth_filter_active" == true && "$trust_status" == 500 && "$preauth_500_delta" == 1 &&
+  "$preauth_connect_fail_delta" == 1 && "$preauth_rq_error_delta" == 1 &&
+  "$preauth_before_a" == "$preauth_after_a" && "$preauth_before_b" == "$preauth_after_b" ]]; then
+  record 34 preauth_unavailable_trust_boundary PASS "http=500 envoy_500_delta=1 extproc_connect_fail_delta=1 extproc_rq_error_delta=1 fail_closed=true provider_a_contact=false provider_b_contact=false"
 else
-  record 34 preauth_unavailable_trust_boundary FAIL "stopped=$preauth_stopped http=$trust_status provider_contact=$([[ "$preauth_before" == "$preauth_after" ]] && echo false || echo true)"
+  record 34 preauth_unavailable_trust_boundary FAIL "stopped=$preauth_stopped desired=$preauth_desired_at_request pods=$preauth_pods_at_request ready_endpoints=$preauth_endpoints_at_request all_endpoint_addresses=$preauth_all_addresses_at_request http=$trust_status envoy_500_delta=$preauth_500_delta extproc_connect_fail_delta=$preauth_connect_fail_delta extproc_rq_error_delta=$preauth_rq_error_delta filter_fail_closed=$preauth_filter_fail_closed filter_active=$preauth_filter_active provider_a_contact=$([[ "$preauth_before_a" == "$preauth_after_a" ]] && echo false || echo true) provider_b_contact=$([[ "$preauth_before_b" == "$preauth_after_b" ]] && echo false || echo true)"
 fi
 kctl -n "$API_NS" scale deployment/payload-pre-processing --replicas=1 >/dev/null
 preauth_restored=false
