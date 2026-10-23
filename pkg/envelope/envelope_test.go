@@ -262,6 +262,24 @@ func TestRender_AzureOpenAIChatMapsToApikeyWithHeaderOverride(t *testing.T) {
 	}
 }
 
+func TestIsQualifiedAuthHeader(t *testing.T) {
+	// Exactly the non-empty headers StrategyFor emits are qualified; the empty
+	// header (bearer_token, none injected) and any other value are not, so a
+	// consumer can reject an untrusted or unrecognized header annotation.
+	for header, want := range map[string]bool{
+		"api-key":         true,
+		"x-api-key":       true,
+		"":                false,
+		"authorization":   false,
+		"Authorization":   false,
+		"x-forwarded-for": false,
+	} {
+		if got := IsQualifiedAuthHeader(header); got != want {
+			t.Errorf("IsQualifiedAuthHeader(%q) = %t, want %t", header, got, want)
+		}
+	}
+}
+
 func TestRender_CredentialOmittedForUnmappedAuth(t *testing.T) {
 	// SigV4 and OAuth2 have no supported wire mapping and must fail closed.
 	for _, authType := range []string{"sigv4", "oauth2"} {

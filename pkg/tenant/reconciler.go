@@ -810,8 +810,17 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 				return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
 			}
 			// Credential.Header is json:"-" and is lost on the overlay round-trip;
-			// restore it from the trusted copy Secret stamped at attach time.
-			candidate.Credential.Header = copySecret.GetAnnotations()[AnnotationCredentialHeader]
+			// restore it from the copy Secret stamped at attach time — but only from
+			// a Secret marked as a credential copy, and only when the stamped value is
+			// a header the controller qualifies. A header annotation on an untrusted
+			// or unexpected Secret in the tenant namespace must never drive
+			// credential_inject; an unrecognized value leaves the header unset
+			// (bearer_token semantics), failing closed rather than injecting it.
+			if copySecret.GetLabels()[LabelCredentialCopy] == "true" {
+				if header := copySecret.GetAnnotations()[AnnotationCredentialHeader]; envelope.IsQualifiedAuthHeader(header) {
+					candidate.Credential.Header = header
+				}
+			}
 		}
 		attached = append(attached, candidate)
 	}

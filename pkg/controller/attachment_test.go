@@ -1488,6 +1488,55 @@ func TestSharedSecretWithDivergentHeadersGetsDistinctCopies(t *testing.T) {
 	}
 }
 
+func TestCrossNamespaceAzureOverrideSecretGetsHeaderedCopy(t *testing.T) {
+	// A tenant's own model references a cross-namespace Azure provider but brings
+	// its own credential with a model-local override Secret. The override Secret
+	// lives in the tenant namespace, so it would otherwise be mounted directly —
+	// but azure+openai-chat qualifies to the api-key header, which survives the
+	// overlay round-trip only on a copy Secret's annotation (Credential.Header is
+	// not serialized). localizeRoutes must still copy such a tenant-local Secret
+	// so attachedOverlayCandidates can restore the header; skipping the copy would
+	// drop the api-key header and break Azure auth.
+	azure := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "shared", UID: types.UID("provider-azure-shared")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+	}
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	model.Spec.ExternalProviderRefs[0].Ref.Name = "azure"
+	// A model-local override: the resolver leaves SecretNamespace empty, so the
+	// Secret is read from the model (tenant) namespace.
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	modelSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "model-key", Namespace: "tenant-b"}, Data: map[string][]byte{"api-key": []byte("sk-model-local")}}
+	objects := append([]client.Object{azure, modelSecret, model, referenceGrant("shared", "tenant-b", "azure")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("status = %q/%q %q", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+
+	// Source namespace is the tenant namespace (model-local override), yet the
+	// headered credential is still copied, carrying its header annotation.
+	copyName := credentialCopyName("tenant-b", "tenant-b", "model-key", "api-key", "api-key")
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: copyName}, &copied); err != nil {
+		t.Fatalf("model-local override copy for a cross-namespace Azure provider: %v", err)
+	}
+	if got := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("copy header annotation = %q, want api-key", got)
+	}
+	if string(copied.Data["api-key"]) != "sk-model-local" {
+		t.Fatalf("copy value = %q, want the model-local override", copied.Data["api-key"])
+	}
+	candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+	if len(candidates) != 1 || candidates[0].StableID != "tenant-b/chat/shared/azure" ||
+		candidates[0].Credential == nil || candidates[0].Credential.SecretRef.Name != copyName {
+		t.Fatalf("overlay candidates = %#v, want the headered copy", candidates)
+	}
+}
+
 func TestServedBearerAttachmentOmitsCredentialHeaderAnnotation(t *testing.T) {
 	// openai + openai-chat qualifies to bearer_token, whose header is fixed
 	// data-plane side; no header annotation is stamped on the copy Secret.

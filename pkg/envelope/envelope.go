@@ -394,6 +394,22 @@ var defaultAuthHeaders = map[string]string{
 	"azure-openai": "api-key",
 }
 
+// IsQualifiedAuthHeader reports whether header is a provider-boundary request
+// header the controller qualifies for apikey credential injection — one of the
+// values StrategyFor emits (see defaultAuthHeaders). The empty header is not
+// qualified here: it means "no injected header" (bearer_token fixes
+// Authorization filter-side), which callers treat as the absence of a header
+// rather than a value to validate. It lets a consumer reject an untrusted or
+// unrecognized header annotation before it drives credential_inject.
+func IsQualifiedAuthHeader(header string) bool {
+	for _, qualified := range defaultAuthHeaders {
+		if qualified == header {
+			return true
+		}
+	}
+	return false
+}
+
 // StrategyFor maps only the currently qualified provider API-key contracts to
 // Praxis wire strategies, returning the strategy and — for apikey strategies —
 // the provider-boundary header the credential_inject filter must inject into

@@ -864,14 +864,23 @@ func localizeRoutes(tenantNamespace string, routes []resolver.Route) []credentia
 			continue
 		}
 		route.StableID = envelope.ScopedStableID(route.Namespace, route.Model, route.ProviderNamespace, route.Provider)
-		source := route.SecretRefNamespace()
-		if route.AuthType == "" || source == tenantNamespace {
+		if route.AuthType == "" {
 			continue
 		}
 		// ValidateModel above has already qualified the strategy, so deriving the
 		// provider-boundary header here cannot fail. It is carried onto the copy
 		// Secret because Credential.Header does not survive the overlay round-trip.
 		_, header, _ := envelope.StrategyFor(*route)
+		source := route.SecretRefNamespace()
+		// A Secret already in the tenant namespace is mounted directly — unless it
+		// carries a provider-boundary header (Azure api-key, Anthropic x-api-key).
+		// That header survives the overlay round-trip only on the copy Secret's
+		// annotation, which attachedOverlayCandidates reads back, so a headered
+		// credential still needs a copy even when its Secret is tenant-local (e.g.
+		// a model-local override Secret for a cross-namespace Azure provider).
+		if source == tenantNamespace && header == "" {
+			continue
+		}
 		copied := credentialCopy{
 			// The header is part of the copy identity (credentialCopyName), so two
 			// providers that share a source Secret but diverge on the injected
