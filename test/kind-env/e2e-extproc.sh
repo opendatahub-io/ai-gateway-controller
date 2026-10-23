@@ -15,8 +15,10 @@ EXT_DEPLOYMENT=payload-processing-external-model
 EXT_SERVICE=payload-processing-external-model
 EXT_CONFIG=payload-processing-external-model-plugins
 SEED_FAILED_HOME_MODEL=${LOCAL_ENV_SEED_FAILED_HOME_MODEL:-false}
+PROVIDER_LOG_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 mkdir -p "$EVIDENCE"
 exec > >(tee "$EVIDENCE/e2e.log") 2>&1
+printf 'since_time=%s\n' "$PROVIDER_LOG_SINCE" >"$EVIDENCE/provider-request-count-window.txt"
 evidence_label() {
   case "$1" in
     "$ROOT"/*) printf '%s\n' "${1#"$ROOT"/}" ;;
@@ -435,9 +437,13 @@ print(f"chunks={n} first_ms={first or 0:.0f} last_ms={last or 0:.0f} status={sta
 }
 
 provider_request_count() {
-  local deployment=$1
-  timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "deploy/$deployment" --tail=300 2>/dev/null |
-    rg -c 'POST /v1/chat/completions' || true
+  local deployment=$1 logs
+  if ! logs=$(timeout 15s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "deploy/$deployment" \
+    --since-time="$PROVIDER_LOG_SINCE" 2>>"$EVIDENCE/provider-request-count-$deployment.stderr"); then
+    printf 'cannot read %s provider logs for request count\n' "$deployment" >&2
+    return 1
+  fi
+  awk '/POST \/v1\/chat\/completions/ { count++ } END { print count+0 }' <<<"$logs"
 }
 
 write_model_override_secret() {
@@ -514,11 +520,13 @@ key_status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-
 KEY_ID=$(jq -r '.id//.keyId//.metadata.id//empty' "$key_body" 2>/dev/null||true); KEY_VALUE=$(jq -r '.key//.apiKey//.token//empty' "$key_body" 2>/dev/null||true)
 if [[ "$key_status" == 201 && -n "$KEY_ID" && -n "$KEY_VALUE" ]]; then AUTH_CFG="$TMP_DIR/auth.cfg"; printf 'header = "Authorization: Bearer %s"\n' "$KEY_VALUE">"$AUTH_CFG"; chmod 600 "$AUTH_CFG"; printf 'http_status=201 key_id_present=true key_value_saved=false\n'>"$EVIDENCE/key-created.txt"; record 9 key_created PASS "http=201"; else record 9 key_created FAIL "http=$key_status"; exit 1; fi
 unauth_cfg="$TMP_DIR/unauth.cfg"; :>"$unauth_cfg"
-unauth_before_a=$(provider_request_count katan-a); unauth_before_b=$(provider_request_count katan-b)
+unauth_before_a=$(provider_request_count katan-a || printf 'unknown'); unauth_before_b=$(provider_request_count katan-b || printf 'unknown')
 u=$(gateway unauthenticated "$unauth_cfg")
-unauth_after_a=$(provider_request_count katan-a); unauth_after_b=$(provider_request_count katan-b)
+unauth_after_a=$(provider_request_count katan-a || printf 'unknown'); unauth_after_b=$(provider_request_count katan-b || printf 'unknown')
 status_assert 10 unauthenticated 401 "$u"
-if [[ "$u" == 401 && "$unauth_before_a" == "$unauth_after_a" && "$unauth_before_b" == "$unauth_after_b" ]]; then
+if [[ "$u" == 401 && "$unauth_before_a" =~ ^[0-9]+$ && "$unauth_after_a" =~ ^[0-9]+$ &&
+  "$unauth_before_b" =~ ^[0-9]+$ && "$unauth_after_b" =~ ^[0-9]+$ &&
+  "$unauth_before_a" == "$unauth_after_a" && "$unauth_before_b" == "$unauth_after_b" ]]; then
   record 39 unauthenticated_provider_isolation PASS "http=401 provider_a_unchanged=true provider_b_unchanged=true"
 else
   record 39 unauthenticated_provider_isolation FAIL "http=$u provider_a_before=$unauth_before_a provider_a_after=$unauth_after_a provider_b_before=$unauth_before_b provider_b_after=$unauth_after_b"
@@ -645,8 +653,8 @@ kctl -n "$NS" patch externalmodel demo-model --type=json -p='[{"op":"remove","pa
 DUPLICATE_ACTIVE=false
 if wait_model_phase Ready && wait_overlay a; then record 33 duplicate_binding_recovery PASS "restored=true"; else record 33 duplicate_binding_recovery FAIL "convergence=false"; exit 1; fi
 
-preauth_before_a=$(provider_request_count katan-a)
-preauth_before_b=$(provider_request_count katan-b)
+preauth_before_a=$(provider_request_count katan-a || printf 'unknown')
+preauth_before_b=$(provider_request_count katan-b || printf 'unknown')
 capture_preauth_diagnostics before-stop
 kctl -n "$API_NS" scale deployment/payload-pre-processing --replicas=0 >/dev/null
 preauth_stopped=false
@@ -659,8 +667,8 @@ conflict_model_cfg="$TMP_DIR/conflict-model.cfg"; printf '%s\n' 'header = "X-Gat
 preauth_request_id="preauth-unavailable-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 printf 'header = "X-Request-ID: %s"\n' "$preauth_request_id" >>"$conflict_model_cfg"
 trust_status=$(gateway_body preauth_unavailable "$AUTH_CFG" demo unauthorized-model "$conflict_model_cfg")
-preauth_after_a=$(provider_request_count katan-a)
-preauth_after_b=$(provider_request_count katan-b)
+preauth_after_a=$(provider_request_count katan-a || printf 'unknown')
+preauth_after_b=$(provider_request_count katan-b || printf 'unknown')
 capture_preauth_diagnostics after-request
 preauth_500_after=$(cat "$EVIDENCE/preauth-after-request-envoy-500-counter.txt" 2>/dev/null || printf 'unknown')
 preauth_connect_fail_after=$(cat "$EVIDENCE/preauth-after-request-envoy-extproc-connect-fail-counter.txt" 2>/dev/null || printf 'unknown')
@@ -694,10 +702,12 @@ kctl -n "$API_NS" logs deployment/maas-default-gateway-istio -c istio-proxy --si
 if [[ "$preauth_stopped" == true && "$preauth_desired_at_request" == 0 && "$preauth_pods_at_request" == 0 && "$preauth_endpoints_at_request" == 0 && "$preauth_all_addresses_at_request" == 0 &&
   "$preauth_filter_fail_closed" == true && "$preauth_filter_active" == true && "$trust_status" == 500 && "$preauth_500_delta" == 1 &&
   "$preauth_connect_fail_delta" == 1 && "$preauth_rq_error_delta" == 1 &&
+  "$preauth_before_a" =~ ^[0-9]+$ && "$preauth_after_a" =~ ^[0-9]+$ &&
+  "$preauth_before_b" =~ ^[0-9]+$ && "$preauth_after_b" =~ ^[0-9]+$ &&
   "$preauth_before_a" == "$preauth_after_a" && "$preauth_before_b" == "$preauth_after_b" ]]; then
   record 34 preauth_unavailable_trust_boundary PASS "http=500 envoy_500_delta=1 extproc_connect_fail_delta=1 extproc_rq_error_delta=1 fail_closed=true provider_a_contact=false provider_b_contact=false"
 else
-  record 34 preauth_unavailable_trust_boundary FAIL "stopped=$preauth_stopped desired=$preauth_desired_at_request pods=$preauth_pods_at_request ready_endpoints=$preauth_endpoints_at_request all_endpoint_addresses=$preauth_all_addresses_at_request http=$trust_status envoy_500_delta=$preauth_500_delta extproc_connect_fail_delta=$preauth_connect_fail_delta extproc_rq_error_delta=$preauth_rq_error_delta filter_fail_closed=$preauth_filter_fail_closed filter_active=$preauth_filter_active provider_a_contact=$([[ "$preauth_before_a" == "$preauth_after_a" ]] && echo false || echo true) provider_b_contact=$([[ "$preauth_before_b" == "$preauth_after_b" ]] && echo false || echo true)"
+  record 34 preauth_unavailable_trust_boundary FAIL "stopped=$preauth_stopped desired=$preauth_desired_at_request pods=$preauth_pods_at_request ready_endpoints=$preauth_endpoints_at_request all_endpoint_addresses=$preauth_all_addresses_at_request http=$trust_status envoy_500_delta=$preauth_500_delta extproc_connect_fail_delta=$preauth_connect_fail_delta extproc_rq_error_delta=$preauth_rq_error_delta filter_fail_closed=$preauth_filter_fail_closed filter_active=$preauth_filter_active provider_a_before=$preauth_before_a provider_a_after=$preauth_after_a provider_b_before=$preauth_before_b provider_b_after=$preauth_after_b"
 fi
 kctl -n "$API_NS" scale deployment/payload-pre-processing --replicas=1 >/dev/null
 preauth_restored=false
