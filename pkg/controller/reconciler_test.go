@@ -1515,6 +1515,144 @@ func TestValidateResolvedCredentialsUsesEffectiveModelOverride(t *testing.T) {
 	}
 }
 
+func TestMissingModelCredentialOverrideHasDistinctReadinessReason(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{
+		Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-override"},
+	}
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if !errors.Is(err, errModelCredentialOverrideNotReady) {
+		t.Fatalf("missing model credential reconcile = %v, want credential readiness error", err)
+	}
+	var failed v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status.Phase != "Failed" || failed.Status.ObservedGeneration != failed.Generation ||
+		!hasConditionReason(failed.Status.Conditions, conditionReady, reasonModelCredentialNotReady) {
+		t.Fatalf("missing override status = %#v, want current Failed/%s", failed.Status, reasonModelCredentialNotReady)
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("missing-credential candidate was published: overlay lookup error = %v, want NotFound", err)
+	}
+}
+
+func TestTransientModelCredentialReadPreservesServingCandidate(t *testing.T) {
+	ctx := context.Background()
+	r, model := reconcilerFixture(t)
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{
+		Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-override"},
+	}
+	if err := r.Update(ctx, model); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "model-override", Namespace: model.Namespace},
+		Data:       map[string][]byte{"api-key": []byte("fixture-only-secret")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: model.Namespace, Name: "provider"}}); err != nil {
+		t.Fatal(err)
+	}
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("publish serving model: %v", err)
+	}
+	var before corev1.ConfigMap
+	key := client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}
+	if err := r.Get(ctx, key, &before); err != nil {
+		t.Fatal(err)
+	}
+
+	r.APIReader = failingSecretReader{Reader: r.APIReader}
+	if _, err := r.Reconcile(ctx, req); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("transient credential read error = %v, want retryable ServiceUnavailable", err)
+	}
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady || readyReason(got) == reasonModelCredentialNotReady {
+		t.Fatalf("transient read changed serving model status: %#v", got.Status)
+	}
+	var after corev1.ConfigMap
+	if err := r.Get(ctx, key, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Data["routing-overlay.json"] != before.Data["routing-overlay.json"] {
+		t.Fatal("transient credential read changed the serving overlay")
+	}
+}
+
+func TestMissingModelCredentialDoesNotBlockHealthySiblingReconcile(t *testing.T) {
+	ctx := context.Background()
+	r, healthy := reconcilerFixture(t)
+	providerKey := client.ObjectKey{Namespace: healthy.Namespace, Name: "provider"}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: providerKey}); err != nil {
+		t.Fatalf("reconcile healthy provider: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
+		t.Fatalf("publish the initial healthy candidate: %v", err)
+	}
+	var initialOverlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &initialOverlay); err != nil {
+		t.Fatalf("get initial healthy overlay: %v", err)
+	}
+	initialOverlayData := initialOverlay.Data["routing-overlay.json"]
+
+	bad := healthy.DeepCopy()
+	bad.Name, bad.UID, bad.ResourceVersion = "missing-credential-model", "missing-credential-model-uid", ""
+	bad.Status = v1alpha1.ExternalModelStatus{}
+	bad.Spec.ModelName = "missing-credential-model"
+	bad.Spec.ExternalProviderRefs = append([]v1alpha1.ExternalProviderRef(nil), healthy.Spec.ExternalProviderRefs...)
+	bad.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{
+		Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "missing-model-override"},
+	}
+	if err := r.Create(ctx, bad); err != nil {
+		t.Fatalf("create model with missing credential override: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bad)}); !errors.Is(err, errModelCredentialOverrideNotReady) {
+		t.Fatalf("reconcile missing-credential model = %v, want credential readiness error", err)
+	}
+	if got := getModel(t, r, bad); readyReason(got) != reasonModelCredentialNotReady {
+		t.Fatalf("missing-credential model reason = %q, want %q", readyReason(got), reasonModelCredentialNotReady)
+	}
+	var preservedOverlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &preservedOverlay); err != nil {
+		t.Fatalf("get overlay after failed new model: %v", err)
+	}
+	if got := preservedOverlay.Data["routing-overlay.json"]; got != initialOverlayData {
+		t.Fatal("failed new model changed the last-known-good overlay")
+	}
+
+	// A later healthy sibling reconciliation must ignore the rejected model
+	// candidate and publish the healthy model's current configuration.
+	updated := getModel(t, r, healthy)
+	updated.Spec.ModelName = "healthy-updated"
+	if err := r.Update(ctx, updated); err != nil {
+		t.Fatalf("update healthy sibling: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
+		t.Fatalf("healthy sibling reconcile beside missing-credential model = %v", err)
+	}
+	if got := getModel(t, r, healthy); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("healthy sibling phase = %q, want Ready", got.Status.Phase)
+	}
+	if got := getModel(t, r, bad); readyReason(got) != reasonModelCredentialNotReady {
+		t.Fatalf("missing-credential sibling reason after healthy reconcile = %q, want %q", readyReason(got), reasonModelCredentialNotReady)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("get healthy sibling overlay: %v", err)
+	}
+	if strings.Contains(overlay.Data["routing-overlay.json"], "missing-credential-model") ||
+		!strings.Contains(overlay.Data["routing-overlay.json"], "healthy-updated") ||
+		!strings.Contains(overlay.Data["routing-overlay.json"], healthy.Name) {
+		t.Fatalf("overlay must contain the updated healthy model and exclude the rejected sibling: %s", overlay.Data["routing-overlay.json"])
+	}
+}
+
 func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
@@ -2409,6 +2547,70 @@ func TestProviderReadinessIsReconciledIndependentlyFromModels(t *testing.T) {
 	var overlay corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
 		t.Fatalf("routing overlay after provider transport is ready = %v", err)
+	}
+}
+
+func TestFailedHomeModelRemainsFailedBesideHealthySibling(t *testing.T) {
+	r, healthyModel := reconcilerFixture(t)
+	ctx := context.Background()
+	providerKey := client.ObjectKey{Namespace: "tenant-a", Name: "provider"}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: providerKey}); err != nil {
+		t.Fatalf("reconcile healthy provider: %v", err)
+	}
+
+	failedProvider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-provider", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "failed.example.com"},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: providerPhaseFailed},
+	}
+	failedModel := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-model", Namespace: "tenant-a"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: failedProvider.Name}, TargetModel: "failed-upstream",
+			APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}
+	if err := r.Create(ctx, failedProvider); err != nil {
+		t.Fatalf("create failed provider: %v", err)
+	}
+	if err := r.Create(ctx, failedModel); err != nil {
+		t.Fatalf("create failed model: %v", err)
+	}
+
+	failedRequest := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(failedModel)}
+	if _, err := r.Reconcile(ctx, failedRequest); err != nil {
+		t.Fatalf("reconcile failed model beside healthy sibling: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthyModel)}); err != nil {
+		t.Fatalf("reconcile healthy sibling: %v", err)
+	}
+
+	var gotFailed v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(failedModel), &gotFailed); err != nil {
+		t.Fatal(err)
+	}
+	if gotFailed.Status.Phase != "Failed" {
+		t.Fatalf("failed model phase = %q, want Failed", gotFailed.Status.Phase)
+	}
+	var gotHealthy v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthyModel), &gotHealthy); err != nil {
+		t.Fatal(err)
+	}
+	if gotHealthy.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("healthy sibling phase = %q, want Ready", gotHealthy.Status.Phase)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("get shared routing overlay: %v", err)
+	}
+	if !strings.Contains(overlay.Data["routing-overlay.json"], "provider-provider") ||
+		strings.Contains(overlay.Data["routing-overlay.json"], "provider-failed-provider") {
+		t.Fatalf("shared overlay does not contain only the healthy provider candidate: %s", overlay.Data["routing-overlay.json"])
+	}
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(healthyModel.Name)}, route); err != nil {
+		t.Fatalf("healthy sibling HTTPRoute was not retained: %v", err)
 	}
 }
 
