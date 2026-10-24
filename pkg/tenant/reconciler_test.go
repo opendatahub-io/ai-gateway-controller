@@ -326,6 +326,67 @@ func TestRejectedHomeModelDoesNotBlockAttachmentRuntime(t *testing.T) {
 	}
 }
 
+func TestModelCredentialFailureDoesNotBlockHealthySiblingCandidate(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	rejected := openAIExternalModel("missing-credential-model", namespace, "rejected-provider")
+	rejected.Generation = 2
+	rejected.Status.ObservedGeneration = 2
+	rejected.Status.Phase = "Failed"
+	rejected.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: reasonModelCredentialNotReady}}
+	rejectedProvider := openAIExternalProvider("rejected-provider", namespace, resolver.PhaseReady)
+	healthy := openAIExternalModel("healthy-model", namespace, "healthy-provider")
+	healthyProvider := openAIExternalProvider("healthy-provider", namespace, resolver.PhaseReady)
+	overlay := externalModelOverlay(t, namespace, []*v1alpha1.ExternalModel{healthy}, []*v1alpha1.ExternalProvider{healthyProvider})
+	r, rec := newPraxisReconcileFixture(t, namespace, rejected, rejectedProvider, healthy, healthyProvider, overlay)
+
+	result, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || result.RequeueAfter != time.Hour {
+		t.Fatalf("reconcile healthy sibling beside pre-publication credential failure = %#v, %v; want healthy apply", result, err)
+	}
+	cm := recordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), namespace)
+	config, found, err := unstructured.NestedString(cm.Object, "data", "extproc.yaml")
+	if err != nil || !found || !strings.Contains(config, `provider_hop_clusters: ["provider-healthy-provider"]`) || strings.Contains(config, "provider-rejected-provider") {
+		t.Fatalf("runtime config must serve only the published healthy sibling: found=%t err=%v config=%q", found, err, config)
+	}
+}
+
+func TestProviderNotReadyModelWithPublishedCandidateRemainsEligible(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	model := openAIExternalModel("partially-served-model", namespace, "published-provider", "unready-provider")
+	model.Generation = 3
+	model.Status.ObservedGeneration = 3
+	model.Status.Phase = "Failed"
+	model.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ProviderNotReady"}}
+	published := openAIExternalProvider("published-provider", namespace, resolver.PhaseReady)
+	unready := openAIExternalProvider("unready-provider", namespace, "Failed")
+	overlay := externalModelOverlay(t, namespace, []*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{published})
+	r, rec := newPraxisReconcileFixture(t, namespace, model, published, unready, overlay)
+
+	_, required, unavailable, rejected, err := r.providersForTenant(context.Background(), namespace, "gateway", "gateway-ns", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedID := envelope.CandidateStableID(model.Name, published.Name)
+	unreadyID := envelope.CandidateStableID(model.Name, unready.Name)
+	if !required[publishedID] || !unavailable[unreadyID] || rejected[publishedID] || rejected[unreadyID] {
+		t.Fatalf("ProviderNotReady candidate classification: required=%v unavailable=%v rejected=%v", required, unavailable, rejected)
+	}
+	if ready, reason, err := r.routingOverlayReady(context.Background(), namespace, required, unavailable, rejected); err != nil || !ready {
+		t.Fatalf("overlay with the model's published healthy candidate: ready=%t reason=%q err=%v", ready, reason, err)
+	}
+	result, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || result.RequeueAfter != time.Hour {
+		t.Fatalf("reconcile ProviderNotReady model with published candidate = %#v, %v; want eligible apply", result, err)
+	}
+	cm := recordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), namespace)
+	config, found, err := unstructured.NestedString(cm.Object, "data", "extproc.yaml")
+	if err != nil || !found || !strings.Contains(config, `provider_hop_clusters: ["provider-published-provider"]`) || strings.Contains(config, "provider-unready-provider") {
+		t.Fatalf("runtime config must retain the published ProviderNotReady model candidate: found=%t err=%v config=%q", found, err, config)
+	}
+}
+
 func TestAttachmentWaitsWhileFormerHomeCandidateRemainsPublished(t *testing.T) {
 	requireManifests(t)
 	const namespace = "tenant-ns"
@@ -865,32 +926,36 @@ func TestReconcileServesHealthyModelBesideCurrentFailedModelWithReadyProviders(t
 
 func TestCurrentFailedModelCandidateStillInOverlayRetainsLastKnownGoodExtProc(t *testing.T) {
 	requireManifests(t)
-	const tenantNamespace = "tenant-ns"
-	refs := []string{"provider-a", "provider-b", "provider-c", "provider-d", "provider-e", "provider-f", "provider-g", "provider-h"}
-	model := openAIExternalModel("rejected-model", tenantNamespace, refs...)
-	model.Generation = 2
-	model.Status.ObservedGeneration = 2
-	model.Status.Phase = "Failed"
-	model.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ReconcileFailed"}}
-	providers := make([]*v1alpha1.ExternalProvider, 0, len(refs))
-	for _, name := range refs {
-		providers = append(providers, openAIExternalProvider(name, tenantNamespace, resolver.PhaseReady))
-	}
-	// This represents a prior serving overlay that must remain paired with its
-	// last-known-good ExtProc config until the model controller withdraws it.
-	overlay := externalModelOverlay(t, tenantNamespace, []*v1alpha1.ExternalModel{model}, providers)
-	objects := []client.Object{model, overlay}
-	for _, provider := range providers {
-		objects = append(objects, provider)
-	}
-	r, rec := newPraxisReconcileFixture(t, tenantNamespace, objects...)
+	for _, reason := range []string{"ReconcileFailed", reasonModelCredentialNotReady} {
+		t.Run(reason, func(t *testing.T) {
+			const tenantNamespace = "tenant-ns"
+			refs := []string{"provider-a", "provider-b", "provider-c", "provider-d", "provider-e", "provider-f", "provider-g", "provider-h"}
+			model := openAIExternalModel("rejected-model", tenantNamespace, refs...)
+			model.Generation = 2
+			model.Status.ObservedGeneration = 2
+			model.Status.Phase = "Failed"
+			model.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: reason}}
+			providers := make([]*v1alpha1.ExternalProvider, 0, len(refs))
+			for _, name := range refs {
+				providers = append(providers, openAIExternalProvider(name, tenantNamespace, resolver.PhaseReady))
+			}
+			// This represents a prior serving overlay that must remain paired with its
+			// last-known-good ExtProc config until the model controller withdraws it.
+			overlay := externalModelOverlay(t, tenantNamespace, []*v1alpha1.ExternalModel{model}, providers)
+			objects := []client.Object{model, overlay}
+			for _, provider := range providers {
+				objects = append(objects, provider)
+			}
+			r, rec := newPraxisReconcileFixture(t, tenantNamespace, objects...)
 
-	result, err := r.Reconcile(context.Background(), mtcRequest(tenantNamespace))
-	if err != nil || result.RequeueAfter != constants.NotReadyRequeueInterval {
-		t.Fatalf("reconcile with rejected candidate still in overlay = result %#v, err %v; want shared apply and route retry", result, err)
+			result, err := r.Reconcile(context.Background(), mtcRequest(tenantNamespace))
+			if err != nil || result.RequeueAfter != constants.NotReadyRequeueInterval {
+				t.Fatalf("reconcile with rejected candidate still in overlay = result %#v, err %v; want shared apply and route retry", result, err)
+			}
+			assertRecordedResource(t, rec, gvkEnvoyFilter, PayloadProcessingEnvoyFilterName("redteam"), "gateway-ns")
+			assertNoRecordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), tenantNamespace)
+		})
 	}
-	assertRecordedResource(t, rec, gvkEnvoyFilter, PayloadProcessingEnvoyFilterName("redteam"), "gateway-ns")
-	assertNoRecordedResource(t, rec, gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), tenantNamespace)
 }
 
 func TestReconcileRecoversWhenFailedProviderAndOverlayBecomeReady(t *testing.T) {

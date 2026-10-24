@@ -110,6 +110,8 @@ type Reconciler struct {
 	Log logr.Logger
 }
 
+const reasonModelCredentialNotReady = "ModelCredentialNotReady" //nolint:gosec // status reason, not a credential value
+
 // SetupWithManager registers the MaasTenantConfig watch (primary trigger)
 // and a secondary AITenant watch mapped back to the owning MaasTenantConfig,
 // mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
@@ -672,7 +674,7 @@ func (r *Reconciler) providersForTenant(
 	unavailable := map[string]bool{}
 	rejectedModelCandidates := map[string]bool{}
 	for i := range models {
-		rejectedModel := modelHasCurrentReconcileFailure(&models[i])
+		rejectedModel := modelHasCurrentRejectedCandidate(&models[i])
 		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
@@ -707,17 +709,18 @@ func (r *Reconciler) providersForTenant(
 	return result, required, unavailable, rejectedModelCandidates, nil
 }
 
-// modelHasCurrentReconcileFailure recognizes a current-generation model that
+// modelHasCurrentRejectedCandidate recognizes a current-generation model that
 // the ExternalModel reconciler rejected before publishing its routes (for
-// example, because its HTTPRoute would exceed the Gateway API rule limit).
-// ProviderNotReady is deliberately excluded: that path can publish healthy
-// sibling references from the same model.
-func modelHasCurrentReconcileFailure(model *v1alpha1.ExternalModel) bool {
+// example, because its HTTPRoute would exceed the Gateway API rule limit or an
+// effective model credential is unavailable). ProviderNotReady is deliberately
+// excluded: that path can publish healthy references from the same model.
+func modelHasCurrentRejectedCandidate(model *v1alpha1.ExternalModel) bool {
 	if model == nil || model.Status.Phase != "Failed" || model.Status.ObservedGeneration != model.Generation {
 		return false
 	}
 	ready := apiMeta.FindStatusCondition(model.Status.Conditions, "Ready")
-	return ready != nil && ready.Status == metav1.ConditionFalse && ready.Reason == "ReconcileFailed"
+	return ready != nil && ready.Status == metav1.ConditionFalse &&
+		(ready.Reason == "ReconcileFailed" || ready.Reason == reasonModelCredentialNotReady)
 }
 
 func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, bool, error) {
@@ -731,10 +734,10 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
 	for i := range models {
-		// A current-generation reconciliation failure cannot publish this
-		// model's routes. Resolve the remaining models independently; overlay
-		// readiness below waits if an older route for this model still exists.
-		if modelHasCurrentReconcileFailure(&models[i]) {
+		// A current-generation rejected candidate cannot be published from this
+		// model. Resolve the remaining models independently; overlay readiness
+		// below waits if an older route for this model still exists.
+		if modelHasCurrentRejectedCandidate(&models[i]) {
 			continue
 		}
 		// Providers in other namespaces are loaded from the published overlay

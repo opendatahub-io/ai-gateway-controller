@@ -259,8 +259,8 @@ func TestAttachedModelOverrideCredentialIsModelLocalWithoutFallback(t *testing.T
 		t.Fatal(err)
 	}
 	reconcileModel(t, r, model)
-	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady || !strings.Contains(readyMessage(got), "team/openai-key") {
-		t.Fatalf("status = %q %q, want the missing model-local Secret", readyReason(got), readyMessage(got))
+	if got := getModel(t, r, model); readyReason(got) != reasonModelCredentialNotReady || !strings.Contains(readyMessage(got), "team/openai-key") {
+		t.Fatalf("status = %q %q, want %s for the missing model-local Secret", readyReason(got), readyMessage(got), reasonModelCredentialNotReady)
 	}
 	for _, name := range []string{modelCopy, sharedCopy} {
 		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: name}, &copied); !apierrors.IsNotFound(err) {
@@ -470,8 +470,8 @@ func TestOverrideSecretEventsReconcileTenantLocalModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconcileOnSecretEvent()
-	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady || !strings.Contains(readyMessage(got), "tenant-b/model-key") {
-		t.Fatalf("status after deleting the override Secret = %q %q, want ProviderNotReady", readyReason(got), readyMessage(got))
+	if got := getModel(t, r, model); readyReason(got) != reasonModelCredentialNotReady || !strings.Contains(readyMessage(got), "tenant-b/model-key") {
+		t.Fatalf("status after deleting the override Secret = %q %q, want %s", readyReason(got), readyMessage(got), reasonModelCredentialNotReady)
 	}
 	if err := r.Create(context.Background(), modelSecret()); err != nil {
 		t.Fatal(err)

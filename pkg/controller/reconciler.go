@@ -48,6 +48,7 @@ const (
 	reasonTenantNotReady          = "TenantNotReady"
 	reasonNoRoutes                = "NoRoutes"
 	reasonProviderNotReady        = "ProviderNotReady"
+	reasonModelCredentialNotReady = "ModelCredentialNotReady" //nolint:gosec // status reason, not a credential value
 	providerPhasePending          = "Pending"
 	providerPhaseFailed           = "Failed"
 	providerServicePrefix         = "provider-"
@@ -64,7 +65,10 @@ const (
 	externalProviderFinalizer     = "inference.opendatahub.io/external-provider-cleanup"
 )
 
-var errCredentialNotReady = errors.New("effective provider credential is not ready")
+var (
+	errCredentialNotReady              = errors.New("effective provider credential is not ready")
+	errModelCredentialOverrideNotReady = errors.New("effective model credential override is not ready")
+)
 
 // Reconciler coordinates Praxis ExternalModel routes and ExternalProvider
 // transport. The model loop resolves one namespace-scoped route set and
@@ -1704,6 +1708,37 @@ func (r *Reconciler) validateResolvedCredentials(ctx context.Context, routes []r
 	return nil
 }
 
+// validateModelRouteCredentials validates one model's effective route
+// credentials and distinguishes a missing model-level override from an
+// unavailable inherited provider credential.
+func (r *Reconciler) validateModelRouteCredentials(ctx context.Context, modelRoutes resolver.ModelRoutes, model *v1alpha1.ExternalModel) error {
+	for _, route := range modelRoutes.Routes {
+		if err := r.validateResolvedCredentials(ctx, []resolver.Route{route}); err != nil {
+			if errors.Is(err, errCredentialNotReady) && modelHasCredentialOverride(model, route) {
+				return fmt.Errorf("%w: %w", errModelCredentialOverrideNotReady, err)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func modelHasCredentialOverride(model *v1alpha1.ExternalModel, route resolver.Route) bool {
+	if model == nil {
+		return false
+	}
+	for _, ref := range model.Spec.ExternalProviderRefs {
+		providerNamespace := ref.Ref.Namespace
+		if providerNamespace == "" {
+			providerNamespace = model.Namespace
+		}
+		if ref.Ref.Name == route.Provider && providerNamespace == route.ProviderNamespace {
+			return ref.Auth != nil
+		}
+	}
+	return false
+}
+
 func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet) error {
 	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
 		return err
@@ -1776,17 +1811,56 @@ func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.Re
 		}
 		return nil, err
 	}
-	if err := r.validateResolvedRouteSet(ctx, valid); err != nil {
-		reason := reasonReconcileFailed
-		if errors.Is(err, errCredentialNotReady) {
-			reason = reasonProviderNotReady
+	// Validate credentials per model. The route set is namespace-wide, but a
+	// missing model override must reject only its owning model; otherwise a
+	// healthy sibling reconciliation reports that sibling as unready and
+	// prevents its routes from being published.
+	credentialValid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(valid.Models))}
+	for i := range valid.Models {
+		modelRoutes := valid.Models[i]
+		separator := strings.LastIndexByte(modelRoutes.ModelRef, '/')
+		if separator < 0 {
+			return nil, fmt.Errorf("credential validation references invalid ExternalModel ref %q", modelRoutes.ModelRef)
 		}
-		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
-			return nil, statusErr
+		owner := owners[modelRoutes.ModelRef[separator+1:]]
+		if owner == nil {
+			return nil, fmt.Errorf("credential validation references unknown ExternalModel %s", modelRoutes.ModelRef)
 		}
+		if err := r.validateModelRouteCredentials(ctx, modelRoutes, owner); err != nil {
+			if transientReadError(err) {
+				// A failed API read does not establish that the model's credential
+				// is unavailable. Retry without rejecting a serving candidate.
+				return nil, err
+			}
+			if errors.Is(err, errModelCredentialOverrideNotReady) {
+				if owner.Namespace == current.Namespace && owner.Name == current.Name {
+					if statusErr := report(false, reasonModelCredentialNotReady, err.Error(), nil); statusErr != nil {
+						return nil, statusErr
+					}
+					// Keep the current model's last-known-good route and overlay until
+					// a usable credential is available.
+					return nil, err
+				}
+				if statusErr := r.updateModelStatus(ctx, owner, false, reasonModelCredentialNotReady, err.Error(), nil); statusErr != nil {
+					return nil, statusErr
+				}
+				continue
+			}
+			reason := reasonReconcileFailed
+			if errors.Is(err, errCredentialNotReady) {
+				reason = reasonProviderNotReady
+			}
+			if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
+				return nil, statusErr
+			}
+			return nil, err
+		}
+		credentialValid.Models = append(credentialValid.Models, modelRoutes)
+	}
+	if err := envelope.ValidateSelectionMetadata(credentialValid); err != nil {
 		return nil, err
 	}
-	return valid, nil
+	return credentialValid, nil
 }
 
 func (r *Reconciler) namespaceAllowed(namespace string) bool {
