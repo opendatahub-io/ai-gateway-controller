@@ -391,9 +391,44 @@ func TestProviderTransportOutlivesTheRouteThatUsesIt(t *testing.T) {
 	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); err != nil {
 		t.Fatalf("provider Service deleted while a route uses it: %v", err)
 	}
-	reconcileModel(t, r, model)
-	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); !apierrors.IsNotFound(err) {
-		t.Fatalf("provider Service remains after its route stopped using it: %v", err)
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatalf("reconcile provider namespace change: %v", err)
+	}
+	if result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("withdrawal requeue = %s, want %s while the old serving revision is unverified", result.RequeueAfter, withdrawalRequeueInterval)
+	}
+	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); err != nil {
+		// The old overlay may still select the cross-namespace provider. Its
+		// Service must remain until the replacement ExtProc revision is proven.
+		t.Fatalf("provider Service was removed during staged withdrawal: %v", err)
+	}
+	route := newHTTPRoute()
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: modelRouteName(model.Name)}, route); err != nil {
+		t.Fatalf("read route while withdrawal is pending: %v", err)
+	}
+	rules, _, err := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedOldBackend := false
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		backends, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+		if len(backends) == 0 {
+			continue
+		}
+		backend, _ := backends[0].(map[string]any)
+		name, _ := backend["name"].(string)
+		if name == serviceName {
+			retainedOldBackend = true
+		}
+	}
+	if !retainedOldBackend {
+		t.Fatalf("HTTPRoute lost old cross-namespace backend %q before the replacement ExtProc revision was serving", serviceName)
 	}
 }
 
