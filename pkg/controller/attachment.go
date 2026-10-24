@@ -955,7 +955,7 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 	set, err := resolver.ResolveWithAPITranslation([]*v1alpha1.ExternalModel{m}, append(providerPtrs, foreign...), t.apiTranslationEnabled)
 	set, _, err = skipUnreadyCredentials(set, err, unready)
 	if err == nil {
-		err = r.validateResolvedCredentials(ctx, set.Routes())
+		err = r.validateModelRouteCredentials(ctx, set.Models[0], m)
 	}
 	if transientReadError(err) {
 		// A failed Secret read is not the model's own failure: retry
@@ -968,6 +968,8 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		switch {
 		case errors.Is(err, resolver.ErrNoRoutes) && denied != "":
 			candidate.reason, candidate.message = reasonRefNotPermitted, denied
+		case errors.Is(err, errModelCredentialOverrideNotReady):
+			candidate.reason = reasonModelCredentialNotReady
 		case errors.Is(err, resolver.ErrNoRoutes):
 			candidate.reason = reasonProviderNotReady
 			if reason, message, ok := unroutedStatus(set, m.Namespace+"/"+m.Name); ok {
