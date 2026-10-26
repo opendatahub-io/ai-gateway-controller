@@ -9,7 +9,8 @@ metadata:
     app.kubernetes.io/name: maas-consumer-portal-auth-proxy
     app.kubernetes.io/part-of: maas-consumer-portal
 spec:
-  replicas: 1
+  # replicas is omitted so admins can scale the proxy without the controller
+  # reverting it; the API server defaults a new Deployment to 1.
   selector:
     matchLabels:
       app.kubernetes.io/name: maas-consumer-portal-auth-proxy
