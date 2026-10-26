@@ -42,6 +42,7 @@ const (
 	conditionReady                = "Ready"
 	conditionOverlayDistributed   = "OverlayDistributed"
 	reasonReconciled              = "Reconciled"
+	reasonValidated               = "Validated"
 	reasonReconcileFailed         = "ReconcileFailed"
 	reasonNotPraxis               = "NotPraxisTenant"
 	reasonTenantNotReady          = "TenantNotReady"
@@ -295,7 +296,8 @@ func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace s
 
 // providerInputs returns only providers whose persisted readiness covers their
 // current spec. ExternalProvider reconciliation is the sole writer of that
-// status and of provider transport resources.
+// status and of provider transport resources. A provider only Validated
+// outside tenant namespaces has no tenant-local transport.
 func (r *Reconciler) providerInputs(ctx context.Context, namespace string) ([]*v1alpha1.ExternalProvider, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
@@ -304,7 +306,9 @@ func (r *Reconciler) providerInputs(ctx context.Context, namespace string) ([]*v
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
 		p := &providers.Items[i]
-		if !p.DeletionTimestamp.IsZero() || p.Status.Phase != resolver.PhaseReady || p.Status.ObservedGeneration != p.Generation {
+		ready := apiMeta.FindStatusCondition(p.Status.Conditions, conditionReady)
+		if !p.DeletionTimestamp.IsZero() || p.Status.Phase != resolver.PhaseReady || p.Status.ObservedGeneration != p.Generation ||
+			ready != nil && ready.Reason == reasonValidated {
 			continue
 		}
 		providerPtrs = append(providerPtrs, p)
@@ -361,6 +365,19 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		}
 		return reconcile.Result{}, nil
 	}
+	validationErr := r.validateProvider(ctx, &provider)
+	if validationErr == nil {
+		validationErr = r.validateProviderCredential(ctx, &provider)
+	}
+	if live.missingConfig && !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+		// Never served by a tenant here: this namespace has no
+		// MaasTenantConfig. Gateway attachments apply the provider's transport,
+		// so only its own configuration is reported.
+		if validationErr != nil {
+			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+		}
+		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+	}
 	if message := providerTenantReadinessMessage(live); message != "" {
 		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonTenantNotReady, message)
 	}
@@ -374,10 +391,6 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		apiTranslationEnabled: live.apiTranslationEnabled,
 	}
 
-	validationErr := r.validateProvider(ctx, &provider)
-	if validationErr == nil {
-		validationErr = r.validateProviderCredential(ctx, &provider)
-	}
 	if validationErr != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
 		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
@@ -476,11 +489,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 }
 
 func (r *Reconciler) reconcileModel(ctx context.Context, req reconcile.Request, model *v1alpha1.ExternalModel) (reconcile.Result, error) {
-	if len(model.Spec.GatewayRefs) > 0 {
-		return r.reconcileAttachedModel(ctx, model)
+	gateways, err := r.modelGateways(ctx, model)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
-	// With every gatewayRef removed, no attachment route, attachment
-	// finalizer or per-gateway result remains.
+	if len(gateways) > 0 {
+		return r.reconcileAttachedModel(ctx, model, gateways)
+	}
+	// With every gatewayRef removed, or an implicit attachment replaced by a
+	// MaasTenantConfig in the namespace, left to IPP or without a default
+	// tenant Gateway, no attachment route, attachment finalizer or per-gateway
+	// result remains.
 	if err := r.releaseAttachments(ctx, model); err != nil {
 		return reconcile.Result{}, err
 	}
@@ -723,9 +742,24 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 	}
 	if live.missingConfig {
 		if len(model.Spec.GatewayRefs) == 0 && !controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
-			// Never served here: this namespace is not a tenant namespace.
-			// Do not choose another gateway; explicit gatewayRefs select one.
+			// Never served here, nor through an implicit attachment to the
+			// default tenant's Gateway (see implicitlyAttached).
 			message := fmt.Sprintf("namespace %s has no MaasTenantConfig; set spec.gatewayRefs to attach this model to a tenant gateway", namespace)
+			implicit, err := r.implicitlyAttached(ctx, model)
+			if err != nil {
+				return modelTenantContext{}, false, err
+			}
+			if implicit {
+				_, ok, ipp, err := r.defaultTenantGateway(ctx)
+				if err != nil || ipp {
+					// The default tenant's IPP serves it and owns its status.
+					return modelTenantContext{}, false, err
+				}
+				if !ok {
+					message = fmt.Sprintf("namespace %s has no MaasTenantConfig and the default tenant (AITenant %s) has no resolvable Gateway; "+
+						"set spec.gatewayRefs to attach this model to a tenant gateway", namespace, tenant.DefaultAITenantName)
+				}
+			}
 			if err := r.setModelStatus(ctx, model, modelPhasePending, false, reasonTenantNotResolved, message, ""); err != nil {
 				return modelTenantContext{}, false, err
 			}
@@ -1556,7 +1590,7 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 	if err := validateProviderEndpoint(p.Spec.Endpoint); err != nil {
 		return err
 	}
-	authType := strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type))
+	authType := resolver.AuthType(strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type)))
 	if authType != "apikey" {
 		if authType == "" {
 			return errors.New("auth.type is required; supported strategy is apikey")
