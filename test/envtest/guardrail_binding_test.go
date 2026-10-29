@@ -3,6 +3,7 @@
 package envtest_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -287,16 +288,13 @@ func testGuardrailBinding(t *testing.T, c client.Client) {
 	})
 
 	t.Run("removing the provider CRD is reported as a missing platform component", func(t *testing.T) {
-		t.Skip("known defect: uninstalling the CRD under a running controller reports ProviderNotFound. " +
-			"The manager's RESTMapper reloads discovery only on a NoMatch, so a mapping that already " +
-			"resolved is never invalidated and the CRD check keeps passing. The verdict is only " +
-			"reachable when the CRD was already absent at controller start.")
-
 		// A missing CRD means the platform is incomplete, while a missing
 		// object means the reference is wrong, and an operator fixes those in
-		// different places. Asserting the reason this scenario should produce,
-		// rather than the one it does, so the suite stops skipping the day the
-		// defect is fixed.
+		// different places.
+		//
+		// The controller is not restarted, so its RESTMapper still carries the
+		// mapping it resolved while the CRD existed. Reaching the right reason
+		// from here is what the discovery check on the refusal path is for.
 		const namespace = "guardrail-crd-missing"
 		createNamespace(t, c, namespace)
 		createReadyProvider(t, c, nemoProvider(namespace, "nemo", defaultConfigID, []string{"base-rails"}))
@@ -307,8 +305,49 @@ func testGuardrailBinding(t *testing.T, c client.Client) {
 
 		require.NoError(t, c.Delete(t.Context(), nemoGuardrailsCRD()))
 		t.Cleanup(func() {
-			require.NoError(t, c.Create(t.Context(), nemoGuardrailsCRD()))
-			awaitCRDServing(t, c)
+			// The CRD is cluster-scoped and the scenario after this one needs
+			// it, so restoring it is not optional even when this one fails.
+			// Not t.Context(): the testing package cancels that before
+			// cleanups run.
+			ctx := context.Background()
+			require.NoError(t, c.Create(ctx, nemoGuardrailsCRD()))
+			awaitCRDServing(ctx, t, c)
+		})
+		awaitCRDGone(t, c)
+
+		requireBindingWithdrawn(t, awaitAcceptedReason(t, c, policy, reasonProviderCRDNotInstalled))
+	})
+
+	t.Run("removing only the provider CRD leaves its group served and is still reported as missing", func(t *testing.T) {
+		// The scenario above removes the last CRD in TrustyAI's group, so the
+		// whole group/version stops resolving. Uninstalling NemoGuardrails on
+		// a real cluster does not look like that: the operator's other kinds
+		// keep the group/version answering, and only the Kind goes away.
+		//
+		// That is the case a check trusting the group/version to disappear
+		// would get wrong, and it is the one this suite could not produce
+		// while NemoGuardrails was the only CRD in its group.
+		const namespace = "guardrail-crd-kind-missing"
+
+		require.NoError(t, c.Create(t.Context(), trustyAIServiceCRD()))
+		t.Cleanup(func() {
+			// Removed so the scenario after this one still sees the group
+			// disappear along with the CRD.
+			require.NoError(t, client.IgnoreNotFound(c.Delete(context.Background(), trustyAIServiceCRD())))
+		})
+
+		createNamespace(t, c, namespace)
+		createReadyProvider(t, c, nemoProvider(namespace, "nemo", defaultConfigID, []string{"base-rails"}))
+
+		policy := guardrailPolicy(namespace, "nemo", "", defaultConfigID)
+		require.NoError(t, c.Create(t.Context(), policy))
+		requireBindingPublished(t, awaitAcceptedReason(t, c, policy, reasonPolicyAccepted))
+
+		require.NoError(t, c.Delete(t.Context(), nemoGuardrailsCRD()))
+		t.Cleanup(func() {
+			ctx := context.Background()
+			require.NoError(t, c.Create(ctx, nemoGuardrailsCRD()))
+			awaitCRDServing(ctx, t, c)
 		})
 		awaitCRDGone(t, c)
 
@@ -329,13 +368,13 @@ func testGuardrailBinding(t *testing.T, c client.Client) {
 		require.NoError(t, c.Delete(t.Context(), nemoGuardrailsCRD()))
 		awaitCRDGone(t, c)
 
-		// Which reason the refusal carries is the subject of the skipped
-		// scenario above. What matters here is that the binding is withdrawn
-		// rather than left standing against a provider that cannot be read.
+		// Which reason the refusal carries is the subject of the scenario
+		// above. What matters here is that the binding is withdrawn rather
+		// than left standing against a provider that cannot be read.
 		requireBindingWithdrawn(t, awaitBindingRefused(t, c, policy))
 
 		require.NoError(t, c.Create(t.Context(), nemoGuardrailsCRD()))
-		awaitCRDServing(t, c)
+		awaitCRDServing(t.Context(), t, c)
 		createReadyProvider(t, c, nemoProvider(namespace, "nemo", defaultConfigID, []string{"base-rails"}))
 
 		// The controller is never restarted. It re-reads the RESTMapper on
@@ -424,10 +463,14 @@ func awaitCRDGone(t *testing.T, c client.Client) {
 // awaitCRDServing waits for the provider CRD to answer requests again. The API
 // server admits the CRD object before it establishes the resource behind it, so
 // creating a provider straight after reinstalling races that.
-func awaitCRDServing(t *testing.T, c client.Client) {
+//
+// The context is a parameter rather than t.Context() because one caller
+// restores the CRD from t.Cleanup, which runs after the testing package has
+// already cancelled that context.
+func awaitCRDServing(ctx context.Context, t *testing.T, c client.Client) {
 	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		assert.NoError(collect, c.List(t.Context(), newProviderList()))
+		assert.NoError(collect, c.List(ctx, newProviderList()))
 	}, eventuallyTimeout, pollInterval)
 }
 
