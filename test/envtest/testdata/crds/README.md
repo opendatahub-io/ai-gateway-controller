@@ -12,9 +12,11 @@ the pinned sources below, with the local addition noted after the table.
 | MaasTenantConfig | [MaaS at 26e3116f](https://raw.githubusercontent.com/opendatahub-io/models-as-a-service/26e3116f6ddbe50a73fe9c31b61fbd6d3c817411/deployment/base/maas-controller/crd/bases/maas.opendatahub.io_maastenantconfigs.yaml) |
 
 The MaasTenantConfig fixture also includes `spec.apiTranslation.enabled` from
-the in-flight MaaS translation change. The pinned MaaS source above predates
-that field; this local addition lets envtest verify that the API server retains
-the tenant setting until the MaaS pin is updated.
+the in-flight MaaS translation change, and `spec.payloadProcessing.maxBodyBytes`
+(default 10 MiB, maximum 100 MiB) from the in-flight ExtProc accumulation
+change. The pinned MaaS source above predates those fields; these local
+additions let envtest verify that the API server retains the tenant settings
+until the MaaS pin is updated.
 
 The AITenant fixture also includes `spec.oidc.cookieExpire` (with the
 positive-duration and effective-defaults cross-field rules) from the in-flight

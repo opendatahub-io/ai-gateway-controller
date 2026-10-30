@@ -253,11 +253,15 @@ whose payload-processing annotation is `praxis`, does kustomize build →
 placeholder post-render → per-tenant rename/patch → SSA apply into that
 tenant's Gateway namespace. On that path it also honors
 `MaasTenantConfig.spec.payloadProcessing` /
-`spec.payloadPreProcessing` (`replicas`, `autoscaling`, `resources`): when
-`autoscaling` is set it creates gateway-namespace HPAs (parity with
-maas-controller's legacy IPP behavior) and omits Deployment `spec.replicas`
-so SSA does not fight the HPA; when autoscaling is removed it deletes the
-orphaned HPAs. Both controllers watching the same primary
+`spec.payloadPreProcessing` for scaling (`replicas`, `autoscaling`,
+`resources`): when `autoscaling` is set it creates gateway-namespace HPAs
+(parity with maas-controller's legacy IPP behavior) and omits Deployment
+`spec.replicas` so SSA does not fight the HPA; when autoscaling is removed
+it deletes the orphaned HPAs. Separately,
+`spec.payloadProcessing.maxBodyBytes` always renders ExtProc
+`server.max_body_bytes` (default 10 MiB, maximum 100 MiB) and never
+`allow_unbounded_body`; this is ExtProc accumulation, not Envoy's HTTP
+buffer filter. Both controllers watching the same primary
 object (rather than `ai-gateway-controller` watching `AITenant` while
 `maas-controller` watches `MaasTenantConfig`) means a backend-selection
 write is a single watch event both sides observe together, with no

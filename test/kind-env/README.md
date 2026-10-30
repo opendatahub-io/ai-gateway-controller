@@ -292,12 +292,13 @@ not currently a separate switch for target-model rewriting.
 When translation is enabled, the selected-provider request filter applies a
 1 MiB limit before model validation and target-model rewriting, including for
 OpenAI-compatible candidates; larger requests are rejected before the upstream
-provider. The dedicated ExtProc process uses a 10 MiB accumulation ceiling for
-that translation configuration. The Kind request-limit probe currently observes
-Envoy's preselection 413 before the request reaches Praxis, so it does not
-qualify the filter's 1 MiB limit. With translation disabled, the translation
-filter and its bounds are absent and the main `allow_unbounded_body` setting is
-retained. For Anthropic JSON responses, the translator buffers chunks in
+provider. The dedicated ExtProc process always uses a body accumulation
+ceiling via `server.max_body_bytes` (default 10 MiB, maximum 100 MiB from
+`MaasTenantConfig.spec.payloadProcessing.maxBodyBytes`; this is ExtProc
+accumulation, not Envoy's HTTP buffer). The Kind request-limit probe currently
+observes Envoy's preselection 413 before the request reaches Praxis, so it does
+not qualify the filter's 1 MiB limit. With translation disabled, the translation
+filter and its 1 MiB bound are absent; the ExtProc accumulation ceiling remains. For Anthropic JSON responses, the translator buffers chunks in
 request-local filter state and enforces its 1 MiB limit. SSE remains
 incremental, and OpenAI-compatible responses pass through without this response
 buffer or limit.

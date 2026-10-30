@@ -389,7 +389,11 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("read authoritative MaaS apiTranslation setting: %w", err)
 	}
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation); err != nil {
+	maxBodyBytes, err := PayloadProcessingMaxBodyBytes(mtc)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("read authoritative MaaS payloadProcessing.maxBodyBytes: %w", err)
+	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation, maxBodyBytes); err != nil {
 		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
 	}
 	tenantNamespace := mtc.GetNamespace()
@@ -413,7 +417,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
 	if serving {
-		if err := configureExternalModelExtProc(resources, tenantID, tenantNamespace, runtimeCandidates, apiTranslation); err != nil {
+		if err := configureExternalModelExtProc(resources, tenantID, tenantNamespace, runtimeCandidates, apiTranslation, maxBodyBytes); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
 		}
 	} else {

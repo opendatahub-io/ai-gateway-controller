@@ -1157,12 +1157,15 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
                 for candidate in profile_candidates)
         )
         body_limit_state_matches = (
-            "max_body_bytes: 1048576" in snapshot["extproc_config"]
-            and translation_stream_filter_present
-            if api_translation_enabled else
-            "max_body_bytes" not in snapshot["extproc_config"]
-            and "allow_unbounded_body: true" in snapshot["extproc_config"]
-            and not translation_stream_filter_present
+            "max_body_bytes: 10485760\n" in snapshot["extproc_config"]
+            and "allow_unbounded_body: true" not in snapshot["extproc_config"]
+            and (
+                "max_body_bytes: 1048576\n" in snapshot["extproc_config"]
+                and translation_stream_filter_present
+                if api_translation_enabled else
+                "max_body_bytes: 1048576\n" not in snapshot["extproc_config"]
+                and not translation_stream_filter_present
+            )
         )
         if (set(snapshot["demo_model_candidate_clusters"]) == set(expected_clusters)
                 and snapshot["published_digest"]
@@ -3072,8 +3075,9 @@ def test_externalmodel_provider_aware_translation(auth_file):
            and "api_translation_enabled:" not in openai_off_runtime["extproc_config"]
            and "filter: openai_chat_completions_to_anthropic\n" not in openai_off_runtime["extproc_config"]
            and "openai_chat_completions_to_anthropic_stream" not in openai_off_runtime["extproc_config"]
-           and "max_body_bytes" not in openai_off_runtime["extproc_config"]
-           and "allow_unbounded_body: true" in openai_off_runtime["extproc_config"]
+           and "max_body_bytes: 10485760\n" in openai_off_runtime["extproc_config"]
+           and "max_body_bytes: 1048576\n" not in openai_off_runtime["extproc_config"]
+           and "allow_unbounded_body: true" not in openai_off_runtime["extproc_config"]
            and all(not any(field in candidate for field in ("api_format", "path", "target_model"))
                    for candidate in openai_off_runtime["demo_model_candidates"]),
            {"http_status": openai_off_status, "provider_path": openai_off_observation.get("path"),
