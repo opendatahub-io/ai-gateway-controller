@@ -85,6 +85,11 @@ _apply_ai_gateway_controller() {
   work_dir="$(mktemp -d -t aigc-kustomize.XXXXXXXXXX)"
 
   cp -a "${PROJECT_ROOT}/config/self" "${work_dir}/self"
+  if [[ "${AI_GATEWAY_CONTROLLER_NAMESPACE}" != "opendatahub" ]]; then
+    # RHOAI installs into redhat-ods-* namespaces; kustomize hardcodes opendatahub
+    sed -i "s|^namespace: opendatahub$|namespace: ${AI_GATEWAY_CONTROLLER_NAMESPACE}|" \
+      "${work_dir}/self/default/kustomization.yaml"
+  fi
   sed -i "s|^ai-gateway-controller-image=.*|ai-gateway-controller-image=${AI_GATEWAY_CONTROLLER_IMAGE}|" \
     "${work_dir}/self/default/params.env"
   sed -i "s|^praxis-extproc-image=.*|praxis-extproc-image=${PRAXIS_EXTPROC_IMAGE}|" \
