@@ -3,6 +3,7 @@
 package envtest_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -306,10 +307,7 @@ func testGuardrailBinding(t *testing.T, c client.Client) {
 		requireBindingPublished(t, awaitAcceptedReason(t, c, policy, reasonPolicyAccepted))
 
 		require.NoError(t, c.Delete(t.Context(), nemoGuardrailsCRD()))
-		t.Cleanup(func() {
-			require.NoError(t, c.Create(t.Context(), nemoGuardrailsCRD()))
-			awaitCRDServing(t, c)
-		})
+		t.Cleanup(func() { restoreProviderCRD(t, c) })
 		awaitCRDGone(t, c)
 
 		requireBindingWithdrawn(t, awaitAcceptedReason(t, c, policy, reasonProviderCRDNotInstalled))
@@ -327,6 +325,9 @@ func testGuardrailBinding(t *testing.T, c client.Client) {
 		requireBindingPublished(t, awaitAcceptedReason(t, c, policy, reasonPolicyAccepted))
 
 		require.NoError(t, c.Delete(t.Context(), nemoGuardrailsCRD()))
+		// The CRD is cluster-scoped, so a failure anywhere between here and
+		// the reinstall below would leave it deleted for whatever runs next.
+		t.Cleanup(func() { restoreProviderCRD(t, c) })
 		awaitCRDGone(t, c)
 
 		// Which reason the refusal carries is the subject of the skipped
@@ -334,13 +335,13 @@ func testGuardrailBinding(t *testing.T, c client.Client) {
 		// rather than left standing against a provider that cannot be read.
 		requireBindingWithdrawn(t, awaitBindingRefused(t, c, policy))
 
-		require.NoError(t, c.Create(t.Context(), nemoGuardrailsCRD()))
-		awaitCRDServing(t, c)
+		restoreProviderCRD(t, c)
 		createReadyProvider(t, c, nemoProvider(namespace, "nemo", defaultConfigID, []string{"base-rails"}))
 
-		// The controller is never restarted. It re-reads the RESTMapper on
-		// every reconcile, so recovery arrives on the resync cadence — the
-		// provider watch stays unregistered until a restart.
+		// The controller is never restarted, and it re-reads the RESTMapper on
+		// every reconcile. Recovery is awaited on the resync cadence rather
+		// than on the provider watch, whose informer lost the resource it was
+		// watching when the CRD went away.
 		requireBindingPublished(t, awaitAcceptedReason(t, c, policy, reasonPolicyAccepted))
 	})
 }
@@ -421,13 +422,24 @@ func awaitCRDGone(t *testing.T, c client.Client) {
 	}, eventuallyTimeout, pollInterval)
 }
 
-// awaitCRDServing waits for the provider CRD to answer requests again. The API
-// server admits the CRD object before it establishes the resource behind it, so
-// creating a provider straight after reinstalling races that.
-func awaitCRDServing(t *testing.T, c client.Client) {
+// restoreProviderCRD reinstalls the provider CRD and waits for it to answer
+// requests again. The API server admits the CRD object before it establishes
+// the resource behind it, so creating a provider straight after reinstalling
+// races that.
+//
+// A scenario that deletes the CRD registers this as its cleanup and also calls
+// it inline, so it tolerates the CRD already being back. It carries its own
+// context because t.Context is cancelled just before cleanups run.
+func restoreProviderCRD(t *testing.T, c client.Client) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*eventuallyTimeout)
+	defer cancel()
+
+	err := c.Create(ctx, nemoGuardrailsCRD())
+	require.True(t, err == nil || apierrors.IsAlreadyExists(err), "reinstalling the provider CRD: %v", err)
+
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		assert.NoError(collect, c.List(t.Context(), newProviderList()))
+		assert.NoError(collect, c.List(ctx, newProviderList()))
 	}, eventuallyTimeout, pollInterval)
 }
 

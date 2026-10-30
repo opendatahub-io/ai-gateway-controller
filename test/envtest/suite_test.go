@@ -18,9 +18,11 @@ import (
 
 // guardrailResyncInterval is short enough that scenarios driven by the resync
 // loop rather than by a watch still finish inside eventuallyTimeout. Scenario
-// 9 is the one that needs it: while the provider CRD is absent the provider
-// watch is not registered, so recovery after reinstalling it arrives on this
-// cadence and on nothing else.
+// 9 is the one that needs it: the suite installs the provider CRD before the
+// manager starts, so the provider watch is registered, but that scenario then
+// deletes the CRD underneath it. Whether the informer behind the watch resumes
+// once the CRD is reinstalled is not something to assert on, so the resync is
+// the path recovery is allowed to take.
 const guardrailResyncInterval = time.Second
 
 const (
