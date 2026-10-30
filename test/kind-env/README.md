@@ -172,13 +172,19 @@ the real API emits it and TLS fingerprints. Direct API key creation is only
 fixture setup and is not counted as callback proof. No key or Authorization
 value is written to evidence.
 
-The current route-scoped Kind fixture observes API-key validation and the full
-authorized ExtProc request. The generated AuthPolicy is inspected before
-classifying subscription-selection callback evidence: if the policy requires
-`/internal/v1/subscriptions/select`, an absent callback fails the routing
-qualification; if it does not, the behavior is recorded separately as
-`NOT_DEMONSTRATED` and is excluded from the functional routing total. No
-canned response or synthetic MaaS service is used.
+The base Kind fixture uses the `MaaSAuthPolicy` for each tenant as the sole
+model authorization policy. It does not install a route-targeted `AuthPolicy`
+for those MaaS-managed ExternalModel routes: such a policy conflicts with MaaS
+policy generation, and a key-validity-only rule would bypass the configured
+model authorization. The base E2E checks MaaS policy readiness and
+`ConflictingAuthPolicy=False`, then verifies that missing and invalid client
+keys are rejected before provider traffic and that an authorized request
+reaches exactly one expected provider. The independent route rate-limit
+policies remain in the fixture. The translation test's temporary diagnostic
+route AuthPolicies are excluded from default provisioning and are applied only
+when that test is explicitly run with `--diagnostic-route-auth`; they do not
+qualify normal MaaS authorization. No canned response or synthetic MaaS
+service is used.
 
 This proves single-tenant MaaS authorization callback compatibility. It does
 not prove tenant-aware dispatch for multiple tenant-qualified MaaS APIs; that

@@ -346,9 +346,88 @@ print(f"chunks={n} first_ms={first or 0:.0f} last_ms={last or 0:.0f} status={sta
 }
 
 provider_request_count() {
-  local deployment=$1
-  timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "deploy/$deployment" --tail=300 2>/dev/null |
-    rg -c 'POST /v1/chat/completions' || true
+  local deployment=$1 logs
+  logs=$(timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "deploy/$deployment" --tail=300 2>/dev/null) || return 1
+  awk 'index($0,"POST /v1/chat/completions") { count++ } END { print count+0 }' <<<"$logs"
+}
+
+wait_normal_auth_policy() {
+  local policy gateway policies listed route_policies generation ready conflict gateway_accepted gateway_enforced
+  local snapshot fingerprint previous='' stable=0
+  for _ in $(seq 1 120); do
+    policy=$(kctl -n "$NS" get maasauthpolicy kind-e2e-access -o json 2>/dev/null || echo '{}')
+    gateway=$(kctl -n "$API_NS" get authpolicy maas-gateway-auth -o json 2>/dev/null || echo '{}')
+    listed=false
+    route_policies=null
+    if policies=$(kctl get authpolicies.kuadrant.io -A -o json 2>/dev/null); then
+      listed=true
+      route_policies=$(jq -c --arg ns "$NS" --arg route external-model-demo-model '
+        [.items[]? | select(.metadata.namespace==$ns and .spec.targetRef.kind=="HTTPRoute" and
+          .spec.targetRef.name==$route) | {namespace:.metadata.namespace,name:.metadata.name,
+          targetRef:.spec.targetRef}]' <<<"$policies")
+    fi
+    generation=$(jq -r '.metadata.generation // 0' <<<"$policy")
+    ready=$(jq -r --argjson generation "$generation" '
+      [.status.conditions[]? | select(.type=="Ready" and .status=="True" and
+        ((.observedGeneration // $generation)==$generation))] | length > 0' <<<"$policy")
+    conflict=$(jq -r --argjson generation "$generation" '
+      [.status.conditions[]? | select(.type=="ConflictingAuthPolicy" and .status=="False" and
+        ((.observedGeneration // $generation)==$generation))] | length > 0' <<<"$policy")
+    gateway_accepted=$(jq -r '[.status.conditions[]? | select(.type=="Accepted" and .status=="True")]|length>0' <<<"$gateway")
+    gateway_enforced=$(jq -r '[.status.conditions[]? | select(.type=="Enforced" and .status=="True")]|length>0' <<<"$gateway")
+    snapshot=$(jq -cn --arg namespace "$NS" --arg route external-model-demo-model \
+      --argjson maasPolicy "$(jq -c '{name:.metadata.name,generation:.metadata.generation,conditions:[.status.conditions[]? | {type,status,reason,observedGeneration}]}' <<<"$policy")" \
+      --argjson gatewayPolicy "$(jq -c '{name:.metadata.name,namespace:.metadata.namespace,conditions:[.status.conditions[]? | {type,status,reason,observedGeneration}]}' <<<"$gateway")" \
+      --argjson policiesListed "$listed" --argjson routePolicies "$route_policies" \
+      '{namespace:$namespace,route:$route,maas_auth_policy:$maasPolicy,gateway_auth_policy:$gatewayPolicy,auth_policy_listing_succeeded:$policiesListed,route_targeted_auth_policies:$routePolicies}')
+    fingerprint=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}')
+    if [[ "$ready" == true && "$conflict" == true && "$gateway_accepted" == true &&
+      "$gateway_enforced" == true && "$listed" == true && "$route_policies" == '[]' ]]; then
+      if [[ "$fingerprint" == "$previous" ]]; then stable=$((stable+1)); else stable=1; fi
+      previous=$fingerprint
+      if [[ "$stable" -ge 2 ]]; then
+        jq . <<<"$snapshot" >"$EVIDENCE/normal-auth-policy-state.json"
+        printf 'stable_polls=%s fingerprint=%s\n' "$stable" "$fingerprint" >"$EVIDENCE/normal-auth-policy-readiness.txt"
+        return 0
+      fi
+    else
+      stable=0
+      previous=$fingerprint
+    fi
+    sleep 1
+  done
+  jq . <<<"$snapshot" >"$EVIDENCE/normal-auth-policy-state.json"
+  printf 'stable_polls=%s fingerprint=%s\n' "$stable" "$fingerprint" >"$EVIDENCE/normal-auth-policy-readiness.txt"
+  return 1
+}
+
+maas_callback_counts() {
+  local logs
+  logs=$(timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deploy/maas-api --all-containers=true --since=1h 2>/dev/null) || return 1
+  awk '
+    index($0,"/internal/v1/api-keys/validate") { validation++ }
+    index($0,"/internal/v1/subscriptions/select") { selection++ }
+    END { printf "%d %d\n", validation, selection }
+  ' <<<"$logs"
+}
+
+record_maas_callback_assertion() {
+  local before=$1 after=$2 request_id=$3
+  local validation_before subscription_before validation_after subscription_after
+  local validation_delta subscription_delta
+  if [[ "$before" == unavailable || "$after" == unavailable ]]; then
+    record 44 maas_validation_and_subscription_callbacks FAIL "callback_logs_unavailable=true request_id=$request_id"
+    return 0
+  fi
+  read -r validation_before subscription_before <<<"$before"
+  read -r validation_after subscription_after <<<"$after"
+  validation_delta=$((validation_after-validation_before))
+  subscription_delta=$((subscription_after-subscription_before))
+  if (( validation_delta >= 1 && subscription_delta >= 1 )); then
+    record 44 maas_validation_and_subscription_callbacks PASS "validation_delta=$validation_delta subscription_selection_delta=$subscription_delta request_id=$request_id"
+  else
+    record 44 maas_validation_and_subscription_callbacks FAIL "validation_delta=$validation_delta subscription_selection_delta=$subscription_delta request_id=$request_id"
+  fi
 }
 
 write_model_override_secret() {
@@ -410,13 +489,68 @@ wait_port "$API_PORT"&&wait_port "$GATEWAY_PORT"&&record 8 port_forward_ready PA
 ACTIVE_ASSERTION=initial_gateway_route_convergence
 wait_gateway_route provider-a || { echo 'provider=provider-a stable=false' >"$EVIDENCE/gateway-route-failure.txt"; exit 1; }
 wait_gateway_provider provider-a || { echo 'provider=provider-a endpoint_health=not-healthy' >"$EVIDENCE/provider-cluster-failure.txt"; exit 1; }
+if wait_normal_auth_policy; then
+  record 38 maas_gateway_auth_policy_ready_no_conflict PASS "route_authpolicy_count=0 stable_ready=true conflicting=false"
+else
+  record 38 maas_gateway_auth_policy_ready_no_conflict FAIL "state=$EVIDENCE/normal-auth-policy-state.json"
+fi
 ADMIN_CFG="$TMP_DIR/admin.cfg"; printf '%s\n' 'header = "X-MaaS-Username: kind-user"' 'header = "X-MaaS-Group: [\"system:authenticated\"]"' >"$ADMIN_CFG"
 key_body="$TMP_DIR/key.json"
 key_status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api.maas-system.svc.cluster.local:$API_PORT:127.0.0.1" -sS -o "$key_body" -w '%{http_code}' --config "$ADMIN_CFG" -H 'content-type: application/json' --data '{"name":"issue39-kind-e2e","ephemeral":true,"subscription":"kind-e2e-subscription"}' "https://maas-api.maas-system.svc.cluster.local:$API_PORT/v1/api-keys" 2>/dev/null||true)
 KEY_ID=$(jq -r '.id//.keyId//.metadata.id//empty' "$key_body" 2>/dev/null||true); KEY_VALUE=$(jq -r '.key//.apiKey//.token//empty' "$key_body" 2>/dev/null||true)
 if [[ "$key_status" == 201 && -n "$KEY_ID" && -n "$KEY_VALUE" ]]; then AUTH_CFG="$TMP_DIR/auth.cfg"; printf 'header = "Authorization: Bearer %s"\n' "$KEY_VALUE">"$AUTH_CFG"; chmod 600 "$AUTH_CFG"; printf 'http_status=201 key_id_present=true key_value_saved=false\n'>"$EVIDENCE/key-created.txt"; record 9 key_created PASS "http=201"; else record 9 key_created FAIL "http=$key_status"; exit 1; fi
-unauth_cfg="$TMP_DIR/unauth.cfg"; :>"$unauth_cfg"; u=$(gateway unauthenticated "$unauth_cfg"); status_assert 10 unauthenticated 401 "$u"
-a=$(gateway provider_a "$AUTH_CFG"); status_assert 11 provider_a_request 200 "$a"; write_result request provider_a "$a" "A"
+# Direct MaaS checks establish the key's identity and configured model grant;
+# the independent Gateway requests below determine the effective policy path.
+validation_request="$TMP_DIR/validate-key.json"; printf '{"key":"%s"}\n' "$KEY_VALUE" >"$validation_request"; chmod 600 "$validation_request"
+validation_response="$TMP_DIR/validate-key-response.json"
+validation_status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api.maas-system.svc.cluster.local:$API_PORT:127.0.0.1" -sS -o "$validation_response" -w '%{http_code}' --config "$ADMIN_CFG" -H 'content-type: application/json' --data-binary "@$validation_request" "https://maas-api.maas-system.svc.cluster.local:$API_PORT/internal/v1/api-keys/validate" 2>/dev/null || true)
+validation_valid=$(jq -r '.valid // false' "$validation_response" 2>/dev/null || echo false)
+validation_user=$(jq -r '.username // empty' "$validation_response" 2>/dev/null || true)
+validation_groups=$(jq -r '(.groups // []) | length' "$validation_response" 2>/dev/null || echo 0)
+validation_subscription=$(jq -r '.subscription // empty' "$validation_response" 2>/dev/null || true)
+printf '{"http_status":"%s","valid":%s,"username":"%s","group_count":%s,"subscription":"%s","key_value_saved":false}\n' \
+  "$validation_status" "$validation_valid" "$validation_user" "$validation_groups" "$validation_subscription" >"$EVIDENCE/normal-auth-direct-key-validation.json"
+selection_request="$TMP_DIR/select-subscription.json"
+validation_groups_json=$(jq -c '.groups // []' "$validation_response" 2>/dev/null || printf '[]')
+jq -cn --argjson groups "$validation_groups_json" --arg username "$validation_user" \
+  --arg subscription "$validation_subscription" '{groups:$groups,username:$username,requestedSubscription:$subscription,requestedModel:"demo"}' >"$selection_request"
+chmod 600 "$selection_request"
+selection_response="$TMP_DIR/select-subscription-response.json"
+selection_status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api.maas-system.svc.cluster.local:$API_PORT:127.0.0.1" -sS -o "$selection_response" -w '%{http_code}' --config "$ADMIN_CFG" -H 'content-type: application/json' --data-binary "@$selection_request" "https://maas-api.maas-system.svc.cluster.local:$API_PORT/internal/v1/subscriptions/select" 2>/dev/null || true)
+selection_allowed=$(jq -r '.accessAllowed // false' "$selection_response" 2>/dev/null || echo false)
+selection_phase=$(jq -r '.phase // empty' "$selection_response" 2>/dev/null || true)
+selection_model=$(jq -r '.resolvedModel // empty' "$selection_response" 2>/dev/null || true)
+printf '{"http_status":"%s","access_allowed":%s,"phase":"%s","resolved_model":"%s","key_value_saved":false}\n' \
+  "$selection_status" "$selection_allowed" "$selection_phase" "$selection_model" >"$EVIDENCE/normal-auth-direct-subscription-selection.json"
+if [[ "$validation_status" == 200 && "$validation_valid" == true && "$validation_user" == kind-user &&
+  "$validation_subscription" == kind-e2e-subscription && "$selection_status" == 200 &&
+  "$selection_allowed" == true && "$selection_phase" == Active && "$selection_model" == demo ]]; then
+  record 39 direct_maas_key_and_model_access PASS "valid=true user=kind-user subscription=kind-e2e-subscription model=demo access_allowed=true"
+else
+  record 39 direct_maas_key_and_model_access FAIL "validation_http=$validation_status valid=$validation_valid selection_http=$selection_status access_allowed=$selection_allowed phase=$selection_phase model=$selection_model"
+fi
+unauth_cfg="$TMP_DIR/unauth.cfg"; :>"$unauth_cfg"
+unauth_before=$(provider_request_count katan-a)
+u=$(gateway unauthenticated "$unauth_cfg"); status_assert 10 unauthenticated 401 "$u"
+unauth_after=$(provider_request_count katan-a)
+if [[ "$unauth_after" == "$unauth_before" ]]; then record 40 missing_key_no_provider_contact PASS "provider_receipt_delta=0"; else record 40 missing_key_no_provider_contact FAIL "provider_receipt_delta=$((unauth_after-unauth_before))"; fi
+invalid_cfg="$TMP_DIR/invalid.cfg"; printf '%s\n' 'header = "Authorization: Bearer sk-oai-invalid-kind-control"' >"$invalid_cfg"
+invalid_before=$(provider_request_count katan-a)
+invalid_status=$(gateway invalid_api_key "$invalid_cfg"); status_assert 41 invalid_api_key_denied 403 "$invalid_status"
+invalid_after=$(provider_request_count katan-a)
+if [[ "$invalid_after" == "$invalid_before" ]]; then record 42 invalid_key_no_provider_contact PASS "provider_receipt_delta=0"; else record 42 invalid_key_no_provider_contact FAIL "provider_receipt_delta=$((invalid_after-invalid_before))"; fi
+normal_auth_request_id="aigc-kind-$CLUSTER-provider-a-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+normal_auth_request_cfg="$TMP_DIR/normal-auth-request-id.cfg"; printf 'header = "x-request-id: %s"\n' "$normal_auth_request_id" >"$normal_auth_request_cfg"
+printf 'request_id=%s\n' "$normal_auth_request_id" >"$EVIDENCE/normal-auth-request-id.txt"
+callbacks_before=$(maas_callback_counts) || callbacks_before=unavailable
+provider_a_before=$(provider_request_count katan-a)
+a=$(gateway provider_a "$AUTH_CFG" "$normal_auth_request_cfg"); status_assert 11 provider_a_request 200 "$a"; write_result request provider_a "$a" "A"
+provider_a_after=$(provider_request_count katan-a)
+callbacks_after=$(maas_callback_counts) || callbacks_after=unavailable
+printf 'request_id=%s\ncallback_counts_before=%s\ncallback_counts_after=%s\nprovider_receipts_before=%s\nprovider_receipts_after=%s\n' \
+  "$normal_auth_request_id" "$callbacks_before" "$callbacks_after" "$provider_a_before" "$provider_a_after" >"$EVIDENCE/normal-auth-request-outcome.txt"
+record_maas_callback_assertion "$callbacks_before" "$callbacks_after" "$normal_auth_request_id"
+if (( provider_a_after-provider_a_before == 1 )); then record 43 valid_key_exactly_one_provider_receipt PASS "provider_receipt_delta=1 request_id=$normal_auth_request_id"; else record 43 valid_key_exactly_one_provider_receipt FAIL "provider_receipt_delta=$((provider_a_after-provider_a_before)) request_id=$normal_auth_request_id"; fi
 provider_a_body=$(cat "$EVIDENCE/provider_a-response.json")
 if [[ "$a" == 200 && "$provider_a_body" == *katan-a-* && "$provider_a_body" != *katan-b-* ]]; then
   record 12 provider_a_attribution PASS "backend=katan-a"

@@ -1048,7 +1048,7 @@ EOF
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml|shared-translation-backend.yaml|shared-translation-routes.yaml|api-translation-provider-aware-backend.yaml) continue ;;
+      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml|shared-translation-backend.yaml|shared-translation-routes.yaml|shared-translation-auth-diagnostic.yaml|api-translation-provider-aware-backend.yaml) continue ;;
       45-real-openai-policies.yaml|60-client-kind-patch.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then

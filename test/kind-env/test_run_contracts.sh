@@ -114,8 +114,34 @@ rg -q 'set image "deployment/\$api_deployment" "maas-api=\$\{MAAS_API_RUNTIME_IM
   echo "tenant API Deployments do not select the run-owned source image" >&2
   exit 1
 }
+rg -q 'shared-translation-auth-diagnostic\.yaml.*continue' <<<"$run_source" || {
+  echo "default manifest provisioning does not exclude the opt-in translation diagnostic AuthPolicies" >&2
+  exit 1
+}
+if ! rg -q 'if args\.diagnostic_route_auth:' "$ROOT/test/kind-env/e2e-api-translation.py" ||
+  ! rg -q 'shared-translation-auth-diagnostic\.yaml' "$ROOT/test/kind-env/e2e-api-translation.py"; then
+    echo "translation diagnostic AuthPolicies are not applied only through their explicit opt-in" >&2
+    exit 1
+fi
 if rg -q 'patch deployment maas-api|patch deployment "\$api_deployment"' <<<"$run_source"; then
   echo "the harness overrides MaaS API imagePullPolicy instead of satisfying its Always pull" >&2
+  exit 1
+fi
+
+for policy_fixture in \
+  "$ROOT/test/kind-env/manifests/50-route-policies.yaml" \
+  "$ROOT/test/kind-env/manifests/51-route-policies-tenant-b.yaml"; do
+  if rg -n '^[[:space:]]*kind:[[:space:]]*AuthPolicy[[:space:]]*$' "$policy_fixture" >/dev/null; then
+    echo "ExternalModel fixture $policy_fixture must not add a route AuthPolicy over the MaaSAuthPolicy" >&2
+    exit 1
+  fi
+done
+if ! rg -q 'wait_normal_auth_policy' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'ConflictingAuthPolicy' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'invalid_key_no_provider_contact' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'timeout 5s kubectl --context "kind-\$CLUSTER" -n "\$API_NS" logs deploy/maas-api' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'maas_validation_and_subscription_callbacks' "$ROOT/test/kind-env/e2e-extproc.sh"; then
+  echo "base E2E does not gate on MaaS policy ownership and credential denial before provider contact" >&2
   exit 1
 fi
 
@@ -131,4 +157,105 @@ JSON
   exit 1
 }
 
-echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, and exact MaaS runtime image identity)."
+(
+  eval "$(sed -n '/^provider_request_count() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  CLUSTER=contract-test
+  API_NS=maas-system
+  timeout() { printf '%s\n' 'GET /health' 'POST /v1/chat/completions'; }
+  [[ "$(provider_request_count katan-a)" == 1 ]] || { echo 'provider request count must reflect successful log reads' >&2; exit 1; }
+  timeout() { printf '%s\n' 'GET /health'; }
+  [[ "$(provider_request_count katan-a)" == 0 ]] || { echo 'successful logs with no requests must count as zero' >&2; exit 1; }
+  timeout() { return 124; }
+  if provider_request_count katan-a; then
+    echo 'failed provider log reads must not be treated as zero provider contact' >&2
+    exit 1
+  fi
+)
+
+(
+  eval "$(sed -n '/^maas_callback_counts() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  eval "$(sed -n '/^record_maas_callback_assertion() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  CLUSTER=contract-test
+  API_NS=maas-system
+  timeout() { printf '%s\n' '/internal/v1/api-keys/validate' '/internal/v1/subscriptions/select'; }
+  [[ "$(maas_callback_counts)" == '1 1' ]] || { echo 'MaaS callbacks must reflect successful log reads' >&2; exit 1; }
+  timeout() { printf '%s\n' 'GET /health'; }
+  [[ "$(maas_callback_counts)" == '0 0' ]] || { echo 'successful logs without callbacks must count as zero' >&2; exit 1; }
+  timeout() { printf '%s\n' '/internal/v1/api-keys/validate'; return 124; }
+  if maas_callback_counts; then
+    echo 'failed or partial MaaS log reads must not produce callback counts' >&2
+    exit 1
+  fi
+  record() { [[ "$1" == 44 && "$2" == maas_validation_and_subscription_callbacks && "$3" == "$expected" ]]; }
+  expected=FAIL
+  record_maas_callback_assertion unavailable '10 10' request-test
+  record_maas_callback_assertion '10 10' unavailable request-test
+  record_maas_callback_assertion unavailable unavailable request-test
+  record_maas_callback_assertion '10 10' '10 11' request-test
+  expected=PASS
+  record_maas_callback_assertion '10 10' '11 11' request-test
+)
+
+(
+  eval "$(sed -n '/^wait_normal_auth_policy() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  readiness_tmp=$(mktemp -d)
+  trap 'rm -rf "$readiness_tmp"' EXIT
+  NS=models-as-a-service
+  API_NS=maas-system
+  EVIDENCE=$readiness_tmp
+  seq() { printf '%s\n' 1 2 3; }
+  sleep() { :; }
+  kctl() {
+    case "$*" in
+      *'get maasauthpolicy '*)
+        printf '%s\n' '{"metadata":{"generation":1},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1},{"type":"ConflictingAuthPolicy","status":"False","observedGeneration":1}]}}'
+        ;;
+      *'get authpolicy '*)
+        printf '%s\n' '{"status":{"conditions":[{"type":"Accepted","status":"True"},{"type":"Enforced","status":"True"}]}}'
+        ;;
+      'get authpolicies.kuadrant.io -A -o json')
+        local count
+        count=$(<"$readiness_tmp/list-count")
+        count=$((count+1))
+        printf '%s' "$count" >"$readiness_tmp/list-count"
+        case "$scenario" in
+          failed) return 1 ;;
+          timeout) return 124 ;;
+          interrupted) if [[ "$count" == 2 ]]; then return 1; fi ;;
+          recovered) if [[ "$count" == 1 ]]; then return 1; fi ;;
+          conflict)
+            printf '%s\n' '{"items":[{"metadata":{"namespace":"models-as-a-service","name":"conflicting"},"spec":{"targetRef":{"kind":"HTTPRoute","name":"external-model-demo-model"}}}]}'
+            return 0
+            ;;
+        esac
+        printf '%s\n' '{"items":[]}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  for scenario in failed timeout conflict interrupted; do
+    printf '0' >"$readiness_tmp/list-count"
+    if wait_normal_auth_policy; then
+      echo "AuthPolicy readiness must fail for $scenario listing" >&2
+      exit 1
+    fi
+    if [[ "$scenario" == failed || "$scenario" == timeout ]]; then
+      jq -e '.auth_policy_listing_succeeded == false and .route_targeted_auth_policies == null' \
+        "$EVIDENCE/normal-auth-policy-state.json" >/dev/null || {
+        echo 'failed listings must be recorded as unavailable, not an empty policy list' >&2
+        exit 1
+      }
+    fi
+  done
+  for scenario in empty recovered; do
+    printf '0' >"$readiness_tmp/list-count"
+    wait_normal_auth_policy || { echo "successful stable empty listings must become ready for $scenario" >&2; exit 1; }
+    jq -e '.auth_policy_listing_succeeded == true and .route_targeted_auth_policies == []' \
+      "$EVIDENCE/normal-auth-policy-state.json" >/dev/null || {
+      echo 'successful empty listings must be recorded explicitly' >&2
+      exit 1
+    }
+  done
+)
+
+echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, provider-log failure handling, MaaS callback-log failure handling, and AuthPolicy listing failures)."
