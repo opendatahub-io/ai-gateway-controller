@@ -18,6 +18,7 @@ import (
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 func TestAttachedOverlayCandidatesSkipRemovedCredentialCopies(t *testing.T) {
@@ -166,17 +167,27 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 		ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "shared", Namespace: "shared"}}},
 	}}
 	provider := func(name string) *v1alpha1.ExternalProvider {
-		return &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"}}
+		return &v1alpha1.ExternalProvider{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"},
+			Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+		}
 	}
 	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(
 		local, own, elsewhere, foreign, provider("local"), provider("own"), provider("elsewhere"), provider("shared"),
 	).Build()}
-	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a", false)
+	_, required, unavailable, rejected, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !required["local"] || !required["own"] || required["elsewhere"] || len(required) != 2 {
+	if !required[envelope.CandidateStableID("local", "local")] || !required[envelope.CandidateStableID("own", "own")] ||
+		required[envelope.CandidateStableID("elsewhere", "elsewhere")] || len(required) != 2 {
 		t.Fatalf("required providers = %v, want only local providers of models the tenant Gateway serves", required)
+	}
+	if len(unavailable) != 0 {
+		t.Fatalf("unavailable providers = %v, want none for ready local providers", unavailable)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("rejected model candidates = %v, want none for Ready models", rejected)
 	}
 }
 
