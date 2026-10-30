@@ -119,6 +119,21 @@ if rg -q 'patch deployment maas-api|patch deployment "\$api_deployment"' <<<"$ru
   exit 1
 fi
 
+authorino_volume_wait_line=$(rg -n 'authorino_ca_volume_ready=true' "$ROOT/test/kind-env/run.sh" | cut -d: -f1 | head -n1)
+authorino_env_line=$(rg -n 'set env deployment/authorino' "$ROOT/test/kind-env/run.sh" | cut -d: -f1 | head -n1)
+[[ -n "$authorino_volume_wait_line" && -n "$authorino_env_line" && "$authorino_volume_wait_line" -lt "$authorino_env_line" ]] || {
+  echo "Authorino process trust is configured before its operator-generated CA volume is ready" >&2
+  exit 1
+}
+if ! rg -q 'maas-api-serving-ca' <<<"$run_source" || ! rg -q 'authorino-maas-api-ca' <<<"$run_source"; then
+  echo "Authorino cold-start wait does not verify the run-owned CA projection" >&2
+  exit 1
+fi
+rg -q 'rollout status deployment/authorino --timeout=180s' <<<"$run_source" || {
+  echo "Authorino CA configuration is not followed by bounded rollout convergence" >&2
+  exit 1
+}
+
 ready_pods=$(jq -r -f "$ROOT/test/kind-env/controller-ready-manager-pods.jq" <<'JSON'
 {"items":[
   {"metadata":{"name":"current","deletionTimestamp":null},"spec":{"nodeName":"kind-node"},"status":{"phase":"Running","containerStatuses":[{"name":"manager","ready":true,"imageID":"containerd://sha256:current","image":"controller:tag"}]}},

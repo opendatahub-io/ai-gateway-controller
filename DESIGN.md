@@ -59,11 +59,16 @@ remains deterministic. Repeating the same provider across `ExternalModel`
 objects with the same client-visible model name is rejected; otherwise that
 provider would receive extra random-selection entries. This change adds overlay
 selection metadata and checks compatibility before transport changes. It does
-not add controller/ExtProc rollout coordination, proportional weighting,
-health-aware selection, or retries. Final-provider withdrawal and empty-overlay
-behavior remain outside this change in issue #106. Partial provider withdrawal
-ordering remains a separate issue tracked in
-[#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
+not add proportional weighting, health-aware selection, or retries. Issue #108
+stages provider withdrawal for both tenant-local and Gateway-attached models:
+the reduced overlay must be observed by the serving ExtProc revision, then the
+request drain interval must elapse before old routes, credentials, and
+transports are removed. Deleting an `ExternalProvider` that is still
+referenced is intentionally blocked with `Pending` / `ProviderInUse`; update
+or delete the referencing model to begin that safe withdrawal. This prevents
+provider deletion alone from silently discarding a last-known-good route or
+leaving the operator without an actionable status. Final-provider withdrawal
+and empty-overlay semantics remain tracked in issue #106.
 
 ### ExternalProvider status ownership
 
@@ -98,6 +103,15 @@ inconsistent with the tenant configuration) claims the provider and reports
 `Pending`/`TenantNotReady` before returning the error. Returning a bare error
 would leave the provider with neither the finalizer nor a status writer while
 IPP remains free to write status; the requeue retries the resolution.
+
+Deleting a provider that is still referenced or has an applied provider route
+keeps its cleanup finalizer and reports `Pending`/`ProviderInUse`, including the
+referencing model names. The operator must update or delete those models. Their
+reconciles first publish a reduced overlay; the old route, credential
+projection, and transport remain until the new ExtProc revision is serving and
+the in-flight request drain has elapsed. The provider finalizer then removes
+the unused transport. This is an explicit blocking state, not automatic
+provider failover.
 
 An explicit IPP selection is the existing handoff, unchanged in direction:
 remove the Praxis transport except the backends the namespace's attachment
@@ -442,8 +456,11 @@ compatibility one-pager; this records how it is implemented.
   tenant's own models win, then the oldest; same-namespace models share the
   name and are validated together as one selection group, as on the
   tenant-local path), a resolution or credential failure or more than 7
-  providers (`TooManyProviders`) excludes the model: it loses its route,
-  overlay entry, DestinationRules and copies. Over the 1024-candidate overlay
+  providers (`TooManyProviders`) excludes the model. A model that has never
+  been served is not published; for an already accepted route, withdrawal first
+  removes its candidate from the tenant overlay while retaining the old route,
+  DestinationRules, and credential copies until the reduced ExtProc revision
+  serves and the request drain completes. Over the 1024-candidate overlay
   limit (`OverlayCapacityExceeded`) a model keeps its accepted route but nothing
   else. Capacity is decided, and the handoff re-checked live, before anything is
   written into the tenant; a failed API read is retried, never treated as the
@@ -758,3 +775,22 @@ alone:
 - This repo has no git remote yet, so none of `.github/workflows/*` have
   actually executed — they're believed correct against the Makefile targets
   but unverified in GitHub Actions.
+
+### Withdrawal evidence and attachment-only providers
+
+Before reducing a tenant overlay, every shared route-filter writer persists
+removed attachment candidates on their owned HTTPRoute. Failed persistence
+leaves the previous overlay available for retry; later writers can reconstruct
+the old route contract without republishing withdrawn candidates.
+
+A missing or unreadable serving-revision log line is unknown evidence. It
+blocks cleanup and preserves any existing drain timestamp. A confirmed
+revision mismatch invalidates the drain; cleanup still requires fresh rollout,
+endpoint, and revision proof after the interval. Bounded log tails can therefore
+delay cleanup when no fresh revision evidence is available, but cannot authorize
+cleanup or repeatedly erase a previously proven interval merely by losing a line.
+
+An attachment may protect an unclaimed-namespace provider with the cleanup
+finalizer without changing its standalone validation/status ownership. Once no
+controller-owned serving route uses that provider, transport collection releases
+that protection. A namespace claimed by an AITenant retains its tenant lifecycle.

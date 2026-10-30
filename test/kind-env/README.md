@@ -27,8 +27,11 @@ The controller watches ExternalModel and ExternalProvider, publishes transport
 resources before the content-addressed overlay, and the local manifests
 provide two Katan backends plus tenant-local ExternalModel ExtProc. The default
 qualification entrypoint is `e2e.sh`, which executes the ExtProc-only suite.
-The transition implementation is not part of this checkout's executable
-qualification. Istio, Kuadrant, and the MaaS platform remain
+The equal-provider selection and staged A+B-to-A withdrawal qualification is a
+separate, manually invoked test; it is not included in `e2e.sh` or the default
+CI workflow. It requires an already provisioned cluster and verifies overlay
+publication, serving revisions, provider traffic, drain, and cleanup.
+Istio, Kuadrant, and the MaaS platform remain
 explicit prerequisites for the full authenticated chain; the provisioner
 records a failure rather than silently substituting them.
 
@@ -101,6 +104,31 @@ LOCAL_ENV_EVIDENCE_ROOT="$PWD/evidence/<run-id>" ./run.sh --destroy
 Replace `<run-id>` consistently. The normal qualification does not apply the
 optional OpenAI resources; that workflow must opt in explicitly through its
 documented OpenAI command path.
+
+To run the equal-provider selection and withdrawal qualification, first
+provision a fresh cluster as above, then run the dedicated script against that
+cluster with the same ExtProc source checkout and local image used by
+provisioning:
+
+```sh
+RUN_ID=pr145-withdrawal-20261024
+export LOCAL_ENV_CLUSTER="external-model-kind-${RUN_ID}"
+export LOCAL_ENV_SELECTION_EVIDENCE="$PWD/evidence/${RUN_ID}-selection"
+export EXTPROC_IMAGE="praxis-extproc:${RUN_ID}"
+export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc
+export EXPECTED_EXTPROC_MAIN_SHA="$(git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD)"
+python3 ./e2e-equal-provider-selection.py
+```
+
+The script fails unless the ExtProc source checkout is clean `main`, the
+optional expected SHA matches, and the running ExtProc image matches the local
+image loaded into Kind. It exercises one-provider routing, two independent
+100-request A+B samples, session affinity, and the staged A+B-to-A transition;
+the transition assertions require A traffic during the update and defer B route
+and credential cleanup until the replacement revision is serving and the
+request drain period has elapsed. This specialized qualification uses test
+credentials and recorders. Destroy only the named run-owned cluster after
+preserving its evidence.
 
 ### Shared External Model resources
 

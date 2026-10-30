@@ -723,6 +723,30 @@ EOF
   done
   [[ "$authorino_found" == true ]] || { fail "Kuadrant did not create the run-owned Authorino resource"; exit 2; }
   "${KCTL[@]}" -n kuadrant-system patch authorino authorino --type=merge -p='{"spec":{"volumes":{"defaultMode":420,"items":[{"name":"maas-api-serving-ca","mountPath":"/etc/ssl/certs","configMaps":["authorino-maas-api-ca"],"items":[{"key":"ca.crt","path":"maas-api-serving-ca.crt"}]}]}}}'
+  # The Authorino operator can delete and recreate its Deployment while it
+  # applies the CR's volume configuration. Wait for the generated volume to
+  # appear before setting process trust variables on that Deployment; otherwise
+  # a cold Kind provision can race the replacement and fail with NotFound.
+  authorino_ca_volume_ready=false
+  for _ in $(seq 1 90); do
+    authorino_deployment_json=$("${KCTL[@]}" -n kuadrant-system get deployment authorino -o json 2>/dev/null || true)
+    if [[ -n "$authorino_deployment_json" ]] && jq -e '
+      any(.spec.template.spec.volumes[]?;
+        .name == "maas-api-serving-ca" and
+        any(.projected.sources[]?.configMap?; .name == "authorino-maas-api-ca"))
+    ' >/dev/null <<<"$authorino_deployment_json"; then
+      authorino_ca_volume_ready=true
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$authorino_ca_volume_ready" != true ]]; then
+    "${KCTL[@]}" -n kuadrant-system get authorino authorino -o yaml >"$EVIDENCE/authorino-ca-config-timeout.yaml" 2>&1 || true
+    "${KCTL[@]}" -n kuadrant-system get deployment authorino -o yaml >"$EVIDENCE/authorino-deployment-timeout.yaml" 2>&1 || true
+    fail "Authorino Deployment did not converge to the run-owned CA volume configuration"
+    exit 2
+  fi
+  "${KCTL[@]}" -n kuadrant-system rollout status deployment/authorino --timeout=180s
   "${KCTL[@]}" -n kuadrant-system set env deployment/authorino \
     SSL_CERT_FILE=/etc/ssl/certs/maas-api-serving-ca.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/maas-api-serving-ca.crt
