@@ -27,7 +27,7 @@ const nemoGuardrailsCRDName = "nemoguardrails.trustyai.opendatahub.io"
 
 // nemoGuardrailsCRD defines TrustyAI's NemoGuardrails well enough for this
 // controller, which reads it unstructured by GVK and depends only on
-// spec.allowedConsumers, spec.nemoConfigs and status.endpoint.
+// spec.allowedConsumers, spec.nemoConfigs and status.workloadNamespace.
 //
 // The schema preserves unknown fields rather than restating TrustyAI's. Two
 // reasons, and neither is brevity. A copy of their schema would drift silently
@@ -117,20 +117,22 @@ func withAllowedConsumers(from string, selector map[string]any) providerOption {
 	}
 }
 
-// createReadyProvider creates a provider and publishes the endpoint TrustyAI
-// would publish once its server is auth-protected and addressable.
+// createReadyProvider creates a provider and publishes the workload namespace
+// TrustyAI would publish once its server is addressable.
 func createReadyProvider(t *testing.T, c client.Client, provider *unstructured.Unstructured) *unstructured.Unstructured {
 	t.Helper()
 	require.NoError(t, c.Create(t.Context(), provider))
-	publishEndpoint(t, c, provider)
+	publishWorkloadNamespace(t, c, provider)
 	return provider
 }
 
-// publishEndpoint writes status.endpoint, standing in for TrustyAI. It is the
-// only field this controller reads for provider readiness.
-func publishEndpoint(t *testing.T, c client.Client, provider *unstructured.Unstructured) {
+// publishWorkloadNamespace writes status.workloadNamespace, standing in for
+// TrustyAI. It is the only status field this controller reads for provider
+// readiness: the Service behind it is derived, not published. The provider's
+// own namespace is the case where TrustyAI names the Service for the custom
+// resource alone.
+func publishWorkloadNamespace(t *testing.T, c client.Client, provider *unstructured.Unstructured) {
 	t.Helper()
-	endpoint := "https://" + provider.GetName() + "." + provider.GetNamespace() + ".svc.cluster.local"
-	require.NoError(t, unstructured.SetNestedField(provider.Object, endpoint, "status", "endpoint"))
+	require.NoError(t, unstructured.SetNestedField(provider.Object, provider.GetNamespace(), "status", "workloadNamespace"))
 	require.NoError(t, c.Status().Update(t.Context(), provider))
 }
