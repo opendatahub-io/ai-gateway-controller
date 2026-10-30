@@ -33,9 +33,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
@@ -112,15 +115,62 @@ type Reconciler struct {
 // SetupWithManager registers the MaasTenantConfig watch (primary trigger)
 // and a secondary AITenant watch mapped back to the owning MaasTenantConfig,
 // mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
+// tenantEventPredicates filters the tenant reconciler's watches so that only
+// events that can change the rendered praxis stack enqueue a reconcile.
+//
+// Without predicates, every update to a watched object — including status-only
+// writes and Secret metadata bumps — re-applied the whole tenant stack. In
+// busy namespaces (maas-controller status writebacks, test-driven model churn,
+// this controller's own ExternalModel status writes) that produced one full
+// praxis re-apply per unrelated event at event cadence.
+//
+// GenerationChangedPredicate admits creates, deletes, generic events, and
+// updates whose spec changed (metadata.generation bumped); it drops status-only
+// and metadata-only updates, which cannot change the rendered output.
+//
+// The AITenant watch additionally needs status updates that change
+// status.tenantNamespace: the enqueue mapper reads it, so the event that first
+// populates it must be admitted or a new AITenant would never map to its
+// MaasTenantConfig.
+func tenantEventPredicates() map[string]predicate.Predicate {
+	aitenantUpdate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				aitenantConfigNamespace(e.ObjectOld) != aitenantConfigNamespace(e.ObjectNew)
+		},
+	}
+	return map[string]predicate.Predicate{
+		"maastenantconfig": predicate.GenerationChangedPredicate{},
+		"aitenant":         aitenantUpdate,
+		"externalmodel":    predicate.GenerationChangedPredicate{},
+		"externalprovider": predicate.GenerationChangedPredicate{},
+	}
+}
+
+// aitenantConfigNamespace reads the MaasTenantConfig namespace an AITenant's
+// status points at; empty when unset or the object is not an AITenant.
+func aitenantConfigNamespace(obj client.Object) string {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return ""
+	}
+	namespace, _ := ConfigNamespace(u)
+	return namespace
+}
+
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	preds := tenantEventPredicates()
 	return ctrl.NewControllerManagedBy(mgr).
-		For(NewMaasTenantConfig()).
+		For(NewMaasTenantConfig(), builder.WithPredicates(preds["maastenantconfig"])).
 		Watches(
 			NewAITenant(),
 			handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForAITenant),
+			builder.WithPredicates(preds["aitenant"]),
 		).
-		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
-		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(preds["externalmodel"])).
+		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(preds["externalprovider"])).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Complete(r)
