@@ -158,6 +158,19 @@ func aitenantConfigNamespace(obj client.Object) string {
 	return namespace
 }
 
+// notControllerOwnedSecret reports whether a Secret was not rendered by this
+// controller. The tenant Secret watch exists to react to credential sources
+// changing in the tenant namespace; without this filter it also fired on this
+// controller's own output — projected credential copies (agc-cred-*) and the
+// payload-processing ServiceAccount's dockercfg — self-triggering a full
+// praxis re-apply per write. OpenShift-injected dockercfg churn
+// (builder/deployer/default tokens) is not excludable at watch time, but it
+// only occurs at namespace lifecycle boundaries, before the MaasTenantConfig
+// it would enqueue exists.
+func notControllerOwnedSecret(obj client.Object) bool {
+	return obj.GetLabels()[managedByLabel] != render.FieldOwner
+}
+
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	preds := tenantEventPredicates()
 	return ctrl.NewControllerManagedBy(mgr).
@@ -171,7 +184,8 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(preds["externalmodel"])).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
 			builder.WithPredicates(preds["externalprovider"])).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(predicate.NewPredicateFuncs(notControllerOwnedSecret))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Complete(r)
 }
