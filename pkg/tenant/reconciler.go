@@ -128,23 +128,71 @@ type Reconciler struct {
 // updates whose spec changed (metadata.generation bumped); it drops status-only
 // and metadata-only updates, which cannot change the rendered output.
 //
-// The AITenant watch additionally needs status updates that change
-// status.tenantNamespace: the enqueue mapper reads it, so the event that first
-// populates it must be admitted or a new AITenant would never map to its
-// MaasTenantConfig.
+// The AITenant watch additionally needs status updates that the enqueue
+// mapper or the apply path reads: status.tenantNamespace (the mapper reads
+// it, so the event that first populates it must be admitted or a new
+// AITenant would never map to its MaasTenantConfig), and status.gatewayRef /
+// DeployReady transitions (the apply path targets the Gateway they name, and
+// steady state returns without a requeue). Other status-only writes are
+// dropped. The MaasTenantConfig watch additionally admits changes to the
+// AnnotationPayloadProcessingType annotation, which selects the praxis vs
+// legacy-IPP backend without bumping metadata.generation.
 func tenantEventPredicates() map[string]predicate.Predicate {
 	aitenantUpdate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				aitenantConfigNamespace(e.ObjectOld) != aitenantConfigNamespace(e.ObjectNew) {
+				return true
+			}
+			// The reconcile reads status.gatewayRef and DeployReady to pick
+			// the target Gateway, and the steady-state path returns without
+			// scheduling a requeue: admit their transitions so a gateway
+			// re-claim or Ready↔Failed flip reconciles promptly instead of
+			// waiting out the resync interval.
+			old, oldOK := asUnstructured(e.ObjectOld)
+			current, currentOK := asUnstructured(e.ObjectNew)
+			if !oldOK || !currentOK {
+				return false
+			}
+			oldName, oldNamespace, oldReady := GatewayRef(old)
+			newName, newNamespace, newReady := GatewayRef(current)
+			return oldName != newName || oldNamespace != newNamespace || oldReady != newReady ||
+				DeployReady(old) != DeployReady(current)
+		},
+	}
+	// The payload-processing backend is selected by annotation, which does
+	// not bump metadata.generation. An IPP→praxis flip on an existing
+	// MaasTenantConfig must reconcile promptly: the IPP path returns without
+	// scheduling a requeue, so the resync interval would be the only backstop.
+	maastenantconfigUpdate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
 			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
-				aitenantConfigNamespace(e.ObjectOld) != aitenantConfigNamespace(e.ObjectNew)
+				PayloadProcessingType(mustUnstructured(e.ObjectOld)) != PayloadProcessingType(mustUnstructured(e.ObjectNew))
 		},
 	}
 	return map[string]predicate.Predicate{
-		"maastenantconfig": predicate.GenerationChangedPredicate{},
+		"maastenantconfig": maastenantconfigUpdate,
 		"aitenant":         aitenantUpdate,
 		"externalmodel":    predicate.GenerationChangedPredicate{},
 		"externalprovider": predicate.GenerationChangedPredicate{},
 	}
+}
+
+// asUnstructured converts a watch object to *unstructured.Unstructured.
+func asUnstructured(obj client.Object) (*unstructured.Unstructured, bool) {
+	u, ok := obj.(*unstructured.Unstructured)
+	return u, ok
+}
+
+// mustUnstructured converts a watch object to *unstructured.Unstructured,
+// returning an empty object when the type does not match (annotations of an
+// empty object read as unset, making the comparison a no-op).
+func mustUnstructured(obj client.Object) *unstructured.Unstructured {
+	u, _ := asUnstructured(obj)
+	if u == nil {
+		return &unstructured.Unstructured{}
+	}
+	return u
 }
 
 // aitenantConfigNamespace reads the MaasTenantConfig namespace an AITenant's
