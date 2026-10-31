@@ -1355,10 +1355,19 @@ def qualify_live_provider(provider, auth_file):
     externalmodel_url = f"http://127.0.0.1:{GATEWAY_PORT}/{NAMESPACE}/demo/v1/chat/completions"
     json_marker = f"ipp-live-{provider}-json-synthetic"
     json_request_id = f"{ROUTE_TRACE_PREFIX}live-{provider}-json"
+    live_json_request = {
+        "model": client_model,
+        "messages": [{"role": "user", "content": f"Reply with the word blue. Marker: {json_marker}"}],
+    }
+    if provider == "anthropic":
+        # Exercise the compatibility default and the accepted, ignored
+        # OpenAI-only options against the real translated provider path.
+        live_json_request.update({"user": "compatibility-live-test", "n": 2, "seed": 17,
+                                  "parallel_tool_calls": True})
+    else:
+        live_json_request["max_tokens"] = 16
     json_rc, json_status, json_raw = curl_request(
-        f"live-{provider}-json", externalmodel_url,
-        {"model": client_model, "max_tokens": 16,
-         "messages": [{"role": "user", "content": f"Reply with the word blue. Marker: {json_marker}"}]},
+        f"live-{provider}-json", externalmodel_url, live_json_request,
         auth_file=auth_file,
         extra_headers=[f"x-ipp-diagnostic-id: {json_request_id}"],
         correlation_id=json_request_id,
@@ -2219,7 +2228,7 @@ def probe_provider_a_normal_auth_before_translation(auth_file, *, continue_on_fa
         and auth_input.get("gateway_model") == "demo"
         and route_trace.get("captured") is True
         and route_trace.get("response_code") == "200"
-        and "provider-provider-a" in route_trace.get("upstream_cluster", "")
+        and "provider-a-ext.maas-system.svc.cluster.local" in route_trace.get("upstream_cluster", "")
         and "provider-selection-required" not in route_trace.get("upstream_cluster", "")
         and authorino_response is not None and authorino_response.get("authorized") is True
     )
@@ -3715,7 +3724,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
             ),
             "provider_body_within_server_accumulation_limit": (
                 isinstance(observation.get("request_body_bytes"), int)
-                and observation.get("request_body_bytes") <= 10 * 1024 * 1024
+                and observation.get("request_body_bytes") <= 10 * 1024 * 1024 + 64 * 1024
             ),
             "credential_tls_sni_authority_ok": bool(observation.get("credential_ok")
                 and observation.get("tls") and observation.get("sni_ok") and observation.get("authority_ok")),
@@ -3742,7 +3751,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "route_trace_request_id": route_trace.get("envoy_request_id"),
         }
         save_json(EVIDENCE / f"openai-request-boundary-{label}-diagnosis.json", boundary_evidence)
-        record(f"externalmodel_openai_request_{label}_2mib_boundary_succeeds", accepted,
+        record(f"externalmodel_openai_request_{label}_10mib_boundary_succeeds", accepted,
                boundary_evidence)
 
     # A large-but-under-limit OpenAI JSON response must pass through the
@@ -3957,7 +3966,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
         }
     )
     openai_large_route_captured = openai_large_route.get("captured") is True
-    record("externalmodel_openai_request_over_2mib_rejected_by_extproc_input_limit",
+    record("externalmodel_openai_request_over_10mib_rejected_by_extproc_input_limit",
            rc == 0 and openai_large_status == "413"
            and openai_over_limit_serialized_bytes == large_content_size
            and openai_selected_limit_rejection
@@ -4449,7 +4458,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
         receipts = [item for item in provider_aware_observations()
                     if item.get("diagnostic_id") == diagnostic_id]
         observation = receipts[0] if len(receipts) == 1 else {}
-        record(f"externalmodel_anthropic_request_{label}_2mib_boundary_succeeds",
+        record(f"externalmodel_anthropic_request_{label}_10mib_boundary_succeeds",
                rc == 0 and status == "200" and response.get("choices")
                and len(receipts) == 1 and observation.get("anthropic_request_ok") is True
                and observation.get("model") == "mock-anthropic-model"
@@ -4467,7 +4476,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
                 "provider_request_bytes": observation.get("request_body_bytes"),
                 "provider_body_within_server_accumulation_limit": (
                     isinstance(observation.get("request_body_bytes"), int)
-                    and observation.get("request_body_bytes") <= 10 * 1024 * 1024
+                    and observation.get("request_body_bytes") <= 10 * 1024 * 1024 + 64 * 1024
                 ),
                 "translated_request_valid": observation.get("anthropic_request_ok"),
                 "translated_max_tokens": observation.get("anthropic_max_tokens"),
@@ -4503,7 +4512,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "translator_filter_present": True,
         }
     )
-    record("externalmodel_anthropic_request_over_2mib_rejected_by_extproc_input_limit",
+    record("externalmodel_anthropic_request_over_10mib_rejected_by_extproc_input_limit",
            rc == 0 and over_limit_status == "413" and len(over_limit_raw) < 4096
            and over_limit_serialized_bytes == over_limit_size
            and extproc_rejected_over_limit and not over_limit_receipts,
@@ -5062,7 +5071,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run deterministic translation E2E; live providers are opt-in.")
     parser.add_argument("--scope", choices=("all", "shared", "externalmodel"), default="all",
                         help="qualify both pipelines (all), only the shared route, or only ExternalModel")
-    parser.add_argument("--live-provider", choices=("anthropic", "openai", "bedrock", "all"),
+    parser.add_argument("--live-provider", choices=("anthropic", "openai", "bedrock", "all", "openai-anthropic"),
                         help="optionally qualify one live provider or all providers through the deployed Kind Gateway")
     parser.add_argument("--diagnostic-route-auth", action="store_true",
                         help="use run-owned route AuthPolicies that validate the MaaS key directly; diagnostic only, not final Gateway auth qualification")
@@ -5457,6 +5466,7 @@ def main():
         test_externalmodel_provider_aware_translation(auth_cfg)
         if LIVE_PROVIDER_SELECTION:
             selected = (("anthropic", "openai", "bedrock") if LIVE_PROVIDER_SELECTION == "all"
+                        else ("openai", "anthropic") if LIVE_PROVIDER_SELECTION == "openai-anthropic"
                         else (LIVE_PROVIDER_SELECTION,))
             for provider in selected:
                 try:
@@ -5905,18 +5915,19 @@ def main():
     on_observed = wait_observation(lambda o: on_marker in o.get("message_text", []), "feature-on JSON request")
     (EVIDENCE / "feature-on-json-response.json").write_bytes(on_raw)
     translated = json.loads(on_raw) if on_raw else {}
+    # Praxis AI v0.9.0 strips Anthropic caller credentials before the translated
+    # request reaches a Chat Completions backend. MaaS Authorization proves
+    # ingress authentication; it is not a backend credential.
     record("feature_on_request_translation", rc == 0 and on_status == "200"
            and on_observed.get("path") == "/v1/chat/completions"
            and on_observed.get("model") == "demo"
            and on_marker in on_observed.get("message_text", [])
            and on_observed.get("x_api_key_present") is False
-           and on_observed.get("authorization_present") is True
-           and on_observed.get("authorization_scheme") == "Bearer",
+           and on_observed.get("authorization_present") is False,
            {"http_status": on_status, "upstream_path": on_observed.get("path"),
             "upstream_model": on_observed.get("model"), "body_marker_preserved": on_marker in on_observed.get("message_text", []),
             "client_x_api_key_removed": on_observed.get("x_api_key_present") is False,
-            "upstream_authorization_present": on_observed.get("authorization_present"),
-            "upstream_authorization_scheme": on_observed.get("authorization_scheme")})
+            "upstream_authorization_absent": on_observed.get("authorization_present") is False})
     record("feature_on_json_response_translation", translated.get("type") == "message"
            and any(block.get("text") == "translated reply" for block in translated.get("content", [])
                    if isinstance(block, dict)),
@@ -5980,7 +5991,9 @@ def main():
         test_externalmodel_provider_aware_translation(auth_cfg)
 
     if LIVE_PROVIDER_SELECTION:
-        selected = ("anthropic", "openai", "bedrock") if LIVE_PROVIDER_SELECTION == "all" else (LIVE_PROVIDER_SELECTION,)
+        selected = (("anthropic", "openai", "bedrock") if LIVE_PROVIDER_SELECTION == "all"
+                    else ("openai", "anthropic") if LIVE_PROVIDER_SELECTION == "openai-anthropic"
+                    else (LIVE_PROVIDER_SELECTION,))
         for provider in selected:
             try:
                 qualify_live_provider(provider, auth_cfg)

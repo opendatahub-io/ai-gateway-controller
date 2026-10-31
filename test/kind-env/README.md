@@ -394,8 +394,8 @@ in this mode; it is used only when testing a local AI source override.
 CLUSTER="anthropic-published-$(date -u +%Y%m%dT%H%M%SZ | tr '[:upper:]' '[:lower:]')"
 export PROVIDER_RECORDER_IMAGE="provider-recorder:$CLUSTER"
 unset PRAXIS_AI_REPO
-EXT_SOURCE_SHA=24f2d003ed303a950b6bd8ab042f0d62a5ab4278
-EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd'
+EXT_SOURCE_SHA=cffd4219f080348176d3bfdbc99028372dec7e50
+EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874'
 RUN_EVIDENCE="$PWD/evidence/published-extproc-qualification"
 export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc-at-merge-sha
 export EXTPROC_IMAGE_MODE=published EXPECTED_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA"

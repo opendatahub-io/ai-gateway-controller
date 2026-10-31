@@ -62,7 +62,7 @@ _derive_praxis_image_from_controller() {
 # When unset, fall back to params.env, controller tag alignment, then the pinned release image.
 PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-$(_default_praxis_image)}"
 PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-$(_derive_praxis_image_from_controller)}"
-PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd}"
+PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874}"
 
 if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE}" ]]; then
   echo "ERROR: AI_GATEWAY_CONTROLLER_IMAGE is required" >&2

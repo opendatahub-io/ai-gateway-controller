@@ -247,7 +247,7 @@ func buildMetricsServerOptions(bindAddress string, secureMetrics bool) metricsse
 func resolveExtprocImage() string {
 	return cmp.Or(
 		os.Getenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE"),
-		"quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd",
+		"quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874",
 	)
 }
 
