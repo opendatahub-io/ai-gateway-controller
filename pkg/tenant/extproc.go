@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
@@ -40,6 +41,7 @@ type extprocCredential struct {
 }
 
 const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extproc-config-sha256"
+const extprocConfigSnapshotAnnotation = "ai-gateway-controller.opendatahub.io/extproc-config"
 
 // extprocMaxBodyBytes bounds the request bodies Praxis buffers: the
 // translation-enabled ExternalModel server limit, the request JSON the
@@ -273,6 +275,9 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation); err != nil {
 		return fmt.Errorf("write post-auth ExtProc config hash: %w", err)
 	}
+	if err := snapshotExternalModelConfig(deployment, config); err != nil {
+		return err
+	}
 
 	if len(credentials) == 0 {
 		return nil
@@ -328,6 +333,44 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 		return fmt.Errorf("write post-auth ExtProc containers: %w", err)
 	}
 	return nil
+}
+
+// snapshotExternalModelConfig binds startup configuration to the same pod
+// revision as its projected Secret references. A mutable ConfigMap can reach a
+// kubelet before or after a new Deployment revision, so even a new Ready pod
+// could otherwise load a credential set different from its own volume spec.
+// Only non-secret configuration is snapshotted; Secret values and the routing
+// overlay retain their normal projected-volume updates.
+func snapshotExternalModelConfig(deployment *unstructured.Unstructured, config string) error {
+	annotations, _, err := unstructured.NestedStringMap(deployment.Object, "spec", "template", "metadata", "annotations")
+	if err != nil {
+		return fmt.Errorf("read post-auth pod annotations: %w", err)
+	}
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[extprocConfigSnapshotAnnotation] = config
+	if err := apivalidation.ValidateAnnotationsSize(annotations); err != nil {
+		return fmt.Errorf("post-auth configuration exceeds pod annotation size limit: %w", err)
+	}
+	if err := unstructured.SetNestedStringMap(deployment.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+		return fmt.Errorf("write post-auth pod config snapshot: %w", err)
+	}
+	volumes, _, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "volumes")
+	if err != nil {
+		return fmt.Errorf("read post-auth volumes for config snapshot: %w", err)
+	}
+	volumes = appendOrReplaceNamedVolume(volumes, "plugins-config-volume", map[string]any{
+		"name": "plugins-config-volume",
+		"downwardAPI": map[string]any{"items": []any{map[string]any{
+			"path": "extproc.yaml",
+			"fieldRef": map[string]any{
+				"apiVersion": "v1",
+				"fieldPath":  "metadata.annotations['" + extprocConfigSnapshotAnnotation + "']",
+			},
+		}}},
+	})
+	return unstructured.SetNestedSlice(deployment.Object, volumes, "spec", "template", "spec", "volumes")
 }
 
 // configureExternalModelRequestOrdering removes early body delivery. The routes

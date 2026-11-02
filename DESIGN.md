@@ -286,6 +286,16 @@ CRDs are read as `unstructured.Unstructured` against hardcoded
 pulls in `kserve`, `knative`, `KEDA`, `openshift/api`, and more, none of
 which this controller needs to keep its own dependency graph minimal.
 
+The dedicated ExternalModel processor snapshots its non-secret startup
+configuration in the pod template and mounts that annotation through the
+[Downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/).
+Its configuration and projected credential references therefore belong to the
+same pod revision even when kubelet observes ConfigMap and Deployment updates
+in different orders. The ConfigMap remains the published desired configuration;
+credential values and the routing overlay still update through their own
+projected volumes. The controller validates the combined pod annotations against
+Kubernetes' 256 KiB size limit before applying the render.
+
 A `PraxisCleanupFinalizer` on the `MaasTenantConfig` (not `AITenant`)
 guarantees a chance to delete what was applied when a tenant switches away
 from `praxis` or the `MaasTenantConfig` is deleted (SSA only ever upserts
