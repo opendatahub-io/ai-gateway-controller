@@ -365,16 +365,29 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return result, err
 	}
 
+	// The maas-api HTTPRoute lives in the tenant's infrastructure namespace,
+	// and the EnvoyFilter's route-name matches must be qualified with it
+	// (Istio names Gateway API route rules
+	// "<namespace>.<HTTPRoute-name>.<rule-index>"). maas-controller publishes
+	// it on the MaasTenantConfig status before it waits on this controller's
+	// EnvoyFilter, so waiting here cannot deadlock the tenant bring-up.
+	infraNamespace, _, _ := unstructured.NestedString(mtc.Object, "status", "infraNamespace")
+	if infraNamespace == "" {
+		log.Info("MaasTenantConfig status.infraNamespace is not populated yet; will retry")
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+
 	rendered, err := render.Build(r.ManifestPath)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render: %w", err)
 	}
 
 	resources := render.PostRender(rendered, render.Params{
-		Namespace:        gatewayNamespace,
-		GatewayName:      gatewayName,
-		Image:            r.Image,
-		MaaSAPIRouteName: ResourceName(r.MaaSAPIRouteNameBase, tenantID),
+		Namespace:             gatewayNamespace,
+		GatewayName:           gatewayName,
+		Image:                 r.Image,
+		MaaSAPIRouteName:      ResourceName(r.MaaSAPIRouteNameBase, tenantID),
+		MaaSAPIRouteNamespace: infraNamespace,
 	})
 
 	resources, err = Rename(resources, tenantID, gatewayNamespace)

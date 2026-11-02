@@ -18,6 +18,7 @@ package consumerportal
 
 import (
 	"encoding/json"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -210,6 +211,50 @@ func TestRenderBuildsBackendTLS(t *testing.T) {
 			t.Errorf("DestinationRule %s = %s/%s host=%q port=%d mode=%q sni=%q",
 				tc.name, rule.GetNamespace(), rule.GetName(), host, port, mode, sni)
 		}
+	}
+}
+
+func TestRenderBuildsExtProcBypass(t *testing.T) {
+	resources := renderTestResources(t)
+	filter := findResource(t, resources, "EnvoyFilter", "maas-consumer-portal-extproc-bypass")
+	// EnvoyFilters are gateway-namespace objects, like the DestinationRules.
+	if filter.GetNamespace() != testGatewayNamespace {
+		t.Errorf("EnvoyFilter namespace = %s, want %s", filter.GetNamespace(), testGatewayNamespace)
+	}
+	patches, found, _ := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+	if !found || len(patches) != 3 {
+		t.Fatalf("EnvoyFilter configPatches = %v (found=%v), want 3", patches, found)
+	}
+	// Istio names Gateway API route rules "<namespace>.<HTTPRoute-name>.<rule-index>";
+	// every patch must match a qualified name for one of the portal routes and
+	// disable both ext_proc filters.
+	wantNames := map[string]bool{
+		testInfraNamespace + "." + PortalRouteName + ".0": true,
+		testInfraNamespace + "." + PortalRouteName + ".1": true,
+		testInfraNamespace + "." + OAuthRouteName + ".0":  true,
+	}
+	gotNames := map[string]bool{}
+	for _, patch := range patches {
+		patchMap, ok := patch.(map[string]any)
+		if !ok {
+			t.Fatalf("configPatch is %T, want map", patch)
+		}
+		name, _, _ := unstructured.NestedString(patchMap, "match", "routeConfiguration", "vhost", "route", "name")
+		gotNames[name] = true
+		for _, filterName := range []string{"envoy.filters.http.ext_proc.ipp-pre", "envoy.filters.http.ext_proc.ipp"} {
+			disabled, _, _ := unstructured.NestedBool(patchMap, "patch", "value", "typed_per_filter_config", filterName, "disabled")
+			if !disabled {
+				t.Errorf("patch for %q does not disable %s", name, filterName)
+			}
+		}
+	}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Errorf("patch route names = %v, want %v", gotNames, wantNames)
+	}
+	// The workload selector must track the tenant gateway.
+	selector, _, _ := unstructured.NestedString(filter.Object, "spec", "workloadSelector", "labels", "gateway.networking.k8s.io/gateway-name")
+	if selector != testGatewayName {
+		t.Errorf("workloadSelector gateway = %q, want %q", selector, testGatewayName)
 	}
 }
 
