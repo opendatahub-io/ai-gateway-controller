@@ -1,0 +1,242 @@
+# Bump MaaS E2E Pin Workflow
+#
+# Automates the periodic bump of the models-as-a-service commit pin in
+# test/maas-e2e.lock. The e2e suite deploys MaaS images built from that
+# pinned commit, so a bump is only safe when both quay.io/opendatahub/maas-api
+# and quay.io/opendatahub/maas-controller images exist for the new SHA.
+#
+# This workflow:
+#   1. Reads the current pin from test/maas-e2e.lock
+#   2. Fetches the latest commit on opendatahub-io/models-as-a-service main
+#   3. Exits early if the pin is already current (idempotent)
+#   4. Verifies both Quay images exist for the new commit
+#   5. Updates the lock file preserving its structure
+#   6. Opens a PR with the bump
+#
+# Jira: RHAI-19434
+
+name: Bump MaaS E2E Pin
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Bump MaaS e2e pin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Read current pin
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT_COMMIT=$(grep '^maas_commit=' test/maas-e2e.lock | cut -d'=' -f2)
+          CURRENT_REF=$(grep '^maas_ref=' test/maas-e2e.lock | cut -d'=' -f2)
+          echo "commit=${CURRENT_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "ref=${CURRENT_REF}" >> "$GITHUB_OUTPUT"
+          echo "Current pin: ${CURRENT_COMMIT} (ref: ${CURRENT_REF})"
+
+      - name: Fetch latest commit from models-as-a-service
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_REF: ${{ steps.current.outputs.ref }}
+        run: |
+          set -euo pipefail
+          LATEST_COMMIT=$(gh api "repos/opendatahub-io/models-as-a-service/commits/${CURRENT_REF}" --jq '.sha')
+          LATEST_SHORT="${LATEST_COMMIT:0:7}"
+          echo "commit=${LATEST_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "short=${LATEST_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "Latest commit on ${CURRENT_REF}: ${LATEST_COMMIT} (${LATEST_SHORT})"
+
+      - name: Check if pin is already current
+        id: compare
+        env:
+          CURRENT_COMMIT: ${{ steps.current.outputs.commit }}
+          LATEST_COMMIT: ${{ steps.latest.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [ "${CURRENT_COMMIT}" = "${LATEST_COMMIT}" ]; then
+            echo "Pin is already at the latest commit. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Pin is outdated, will bump."
+            echo "Current: ${CURRENT_COMMIT}"
+            echo "Latest:  ${LATEST_COMMIT}"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify Quay images exist for new commit
+        id: images
+        if: steps.compare.outputs.skip != 'true'
+        env:
+          NEW_COMMIT: ${{ steps.latest.outputs.commit }}
+        run: |
+          set -euo pipefail
+          IMAGES_OK=true
+
+          for image in maas-api maas-controller; do
+            URL="https://quay.io/v2/opendatahub/${image}/manifests/${NEW_COMMIT}"
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              --max-time 30 --retry 3 --retry-all-errors \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              "${URL}" || echo "000")
+            if [ "${HTTP_CODE}" = "200" ]; then
+              echo "${image}:${NEW_COMMIT} exists (HTTP ${HTTP_CODE})"
+            else
+              echo "${image}:${NEW_COMMIT} not found (HTTP ${HTTP_CODE})"
+              IMAGES_OK=false
+            fi
+          done
+
+          if [ "${IMAGES_OK}" = "false" ]; then
+            echo "One or more images not yet published. Skipping bump."
+            echo "## Bump MaaS E2E Pin" >> "$GITHUB_STEP_SUMMARY"
+            echo "Skipped: Quay images for commit \`${NEW_COMMIT}\` are not yet available." >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Both images verified."
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update lock file
+        if: steps.compare.outputs.skip != 'true' && steps.images.outputs.ready == 'true'
+        env:
+          NEW_COMMIT: ${{ steps.latest.outputs.commit }}
+          NEW_SHORT: ${{ steps.latest.outputs.short }}
+          OLD_COMMIT: ${{ steps.current.outputs.commit }}
+          MAAS_REF: ${{ steps.current.outputs.ref }}
+        run: |
+          set -euo pipefail
+          OLD_SHORT="${OLD_COMMIT:0:7}"
+          UPDATED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          cat > test/maas-e2e.lock <<EOF
+          # Pinned models-as-a-service source for ai-gateway-controller e2e.
+          #
+          # Automated bump from ${OLD_SHORT} to ${NEW_SHORT}.
+          #
+          # Validate e2e when bumping this pin. E2E also deploys the MaaS images built from this
+          # commit (test/e2e/scripts/maas-image-defaults.sh), so pin a models-as-a-service main commit
+          # that published both maas-api and maas-controller images (maas-api builds only on its changes).
+          # Both were published for this commit:
+          #   docker manifest inspect quay.io/opendatahub/maas-api:${NEW_COMMIT}
+          #   docker manifest inspect quay.io/opendatahub/maas-controller:${NEW_COMMIT}
+          # Override for one-off runs without editing this file:
+          #   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+          maas_repo=https://github.com/opendatahub-io/models-as-a-service
+          maas_commit=${NEW_COMMIT}
+          maas_ref=${MAAS_REF}
+          updated_at=${UPDATED_AT}
+          EOF
+
+          echo "Lock file updated:"
+          cat test/maas-e2e.lock
+
+      - name: Check for existing bump PR
+        id: existing_pr
+        if: steps.compare.outputs.skip != 'true' && steps.images.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_COMMIT: ${{ steps.latest.outputs.commit }}
+          NEW_SHORT: ${{ steps.latest.outputs.short }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/bump-maas-e2e-pin"
+          EXISTING_PR=$(gh pr list --head "${BRANCH}" --state open --json number,headRepositoryOwner --jq '.[] | select(.headRepositoryOwner.login == "opendatahub-io") | .number' | head -n1)
+
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "Open PR #${EXISTING_PR} exists for branch ${BRANCH}."
+
+            # Read the MaaS commit from the existing PR's lock file
+            EXISTING_MAAS_COMMIT=$(gh api "repos/${GITHUB_REPOSITORY}/contents/test/maas-e2e.lock?ref=${BRANCH}" --jq '.content' | base64 -d | grep '^maas_commit=' | cut -d= -f2)
+            if [ "${EXISTING_MAAS_COMMIT}" = "${NEW_COMMIT}" ]; then
+              echo "Existing PR #${EXISTING_PR} already targets ${NEW_SHORT}. Skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Existing PR #${EXISTING_PR} targets a different commit. Will force-push update."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing PR for branch ${BRANCH}."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update pull request
+        if: steps.compare.outputs.skip != 'true' && steps.images.outputs.ready == 'true' && steps.existing_pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_COMMIT: ${{ steps.latest.outputs.commit }}
+          NEW_SHORT: ${{ steps.latest.outputs.short }}
+          OLD_COMMIT: ${{ steps.current.outputs.commit }}
+          EXISTING_PR_NUMBER: ${{ steps.existing_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          OLD_SHORT="${OLD_COMMIT:0:7}"
+          BRANCH="chore/bump-maas-e2e-pin"
+          COMMIT_URL="https://github.com/opendatahub-io/models-as-a-service/commit/${NEW_COMMIT}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "${BRANCH}"
+          git add test/maas-e2e.lock
+          git commit -m "chore: bump MaaS e2e pin to ${NEW_SHORT}
+
+          Bump test/maas-e2e.lock from ${OLD_SHORT} to ${NEW_SHORT}.
+          Both maas-api and maas-controller Quay images verified for ${NEW_COMMIT}.
+
+          Signed-off-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+          gh auth setup-git
+          git push --force origin "${BRANCH}"
+
+          BODY="## MaaS E2E Pin Bump
+
+          Automated bump of \`test/maas-e2e.lock\` to the latest \`models-as-a-service\` main commit.
+
+          | Detail | Value |
+          | --- | --- |
+          | Previous commit | [\`${OLD_SHORT}\`](https://github.com/opendatahub-io/models-as-a-service/commit/${OLD_COMMIT}) |
+          | New commit | [\`${NEW_SHORT}\`](${COMMIT_URL}) |
+          | maas-api image | \`quay.io/opendatahub/maas-api:${NEW_COMMIT}\` |
+          | maas-controller image | \`quay.io/opendatahub/maas-controller:${NEW_COMMIT}\` |
+
+          Both Quay images were verified to exist before opening this PR.
+
+          [Full diff](https://github.com/opendatahub-io/models-as-a-service/compare/${OLD_COMMIT}...${NEW_COMMIT})"
+
+          if [ -n "${EXISTING_PR_NUMBER}" ]; then
+            echo "${BODY}" | gh pr edit "${EXISTING_PR_NUMBER}" \
+              --title "chore: bump MaaS e2e pin to ${NEW_SHORT}" \
+              --body-file -
+            PR_URL=$(gh pr view "${EXISTING_PR_NUMBER}" --json url --jq '.url')
+            PR_NUMBER="${EXISTING_PR_NUMBER}"
+            echo "Updated PR #${PR_NUMBER}: ${PR_URL}"
+          else
+            PR_URL=$(echo "${BODY}" | gh pr create \
+              --base main \
+              --head "${BRANCH}" \
+              --title "chore: bump MaaS e2e pin to ${NEW_SHORT}" \
+              --body-file - | tail -n1)
+            PR_NUMBER="${PR_URL##*/}"
+            echo "Created PR #${PR_NUMBER}: ${PR_URL}"
+          fi
+
+          echo "## Bump MaaS E2E Pin" >> "$GITHUB_STEP_SUMMARY"
+          echo "PR [#${PR_NUMBER}](${PR_URL}): bump MaaS e2e pin from \`${OLD_SHORT}\` to \`${NEW_SHORT}\`." >> "$GITHUB_STEP_SUMMARY"
