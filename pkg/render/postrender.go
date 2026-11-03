@@ -98,7 +98,15 @@ func placeholderReplacements(p Params) []placeholderReplacement {
 		// namespace (the tenant infra namespace, not Params.Namespace) or the
 		// patches silently never match (verified against a live gateway
 		// config dump).
-		{old: "PLACEHOLDER.maas-api-route", new: p.MaaSAPIRouteNamespace + "." + p.MaaSAPIRouteName},
+		func() placeholderReplacement {
+			if p.MaaSAPIRouteNamespace == "" {
+				// No infrastructure namespace known yet: unqualified names
+				// (the pre-qualification behavior) so the patches no-op
+				// rather than matching ".maas-api-route.0".
+				return placeholderReplacement{old: "PLACEHOLDER.maas-api-route", new: p.MaaSAPIRouteName}
+			}
+			return placeholderReplacement{old: "PLACEHOLDER.maas-api-route", new: p.MaaSAPIRouteNamespace + "." + p.MaaSAPIRouteName}
+		}(),
 		// Deployment container images (payload-processing and payload-pre-processing).
 		{old: "praxis-extproc:dev", new: p.Image},
 	}

@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -221,17 +222,28 @@ func TestRenderBuildsExtProcBypass(t *testing.T) {
 	if filter.GetNamespace() != testGatewayNamespace {
 		t.Errorf("EnvoyFilter namespace = %s, want %s", filter.GetNamespace(), testGatewayNamespace)
 	}
-	patches, found, _ := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
-	if !found || len(patches) != 3 {
-		t.Fatalf("EnvoyFilter configPatches = %v (found=%v), want 3", patches, found)
+	patches, _, _ := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+	// Istio names Gateway API route rules "<namespace>.<HTTPRoute-name>.<rule-index>".
+	// The expected names are DERIVED from the rendered HTTPRoutes, not
+	// hardcoded, so adding, removing, or reordering a rule in
+	// httproutes.yaml without updating envoyfilter.yaml fails here instead
+	// of silently dropping a bypass.
+	wantNames := map[string]bool{}
+	for _, resource := range resources {
+		if resource.GetKind() != "HTTPRoute" {
+			continue
+		}
+		if name := resource.GetName(); name != PortalRouteName && name != OAuthRouteName {
+			continue
+		}
+		rules, _, _ := unstructured.NestedSlice(resource.Object, "spec", "rules")
+		for i := range rules {
+			wantNames[testInfraNamespace+"."+resource.GetName()+"."+strconv.Itoa(i)] = true
+		}
 	}
-	// Istio names Gateway API route rules "<namespace>.<HTTPRoute-name>.<rule-index>";
-	// every patch must match a qualified name for one of the portal routes and
-	// disable both ext_proc filters.
-	wantNames := map[string]bool{
-		testInfraNamespace + "." + PortalRouteName + ".0": true,
-		testInfraNamespace + "." + PortalRouteName + ".1": true,
-		testInfraNamespace + "." + OAuthRouteName + ".0":  true,
+	if len(patches) != len(wantNames) {
+		t.Fatalf("EnvoyFilter has %d configPatches, want %d (one per portal route rule): %v",
+			len(patches), len(wantNames), wantNames)
 	}
 	gotNames := map[string]bool{}
 	for _, patch := range patches {
