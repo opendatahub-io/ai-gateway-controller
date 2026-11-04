@@ -40,7 +40,8 @@ type ExternalProvider struct {
 // ExternalProviderSpec defines the desired state of ExternalProvider.
 type ExternalProviderSpec struct {
 	// Provider identifies the API type for this provider.
-	// e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex".
+	// e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex", "bedrock-openai".
+	// Use "bedrock-openai" for Bedrock Mantle's OpenAI-compatible API; it does not mean Bedrock Runtime.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -91,8 +92,4 @@ type ExternalProviderList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ExternalProvider `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&ExternalProvider{}, &ExternalProviderList{})
 }

@@ -89,6 +89,7 @@ type AIGuardrailProvider struct {
 	// +kubebuilder:validation:Type=string
 	// +kubebuilder:validation:MaxLength=64
 	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="timeout must be a valid positive duration"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1ms')",message="timeout must be at least 1ms"
 	Timeout metav1.Duration `json:"timeout"`
 }
 
@@ -193,8 +194,4 @@ type AIGuardrailList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AIGuardrail `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&AIGuardrail{}, &AIGuardrailList{})
 }
