@@ -52,7 +52,7 @@ const extprocMaxBodyBytes = 10485760
 // authoritative MaasTenantConfig permission. The translation filters are
 // restricted to Anthropic Messages requests and do not change the dedicated
 // ExternalModel processor.
-func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool) error {
+func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool, maxBodyBytes int64) error {
 	wantCM := PayloadProcessingPluginsConfigMapForTenant(tenantID)
 	wantDeploy := PayloadProcessingDeploymentName(tenantID)
 	var configMap *unstructured.Unstructured
@@ -82,7 +82,7 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	if !found {
 		return errors.New("shared ExtProc ConfigMap data is missing")
 	}
-	config := sharedExtProcConfig(apiTranslation)
+	config := sharedExtProcConfig(apiTranslation, maxBodyBytes)
 	data["extproc.yaml"] = config
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
 		return fmt.Errorf("write shared ExtProc ConfigMap data: %w", err)
@@ -173,15 +173,18 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 // unchanged.
 //
 // apiTranslation enables the Anthropic Messages translation filters.
+// maxBodyBytes is the ExtProc server accumulation ceiling from
+// MaasTenantConfig.spec.payloadProcessing.maxBodyBytes.
 //
 // Returns the deterministic Praxis YAML configuration for the shared ipp
 // processor.
-func sharedExtProcConfig(apiTranslation bool) string {
+func sharedExtProcConfig(apiTranslation bool, maxBodyBytes int64) string {
 	var b strings.Builder
 	b.WriteString("server:\n")
 	b.WriteString("  grpc_address: \"0.0.0.0:9004\"\n")
 	b.WriteString("  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	fmt.Fprintf(&b, "  max_body_bytes: %d\n", maxBodyBytes)
 	b.WriteString("  tls:\n")
 	b.WriteString("    mode: self_signed\n\n")
 	b.WriteString("filter_chains:\n")
@@ -242,8 +245,6 @@ func sharedExtProcConfig(apiTranslation bool) string {
 		b.WriteString("          - when:\n")
 		b.WriteString("              path: \"/v1/messages\"\n")
 	}
-	b.WriteString("\ninsecure_options:\n")
-	b.WriteString("  allow_unbounded_body: true\n")
 	return b.String()
 }
 
@@ -259,12 +260,12 @@ func writeStreamUsageInject(b *strings.Builder) {
 // MaaS/KServe post-auth workload is intentionally not modified. Secret values
 // are never read: kubelet projects the referenced Secret into this workload and
 // credential_inject reads the mounted file at request time.
-func configureExternalModelExtProc(resources []unstructured.Unstructured, tenantID, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) error {
+func configureExternalModelExtProc(resources []unstructured.Unstructured, tenantID, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool, maxBodyBytes int64) error {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return err
 	}
-	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled)
+	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled, maxBodyBytes)
 
 	var configMap *unstructured.Unstructured
 	var deployment *unstructured.Unstructured
@@ -451,7 +452,7 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 	return credentials, nil
 }
 
-func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential, apiTranslationEnabled bool) string {
+func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential, apiTranslationEnabled bool, maxBodyBytes int64) string {
 	clusterSet := make(map[string]bool, len(candidates))
 	for _, candidate := range candidates {
 		clusterSet[candidate.Cluster] = true
@@ -464,12 +465,11 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
-	// Bound buffered translation work only when the tenant opts in. With
-	// translation disabled, omit the translation and provider-profile filters
-	// and retain main's unbounded-body setting.
-	if apiTranslationEnabled {
-		fmt.Fprintf(&b, "  max_body_bytes: %d\n", extprocMaxBodyBytes)
-	}
+	// Always bound ExtProc accumulation. Translation-off previously relied on
+	// insecure_options.allow_unbounded_body; tenants raise the ceiling via
+	// MaasTenantConfig.spec.payloadProcessing.maxBodyBytes (default 10 MiB).
+	// Filter-local stream_usage / translation buffers stay on extprocMaxBodyBytes.
+	fmt.Fprintf(&b, "  max_body_bytes: %d\n", maxBodyBytes)
 	b.WriteString("  tls:\n    mode: self_signed\n\n")
 	// headers must stay first: it strips caller credentials and internal MaaS
 	// identity headers before intelligent_route / credential_inject run, so
@@ -514,9 +514,6 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 			}
 			fmt.Fprintf(&b, "            file: %s\n", credential.file)
 		}
-	}
-	if !apiTranslationEnabled {
-		b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
 	}
 	return b.String()
 }

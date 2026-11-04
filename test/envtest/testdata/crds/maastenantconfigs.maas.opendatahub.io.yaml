@@ -113,8 +113,8 @@ spec:
                     type: object
                 type: object
               payloadProcessing:
-                description: PayloadProcessing defines scaling configuration for payload-processing
-                  (IPP) pods.
+                description: PayloadProcessing defines configuration for payload-processing pods
+                  (scaling/resources and ExtProc server.max_body_bytes).
                 properties:
                   autoscaling:
                     description: |-
@@ -152,6 +152,15 @@ spec:
                       When Autoscaling is enabled, this value sets the HPA minReplicas floor.
                     format: int32
                     maximum: 100
+                    minimum: 1
+                    type: integer
+                  maxBodyBytes:
+                    default: 10485760
+                    description: |-
+                      MaxBodyBytes bounds ExtProc request-body accumulation (server.max_body_bytes).
+                      This is ExtProc accumulation, not Envoy's HTTP buffer filter.
+                    format: int64
+                    maximum: 104857600
                     minimum: 1
                     type: integer
                   resources:
