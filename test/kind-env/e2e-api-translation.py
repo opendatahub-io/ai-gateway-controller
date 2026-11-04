@@ -6811,16 +6811,16 @@ def main():
 
     off_observed = wait_observation(lambda o: off_marker in o.get("message_text", []), "feature-off request")
     save_json(EVIDENCE / "feature-off-response.json", json.loads(off_raw) if off_raw else {})
+    # The MaaS key authenticates ingress; it is not a provider credential and must not reach the backend.
     record("feature_off_passthrough", rc == 0 and off_status == "200"
            and off_observed.get("path") == "/v1/messages"
-           and off_observed.get("authorization_present") is True
-           and off_observed.get("authorization_scheme") == "Bearer"
+           and off_observed.get("authorization_present") is False
+           and off_observed.get("authorization_scheme") is None
            and off_observed.get("x_api_key_present") is False
            and off_observed.get("model") == "demo",
            {"http_status": off_status, "upstream_path": off_observed.get("path"),
             "model": off_observed.get("model"),
-            "authorization_forwarded": off_observed.get("authorization_present"),
-            "authorization_scheme": off_observed.get("authorization_scheme"),
+            "client_authorization_not_forwarded": off_observed.get("authorization_present") is False,
             "x_api_key_absent": off_observed.get("x_api_key_present") is False,
             "body_marker_preserved": off_marker in off_observed.get("message_text", [])})
     if rc != 0 or off_status != "200":
@@ -6847,7 +6847,11 @@ def main():
     extproc_on, pods_on = wait_shared_runtime_convergence("feature-on")
     names = ["anthropic_messages_request", "anthropic_messages_to_chat_completions",
              "anthropic_messages_to_chat_completions_stream", "headers", "path_rewrite"]
-    positions = [extproc_on.find(name) for name in names]
+    positions = [extproc_on.find(f"filter: {name}") for name in names[:3]]
+    positions.extend([
+        extproc_on.find("filter: headers\n        request_remove:\n          - x-api-key"),
+        extproc_on.find("filter: path_rewrite"),
+    ])
     record("feature_on_filter_order_and_rollout", all(p >= 0 for p in positions) and positions == sorted(positions)
            and bool(pods_on) and all(p["ready"] and p["mounted_config"] == extproc_on for p in pods_on),
            {"filters": names, "ordered": positions == sorted(positions),
@@ -6920,17 +6924,18 @@ def main():
     openai_events = sse_events(openai_raw)
     (EVIDENCE / "unrelated-openai-stream-events.json").write_text(json.dumps(openai_events, indent=2) + "\n")
     openai_data = [e["data"] for e in openai_events]
+    # The shared MaaS ExtProc chain consumes caller credentials before forwarding upstream.
     record("unrelated_openai_sse_passthrough", rc == 0 and openai_status == "200"
            and openai_observed.get("path") == "/v1/chat/completions"
            and openai_observed.get("stream") is True
-           and openai_observed.get("x_api_key_present") is True
+           and openai_observed.get("x_api_key_present") is False
            and any(isinstance(d, dict) and "choices" in d for d in openai_data)
            and "[DONE]" in openai_data
            and openai_content_type.startswith("text/event-stream")
            and openai_total_ms - openai_first_ms >= 500,
            {"http_status": openai_status, "upstream_path": openai_observed.get("path"),
             "upstream_stream": openai_observed.get("stream"), "openai_sse_events": len(openai_events),
-            "x_api_key_preserved_on_openai_route": openai_observed.get("x_api_key_present"),
+            "client_x_api_key_not_forwarded": openai_observed.get("x_api_key_present") is False,
             "termination": "[DONE]" in openai_data, "content_type": openai_content_type,
             "first_event_latency_ms": round(openai_first_ms, 1),
             "total_response_ms": round(openai_total_ms, 1),

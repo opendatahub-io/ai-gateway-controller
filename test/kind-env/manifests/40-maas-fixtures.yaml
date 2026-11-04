@@ -4,12 +4,13 @@
 # Scope: Kind E2E fixture only. This is not a production deployment manifest.
 #
 # Dependencies: Requires 20-fixtures.yaml's demo-model, the models-as-a-service
-# namespace, the MaaS API/controller, and the generated HTTPRoute. The route
-# policy in 50-route-policies.yaml authenticates the resulting route.
+# namespace, the MaaS API/controller, and the generated HTTPRoute. The
+# MaaSAuthPolicy below is the sole model authorization policy; the harness must
+# not add a route AuthPolicy that conflicts with MaaS policy generation.
 #
-# Qualification role: Proves tenant-A subscription, user authentication, and
-# token-rate-limit metadata are attached to the controller-generated model
-# route. `kind-user` and related values are test-only identities.
+# Qualification role: Supplies the tenant-A subscription and model-scoped
+# MaaSAuthPolicy used by the normal Gateway authorization test. `kind-user`
+# and related values are test-only identities.
 
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
