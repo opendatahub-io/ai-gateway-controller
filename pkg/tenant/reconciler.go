@@ -638,26 +638,12 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
-	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, apiTranslation)
-	if errors.Is(err, errStaleBinding) {
-		log.Info("guardrail status is behind its spec; keeping the checks already published", "error", err)
-		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
-	}
-	if err != nil && !softCalloutErr(err) {
+	resources, retry, err := r.configurePraxisNemoCallouts(ctx, log, resources, tenantID, tenantNamespace, gatewayNamespace, infraNamespace, apiTranslation)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err != nil {
-		log.Error(err, "guardrail catalog is incomplete; affected checks fail closed and the rest are published")
-	}
-	r.reportNemoOutsideInfra(ctx, log, tenantNamespace, infraNamespace, pinNemoCalloutsToInfra(callouts, infraNamespace))
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-	bindNemoPodSelectors(ctx, reader, callouts)
-	resources, err = configureNemoCallouts(resources, tenantID, gatewayNamespace, tenantNamespace, callouts)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("compile NeMo callouts: %w", err)
+	if retry {
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	// ServiceMonitor (and similar scrape CRs) are optional: clusters without
 	// prometheus-operator must still get ExtProc. Drop those kinds before the
@@ -792,6 +778,37 @@ func (r *Reconciler) omitOptionalUnavailableResources(ctx context.Context, log l
 		}
 	}
 	return out, nil
+}
+
+func (r *Reconciler) configurePraxisNemoCallouts(
+	ctx context.Context,
+	log logr.Logger,
+	resources []unstructured.Unstructured,
+	tenantID, tenantNamespace, gatewayNamespace, infraNamespace string,
+	outputUnsupported bool,
+) ([]unstructured.Unstructured, bool, error) {
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, outputUnsupported)
+	if errors.Is(err, errStaleBinding) {
+		log.Info("guardrail status is behind its spec; keeping the checks already published", "error", err)
+		return nil, true, nil
+	}
+	if err != nil && !softCalloutErr(err) {
+		return nil, false, err
+	}
+	if err != nil {
+		log.Error(err, "guardrail catalog is incomplete; affected checks fail closed and the rest are published")
+	}
+	r.reportNemoOutsideInfra(ctx, log, tenantNamespace, infraNamespace, pinNemoCalloutsToInfra(callouts, infraNamespace))
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	bindNemoPodSelectors(ctx, reader, callouts)
+	resources, err = configureNemoCallouts(resources, tenantID, gatewayNamespace, tenantNamespace, callouts)
+	if err != nil {
+		return nil, false, fmt.Errorf("compile NeMo callouts: %w", err)
+	}
+	return resources, false, nil
 }
 
 func (r *Reconciler) resolvePraxisRuntimeCandidates(
