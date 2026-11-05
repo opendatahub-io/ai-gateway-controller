@@ -291,8 +291,8 @@ func TestExternalModelRuntimeExcludesDeletingModels(t *testing.T) {
 	if err != nil || len(candidates) != 1 || candidates[0].StableID != "active/provider-provider" {
 		t.Fatalf("runtime candidates = %#v, err=%v; want only active model", candidates, err)
 	}
-	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
-	if err != nil || len(required) != 1 || !required[provider.Name] {
+	_, required, unavailable, rejected, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
+	if err != nil || len(required) != 1 || len(unavailable) != 0 || len(rejected) != 0 || !required[envelope.CandidateStableID("active", provider.Name)] {
 		t.Fatalf("required providers = %#v, err=%v; deleting model must not add an extra requirement", required, err)
 	}
 }
@@ -2140,4 +2140,17 @@ func TestEnqueueMaasTenantConfigForAITenant(t *testing.T) {
 			t.Fatalf("len(reqs) = %d, want 0", len(reqs))
 		}
 	})
+}
+
+func TestInvalidNameModelIsRejectedOnlyAtCurrentGeneration(t *testing.T) {
+	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Generation: 2},
+		Status: v1alpha1.ExternalModelStatus{Phase: "Failed", ObservedGeneration: 2,
+			Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "InvalidName", ObservedGeneration: 2}}}}
+	if !modelHasCurrentRejectedCandidate(model) {
+		t.Fatal("current InvalidName model must not block healthy sibling runtime")
+	}
+	model.Status.ObservedGeneration = 1
+	if modelHasCurrentRejectedCandidate(model) {
+		t.Fatal("stale InvalidName status must not reject an updated model")
+	}
 }

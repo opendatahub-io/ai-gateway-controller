@@ -980,7 +980,7 @@ func (r *Reconciler) providersForTenant(
 				continue
 			}
 			provider := providerByName[name]
-			providerReady := provider != nil && provider.Status.Phase == resolver.PhaseReady
+			providerReady := provider != nil && provider.DeletionTimestamp.IsZero() && provider.Status.Phase == resolver.PhaseReady
 			if !providerReady {
 				unavailable[candidateID] = true
 			}
@@ -1012,7 +1012,7 @@ func modelHasCurrentRejectedCandidate(model *v1alpha1.ExternalModel) bool {
 	}
 	ready := meta.FindStatusCondition(model.Status.Conditions, "Ready")
 	return ready != nil && ready.Status == metav1.ConditionFalse &&
-		(ready.Reason == "ReconcileFailed" || ready.Reason == reasonModelCredentialNotReady)
+		(ready.Reason == "ReconcileFailed" || ready.Reason == "InvalidName" || ready.Reason == reasonModelCredentialNotReady)
 }
 
 func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, bool, error) {
