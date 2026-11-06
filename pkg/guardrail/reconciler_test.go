@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1164,6 +1165,230 @@ func TestReconcileKeepsAnAcceptedBindingWhenTheProviderReadFails(t *testing.T) {
 		t.Errorf("providerEndpoint = %q, want the accepted one %q left standing",
 			got.Status.ProviderEndpoint, accepted.Status.ProviderEndpoint)
 	}
+}
+
+// TestReconcileFencesAnAcceptedBindingOnceTheProviderReadStaysBroken is the
+// other half of the test above. Tolerating a failed read is right for a blip
+// and wrong for a revoked RBAC rule, which looks identical from here and
+// lasts until someone fixes it. Past the staleness budget the standing
+// verdict is no longer evidence the reference is authorized, so the binding
+// is refused rather than left enforcing on a read that has not succeeded in
+// as long as the budget allows.
+//
+// The refusal reason has to be its own: reporting a provider nobody can read
+// as ProviderNotFound would send an operator looking for a deleted resource
+// that is still there.
+func TestReconcileFencesAnAcceptedBindingOnceTheProviderReadStaysBroken(t *testing.T) {
+	failRead := false
+	f := newFixture(fixtureOptions{
+		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
+		liveObjects:  []client.Object{newNemo(providerNS, nemoName, map[string]any{"from": "All"})},
+		liveFuncs: interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if failRead && obj.GetObjectKind().GroupVersionKind().Kind == NemoGuardrailsGVK.Kind {
+					return apierrors.NewForbidden(schema.GroupResource{Group: NemoGuardrailsGVK.Group, Resource: "nemoguardrails"},
+						key.Name, errors.New("RBAC: access denied"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	})
+
+	f.reconcile(t, consumerNS)
+	accepted := f.reload(t, consumerNS)
+	if accepted.Status.LastProviderReadTime == nil {
+		t.Fatal("lastProviderReadTime is unset after an accepted reconcile; the budget has nothing to measure from")
+	}
+
+	// The budget has run out. Backdating the recorded read is what a provider
+	// that has been unreadable for longer than the budget looks like, without
+	// the test having to wait for one.
+	backdateProviderRead(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
+
+	failRead = true
+	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
+	if err != nil {
+		t.Fatalf("Reconcile: %v, want the binding fenced rather than retried forever", err)
+	}
+
+	got := requireDenied(t, f, res, consumerNS, reasonProviderUnverified)
+	if got.Status.BindingRevision != "" || got.Status.ProviderEndpoint != "" {
+		t.Errorf("bindingRevision = %q, providerEndpoint = %q, want both cleared on a fenced binding",
+			got.Status.BindingRevision, got.Status.ProviderEndpoint)
+	}
+	if got.Status.LastProviderReadTime == nil {
+		t.Error("lastProviderReadTime was cleared; it records when the provider was observed, not what was decided")
+	}
+}
+
+// TestReconcileRestoresAFencedBindingOnceTheProviderReadsAgain closes the
+// loop. Fencing is a verdict on the staleness of a read, not a latch, so the
+// first read that completes re-accepts the policy and re-stamps the clock the
+// budget is measured against.
+func TestReconcileRestoresAFencedBindingOnceTheProviderReadsAgain(t *testing.T) {
+	failRead := false
+	f := newFixture(fixtureOptions{
+		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
+		liveObjects:  []client.Object{newNemo(providerNS, nemoName, map[string]any{"from": "All"})},
+		liveFuncs: interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if failRead && obj.GetObjectKind().GroupVersionKind().Kind == NemoGuardrailsGVK.Kind {
+					return apierrors.NewForbidden(schema.GroupResource{Group: NemoGuardrailsGVK.Group, Resource: "nemoguardrails"},
+						key.Name, errors.New("RBAC: access denied"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	})
+
+	f.reconcile(t, consumerNS)
+	accepted := f.reload(t, consumerNS)
+	backdateProviderRead(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
+
+	failRead = true
+	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	fenced := requireDenied(t, f, res, consumerNS, reasonProviderUnverified)
+
+	failRead = false
+	f.reconcile(t, consumerNS)
+
+	got := f.reload(t, consumerNS)
+	requireCondition(t, got, ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	if got.Status.BindingRevision != accepted.Status.BindingRevision {
+		t.Errorf("bindingRevision = %q, want the binding restored to %q",
+			got.Status.BindingRevision, accepted.Status.BindingRevision)
+	}
+	if !got.Status.LastProviderReadTime.After(fenced.Status.LastProviderReadTime.Time) {
+		t.Errorf("lastProviderReadTime = %v, want a stamp newer than the backdated %v",
+			got.Status.LastProviderReadTime, fenced.Status.LastProviderReadTime)
+	}
+}
+
+// TestReconcileFencesALegacyAcceptedBindingWithNoRecordedRead covers the
+// binding this field arrived too late for. A policy accepted by a controller
+// that did not record read times has a verdict standing and no timestamp to
+// age it against, so if reads start failing at the upgrade there is never a
+// first success to stamp one. Measuring from when this process started bounds
+// that at one budget instead of forever.
+func TestReconcileFencesALegacyAcceptedBindingWithNoRecordedRead(t *testing.T) {
+	failRead := false
+	f := newFixture(fixtureOptions{
+		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
+		liveObjects:  []client.Object{newNemo(providerNS, nemoName, map[string]any{"from": "All"})},
+		liveFuncs: interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if failRead && obj.GetObjectKind().GroupVersionKind().Kind == NemoGuardrailsGVK.Kind {
+					return apierrors.NewForbidden(schema.GroupResource{Group: NemoGuardrailsGVK.Group, Resource: "nemoguardrails"},
+						key.Name, errors.New("RBAC: access denied"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	})
+
+	// An accepted binding carrying no read time is what the upgrade leaves
+	// behind, and the only way to produce one through the current code.
+	f.reconcile(t, consumerNS)
+	clearProviderRead(t, f, consumerNS)
+	backdateStart(f, f.reconciler.providerReadStaleAfter()+time.Minute)
+
+	failRead = true
+	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
+	if err != nil {
+		t.Fatalf("Reconcile: %v, want the legacy binding fenced rather than left accepted forever", err)
+	}
+	requireDenied(t, f, res, consumerNS, reasonProviderUnverified)
+}
+
+// TestReconcileKeepsRetryingAPolicyThatWasNeverAccepted is the limit on the
+// test above. The process-start anchor bounds a verdict that is standing; a
+// policy that never reached one has nothing to fence, and refusing it on a
+// read that did not complete would report an authorization answer nobody got.
+func TestReconcileKeepsRetryingAPolicyThatWasNeverAccepted(t *testing.T) {
+	f := newFixture(fixtureOptions{
+		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
+		liveObjects:  []client.Object{newNemo(providerNS, nemoName, map[string]any{"from": "All"})},
+		liveFuncs: interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if obj.GetObjectKind().GroupVersionKind().Kind == NemoGuardrailsGVK.Kind {
+					return apierrors.NewForbidden(schema.GroupResource{Group: NemoGuardrailsGVK.Group, Resource: "nemoguardrails"},
+						key.Name, errors.New("RBAC: access denied"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	})
+	backdateStart(f, f.reconciler.providerReadStaleAfter()+time.Minute)
+
+	if _, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS)); err == nil {
+		t.Fatal("Reconcile returned no error, want the read retried")
+	}
+
+	got := f.reload(t, consumerNS)
+	if condition := apimeta.FindStatusCondition(got.Status.Conditions, ConditionAccepted); condition != nil {
+		t.Errorf("Accepted = %s/%s, want no verdict published from a read that did not complete",
+			condition.Status, condition.Reason)
+	}
+}
+
+// TestRetryCeilingStaysWithinTheBudgetAndNeverCollapses pins the ceiling the
+// budget depends on. ResyncInterval is documented as positive but is wired
+// straight from a flag: a zero one is not an absent ceiling, it requeues every
+// failure immediately, and one longer than the budget does not bound it.
+func TestRetryCeilingStaysWithinTheBudgetAndNeverCollapses(t *testing.T) {
+	const budget = 15 * time.Minute
+	for _, testCase := range []struct {
+		name   string
+		resync time.Duration
+		want   time.Duration
+	}{
+		{"shorter than the budget is the re-check cadence already in force", 5 * time.Minute, 5 * time.Minute},
+		{"longer than the budget would leave it unenforceable", time.Hour, budget},
+		{"zero would requeue immediately on every failure", 0, budget},
+		{"negative is the same mistake", -time.Second, budget},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			r := &Reconciler{ResyncInterval: testCase.resync, ProviderReadStaleAfter: budget}
+			if got := r.retryCeiling(); got != testCase.want {
+				t.Errorf("retryCeiling() = %s, want %s", got, testCase.want)
+			}
+		})
+	}
+}
+
+// backdateProviderRead moves status.lastProviderReadTime into the past, so a
+// test can reach the staleness budget without sleeping through it.
+func backdateProviderRead(t *testing.T, f *fixture, namespace string, age time.Duration) {
+	t.Helper()
+	guardrail := f.reload(t, namespace)
+	guardrail.Status.LastProviderReadTime = ptr.To(metav1.NewTime(time.Now().Add(-age)))
+	if err := f.cache.Status().Update(context.Background(), guardrail); err != nil {
+		t.Fatalf("backdating lastProviderReadTime: %v", err)
+	}
+}
+
+// clearProviderRead drops status.lastProviderReadTime, leaving the status a
+// controller that never recorded one would have written.
+func clearProviderRead(t *testing.T, f *fixture, namespace string) {
+	t.Helper()
+	guardrail := f.reload(t, namespace)
+	guardrail.Status.LastProviderReadTime = nil
+	if err := f.cache.Status().Update(context.Background(), guardrail); err != nil {
+		t.Fatalf("clearing lastProviderReadTime: %v", err)
+	}
+}
+
+// backdateStart moves the reconciler's start time into the past, so a test
+// reaches the budget an unstamped binding is measured against without waiting.
+//
+// The anchor is taken once, on the first reconcile. Spending that here is what
+// keeps a reconcile after this call from re-anchoring on the present.
+func backdateStart(f *fixture, age time.Duration) {
+	f.reconciler.anchorOnce.Do(func() {})
+	f.reconciler.startedAt = time.Now().Add(-age)
 }
 
 // TestReconcileKeepsAnAcceptedBindingWhenTheNamespaceReadFails is the same
