@@ -117,6 +117,11 @@ func TestRenameNonDefaultTenantPayloadProcessingDeployment(t *testing.T) {
 		t.Fatalf("serviceAccountName = %q, want the dedicated post-auth %q", sa, want)
 	}
 
+	automount, found, _ := unstructured.NestedBool(out[0].Object, "spec", "template", "spec", "automountServiceAccountToken")
+	if !found || automount {
+		t.Fatalf("automountServiceAccountToken = %v (found=%v), want false", automount, found)
+	}
+
 	volumes, _, _ := unstructured.NestedSlice(out[0].Object, "spec", "template", "spec", "volumes")
 	vol0, ok := volumes[0].(map[string]any)
 	if !ok {
