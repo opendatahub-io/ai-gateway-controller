@@ -73,11 +73,19 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["envoyfilters", "destinationrules"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Manage the shared payload-processing-reader ClusterRole plus one
-# payload-processing-reader-{tenantID} ClusterRoleBinding per tenant. Names
-# are dynamic per tenant, so this can't be scoped down with resourceNames.
+# Manage ExtProc metrics ClusterRoles/Bindings (payload-processing-metrics-auth
+# / -metrics-reader) and delete leftover payload-processing-reader bindings
+# from older installs. Names are dynamic per tenant, so this can't be scoped
+# down with resourceNames.
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterroles", "clusterrolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Privilege-escalation mirror for creating metrics-reader (get /metrics).
+- nonResourceURLs: ["/metrics"]
+  verbs: ["get"]
+# ServiceMonitor for ExtProc /metrics scrape wiring (optional CRD).
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["servicemonitors"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # A Role and RoleBinding in the infra namespace, where ODH and RHOAI run the
 # NemoGuardrails workload, let the tenant post-auth ServiceAccount get the
@@ -90,23 +98,18 @@ rules:
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["roles", "rolebindings"]
   verbs: ["get", "list", "create", "update", "patch", "delete"]
-# Escalation-check mirror: ai-gateway-controller must hold every permission it
-# grants via payload-processing-reader.
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "list", "watch"]
 # Controller-owned credential copies (agc-cred-<hash12>) in tenant namespaces.
 # The tenant ExtProc can mount Secrets only from its own namespace, so a
 # credential Secret from elsewhere is copied there: server-side apply needs
-# create and patch, and unreferenced copies are deleted. Trust boundary: the
-# ClusterRoleBinding grants these verbs on every Secret in every namespace.
-# RBAC cannot scope verbs by label, and hashed names rule out resourceNames,
-# so the agc-cred- name and ownership labels are controller safeguards, not
-# RBAC restrictions: the controller itself must only patch or delete Secrets
-# carrying its ownership labels.
+# get/list/watch/create/patch, and unreferenced copies are deleted. Trust
+# boundary: the ClusterRoleBinding grants these verbs on every Secret in every
+# namespace. RBAC cannot scope verbs by label, and hashed names rule out
+# resourceNames, so the agc-cred- name and ownership labels are controller
+# safeguards, not RBAC restrictions: the controller itself must only patch or
+# delete Secrets carrying its ownership labels.
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["create", "patch", "delete"]
+  verbs: ["get", "list", "watch", "create", "patch", "delete"]
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["externalmodels"]
   verbs: ["get", "list", "watch"]

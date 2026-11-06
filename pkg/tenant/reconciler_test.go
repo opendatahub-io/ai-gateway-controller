@@ -1111,12 +1111,15 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 	assertContains(t, names, "payload-processing-redteam")
 	assertContains(t, names, "payload-pre-processing-redteam")
 	assertContains(t, names, "payload-processing-plugins-redteam")
-	assertContains(t, names, "payload-processing-reader-redteam")
-	// The shared ClusterRole must NOT be tenant-suffixed.
-	assertContains(t, names, "payload-processing-reader")
+	assertContains(t, names, "payload-processing-metrics-auth")
+	assertContains(t, names, "payload-processing-metrics-reader")
+	assertContains(t, names, "payload-processing-metrics")
 	for _, n := range names {
 		if n == "payload-processing" || n == "payload-pre-processing" {
 			t.Fatalf("found unsuffixed resource name %q while reconciling a non-default tenant", n)
+		}
+		if strings.Contains(n, "payload-processing-reader") {
+			t.Fatalf("ExtProc must not apply reader ClusterRole/Binding %q", n)
 		}
 	}
 }
@@ -1138,7 +1141,14 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	assertContains(t, names, "payload-processing")
 	assertContains(t, names, "payload-pre-processing")
 	assertContains(t, names, "payload-processing-plugins")
-	assertContains(t, names, "payload-processing-reader")
+	assertContains(t, names, "payload-processing-metrics-auth")
+	assertContains(t, names, "payload-processing-metrics-reader")
+	assertContains(t, names, "payload-processing-metrics")
+	for _, n := range names {
+		if strings.Contains(n, "payload-processing-reader") {
+			t.Fatalf("ExtProc must not apply reader ClusterRole/Binding %q", n)
+		}
+	}
 	for _, kind := range rec.kindSnapshot() {
 		if kind == "HorizontalPodAutoscaler" {
 			t.Fatal("unexpected HPA apply when autoscaling is not configured")

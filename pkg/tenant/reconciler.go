@@ -29,6 +29,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1107,7 +1108,10 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 		current := &unstructured.Unstructured{}
 		current.SetGroupVersionKind(desired.GroupVersionKind())
 		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
-			if apierrors.IsNotFound(err) {
+			// NotFound: nothing to hand off from. NoMatch: optional CRDs
+			// (ServiceMonitor without prometheus-operator) are not installed,
+			// so they cannot be foreign-owned either.
+			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 				continue
 			}
 			return fmt.Errorf("inspect %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)

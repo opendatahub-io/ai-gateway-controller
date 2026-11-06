@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -42,6 +44,11 @@ func Apply(ctx context.Context, c client.Client, resources []unstructured.Unstru
 		// objects; unstructured resources (including third-party CRDs like EnvoyFilter/DestinationRule
 		// with no generated apply-configuration type) must still use client.Patch with client.Apply.
 		if err := c.Patch(ctx, u, client.Apply, client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
+			// ServiceMonitor is optional: clusters without prometheus-operator
+			// must still get the ExtProc dataplane. Other missing kinds fail.
+			if u.GetKind() == "ServiceMonitor" && (meta.IsNoMatchError(err) || apierrors.IsNotFound(err)) {
+				continue
+			}
 			return fmt.Errorf("apply %s %s/%s: %w", u.GetKind(), u.GetNamespace(), u.GetName(), err)
 		}
 	}
