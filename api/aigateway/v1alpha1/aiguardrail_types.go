@@ -183,6 +183,18 @@ type AIGuardrailStatus struct {
 	// +optional
 	BindingRevision string `json:"bindingRevision,omitempty"`
 
+	// LastProviderReadTime is when the referenced NemoGuardrails was last read
+	// successfully. A verdict is only as current as the read behind it, and a
+	// read that fails leaves the previous verdict standing, so this is what
+	// lets a consumer tell a two-second-old Accepted from a two-day-old one
+	// without reading controller logs.
+	//
+	// Unlike providerEndpoint and bindingRevision it is not cleared on
+	// refusal: it records when the provider was observed, not what was
+	// decided.
+	// +optional
+	LastProviderReadTime *metav1.Time `json:"lastProviderReadTime,omitempty"`
+
 	// Conditions report sanitized acceptance, reference, provider and
 	// compatibility state. Credentials and provider configuration are never
 	// exposed here.
