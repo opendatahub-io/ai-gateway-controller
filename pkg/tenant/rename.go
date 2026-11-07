@@ -212,6 +212,9 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	if err := setServiceAccountName(u, PayloadProcessingPostServiceAccountName(tenantID)); err != nil {
 		return fmt.Errorf("serviceAccountName: %w", err)
 	}
+	if err := unstructured.SetNestedField(u.Object, false, "spec", "template", "spec", "automountServiceAccountToken"); err != nil {
+		return fmt.Errorf("automountServiceAccountToken: %w", err)
+	}
 	if err := setConfigMapVolumeName(u, "plugins-config-volume", PayloadProcessingPluginsConfigMapForTenant(tenantID)); err != nil {
 		return fmt.Errorf("plugins ConfigMap volume: %w", err)
 	}
