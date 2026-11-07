@@ -115,6 +115,9 @@ spec:
                 # The presented token, forwarded as-is under
                 # x-forwarded-id-token (MS-0007).
                 "id_token": trim_prefix(authorization, "Bearer "),
+                # The dashboard BFF reads its maas-api token from
+                # x-forwarded-access-token.
+                "access_token": trim_prefix(authorization, "Bearer "),
                 "username": username,
                 "email": object.get(claims, "email", ""),
                 "groups_header": json.marshal(array.concat(["system:authenticated"], sort(groups)))
@@ -158,6 +161,7 @@ spec:
                 # the session path (MS-0007 SSO flow).
                 "authorization": concat("", ["Bearer ", token]),
                 "id_token": token,
+                "access_token": token,
                 "username": username,
                 "email": object.get(response.headers, "x-auth-request-email", [""])[0],
                 "groups_header": json.marshal(array.concat(["system:authenticated"], sort(groups)))
@@ -191,7 +195,7 @@ spec:
           x-maas-group:
             plain:
               expression: auth.authorization['session-and-identity'].identity.groups_header
-          x-maas-orgid:
+          x-maas-organization-id:
             plain:
               expression: auth.authorization['session-and-identity'].organization.org_id
           x-maas-roles:
@@ -206,6 +210,13 @@ spec:
           x-forwarded-id-token:
             plain:
               expression: auth.authorization['session-and-identity'].identity.id_token
+          # The dashboard BFF authenticates to maas-api with the token in
+          # x-forwarded-access-token (its default auth token header); set
+          # it alongside x-forwarded-id-token so a client-supplied value is
+          # always overwritten.
+          x-forwarded-access-token:
+            plain:
+              expression: auth.authorization['session-and-identity'].identity.access_token
           cookie:
             plain:
               expression: auth.authorization['session-and-identity'].application_cookies

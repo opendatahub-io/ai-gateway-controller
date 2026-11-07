@@ -37,8 +37,9 @@ spec:
         # Outer defense for headers the portal AuthPolicy does not inject:
         # the route filter runs after the auth mutation, so it must not
         # remove any header the AuthPolicy sets (the four x-maas-*
-        # identity headers, x-auth-request-user/-email, and
-        # x-forwarded-id-token) — those are overwritten by the policy
+        # identity headers, x-auth-request-user/-email,
+        # x-forwarded-id-token, and x-forwarded-access-token) — those are
+        # overwritten by the policy
         # on success instead.
         - type: RequestHeaderModifier
           requestHeaderModifier:

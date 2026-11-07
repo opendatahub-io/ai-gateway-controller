@@ -417,6 +417,9 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 	}
 	for _, want := range []string{
 		"x-forwarded-id-token",
+		// The dashboard BFF reads its token from x-forwarded-access-token.
+		"x-forwarded-access-token",
+		"identity.access_token",
 		"/oauth2/start?rd=",
 		"allow = true",
 		"login_location := sprintf",
@@ -431,7 +434,7 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 		"issuerUrl\":\"https://keycloak.apps.example.com/realms/tenant-a",
 		"x-maas-username",
 		"x-maas-group",
-		"x-maas-orgid",
+		"x-maas-organization-id",
 		"x-maas-roles",
 		"azp == 'test-client",
 		"io.jwt.decode",
