@@ -584,6 +584,101 @@ func TestSetClusterUpstreamAddressRequiresSANMatchers(t *testing.T) {
 	}
 }
 
+func TestSetClusterUpstreamAddressRewritesAllSANs(t *testing.T) {
+	t.Parallel()
+	value := map[string]any{
+		"transport_socket": map[string]any{
+			"typed_config": map[string]any{
+				"sni": "old.example",
+				"common_tls_context": map[string]any{
+					"validation_context": map[string]any{
+						"match_typed_subject_alt_names": []any{
+							map[string]any{
+								"san_type": "DNS",
+								"matcher":  map[string]any{"exact": "old.example"},
+							},
+							map[string]any{
+								"san_type": "DNS",
+								"matcher":  map[string]any{"exact": "also-old.example"},
+							},
+						},
+					},
+				},
+			},
+		},
+		"load_assignment": map[string]any{
+			"cluster_name": "test-cluster",
+			"endpoints": []any{
+				map[string]any{
+					"lb_endpoints": []any{
+						map[string]any{
+							"endpoint": map[string]any{
+								"address": map[string]any{
+									"socket_address": map[string]any{
+										"address":    "old.example",
+										"port_value": int64(9004),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := setClusterUpstreamAddress(value, "new.example"); err != nil {
+		t.Fatalf("setClusterUpstreamAddress: %v", err)
+	}
+	sans, _, _ := unstructured.NestedSlice(value,
+		"transport_socket", "typed_config", "common_tls_context", "validation_context",
+		"match_typed_subject_alt_names")
+	if len(sans) != 2 {
+		t.Fatalf("SANs length = %d, want 2", len(sans))
+	}
+	for i, raw := range sans {
+		san := mustMap(t, raw)
+		matcher := mustMap(t, san["matcher"])
+		if matcher["exact"] != "new.example" {
+			t.Fatalf("san[%d].matcher.exact = %v, want %q", i, matcher["exact"], "new.example")
+		}
+	}
+}
+
+func TestSetClusterUpstreamAddressEmptySANsError(t *testing.T) {
+	t.Parallel()
+	value := map[string]any{
+		"transport_socket": map[string]any{
+			"typed_config": map[string]any{
+				"sni": "old.example",
+				"common_tls_context": map[string]any{
+					"validation_context": map[string]any{
+						"match_typed_subject_alt_names": []any{},
+					},
+				},
+			},
+		},
+		"load_assignment": map[string]any{
+			"endpoints": []any{
+				map[string]any{
+					"lb_endpoints": []any{
+						map[string]any{
+							"endpoint": map[string]any{
+								"address": map[string]any{
+									"socket_address": map[string]any{"address": "old.example"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	err := setClusterUpstreamAddress(value, "new.example")
+	if err == nil || !strings.Contains(err.Error(), "match_typed_subject_alt_names") {
+		t.Fatalf("error = %v, want fail-closed SAN error", err)
+	}
+}
+
 // mustMap and mustSlice type-assert v, failing the test (rather than
 // silently ignoring a bad assertion) if the underlying value has a
 // different shape than expected.

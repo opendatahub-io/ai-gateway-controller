@@ -18,6 +18,7 @@ package tenant
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -96,5 +97,42 @@ func TestConfigureExtProcGrpcRecvMsgSize(t *testing.T) {
 	}
 	if _, hasEnv := otherContainer["env"]; hasEnv {
 		t.Fatalf("unrelated Deployment env mutated: %#v", otherContainer["env"])
+	}
+}
+
+func TestSetContainerEnvValueContainerNotFound(t *testing.T) {
+	dep := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{"name": "other-container"},
+					},
+				},
+			},
+		},
+	}}
+	err := setContainerEnvValue(dep, "nonexistent", "SOME_ENV", "value")
+	if err == nil {
+		t.Fatal("expected error for missing container, got nil")
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Fatalf("error = %q, want mention of container name", err.Error())
+	}
+}
+
+func TestSetContainerEnvValueEmptyContainers(t *testing.T) {
+	dep := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []any{},
+				},
+			},
+		},
+	}}
+	err := setContainerEnvValue(dep, "any", "SOME_ENV", "value")
+	if err == nil {
+		t.Fatal("expected error for empty containers, got nil")
 	}
 }
