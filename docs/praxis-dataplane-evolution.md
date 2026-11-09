@@ -1,8 +1,8 @@
 # Praxis dataplane evolution
 
 How the MaaS AI Gateway dataplane evolves from today's Envoy + ExtProc stack
-toward Praxis. This is a request-path map, not a deployment ADR — see
-[Architecture](./architecture.md) for operator / controller ownership and
+toward Praxis. This is a request-path map — see
+[Architecture](./architecture.md) for what this controller deploys, and
 [DESIGN.md](../DESIGN.md) for implementer detail.
 
 Sources:
@@ -207,10 +207,10 @@ Across Gateway → standard mode, preserve at least:
 | KServe Service routing | Envoy matches HTTPRoute, dials Service | Controller compiles route; Praxis dials Service |
 | InferencePool / EPP | Unchanged when present; not required for baseline | Separate future work — not initial parity |
 
-For control-plane deployment topology and IPP vs Praxis selection, see
-[Architecture](./architecture.md) and
-[Dataplane selection](./dataplane-selection.md). Implementer detail remains
-in [DESIGN.md](../DESIGN.md).
+For objects this controller deploys and ExternalModel serving behavior, see
+[Architecture](./architecture.md) and [External models](./external-models.md).
+Implementer detail (including legacy migration) remains in
+[DESIGN.md](../DESIGN.md).
 
 ## IPP → Praxis plugins ConfigMap migration gate (3.6)
 

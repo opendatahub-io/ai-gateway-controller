@@ -1,9 +1,8 @@
 # External models
 
 How `ExternalModel` / `ExternalProvider` become live Gateway routes and
-ExtProc overlay config under Praxis. For who owns the control plane, see
-[Architecture](./architecture.md). For Praxis vs IPP handoff, see
-[Dataplane selection](./dataplane-selection.md). Implementer detail:
+ExtProc overlay config. For the objects this controller installs, see
+[Architecture](./architecture.md). Implementer detail:
 [DESIGN.md](../DESIGN.md).
 
 ## Control-plane flow
@@ -44,8 +43,7 @@ for an attachment:
 
 | Gate | Requirement |
 | --- | --- |
-| Dataplane backend | Tenant selected **Praxis** (default or explicit) |
-| Handoff | `payload-processing-status` is `steady` |
+| Dataplane | Tenant Praxis ExtProc is installed and handoff status is `steady` |
 | Tenant / Gateway | Owning `AITenant` has a usable Gateway ref and is deploy-ready (not Failed) |
 | Gateway object | Referenced Gateway exists |
 | Model placement | Home path: `MaasTenantConfig` in the model namespace (or an explicit `gatewayRefs` binding) |
@@ -71,7 +69,7 @@ Explicit bindings never fall back to a different Gateway.
 | Outcome | Typical meaning |
 | --- | --- |
 | Ready | Attachment reconciled and distributed for that Gateway |
-| `TenantNotPraxis` / `TenantNotSteady` | Target tenant not on Praxis + `steady` (existing state may be retained) |
+| `TenantNotPraxis` / `TenantNotSteady` | Target tenant dataplane not ready (existing state may be retained) |
 | `GatewayNotManaged` / `AmbiguousTenant` | Gateway → tenant resolution failed |
 | `AttachmentPending` | Cross-tenant serving not yet fully enabled — no serving state for that attachment |
 
@@ -103,10 +101,8 @@ status lands.
 Proportional weighting, health-aware selection, and retries are out of scope
 for the current behavior.
 
-## Cleanup notes (operators)
+## Cleanup notes
 
-- Switching a tenant to `ipp` cleans up Praxis-owned model serving state for
-  that tenant.
 - On Gateway move, the controller applies the new copy first and removes only
   the old copy for the same tenant identity — neighboring tenants are left
   alone.
@@ -116,9 +112,8 @@ for the current behavior.
 
 ## Related docs
 
-| Doc | Audience |
+| Doc | Contents |
 | --- | --- |
-| [Architecture](./architecture.md) | Component ownership |
-| [Dataplane selection](./dataplane-selection.md) | Praxis / IPP annotations |
+| [Architecture](./architecture.md) | Objects this controller deploys |
 | [Praxis dataplane evolution](./praxis-dataplane-evolution.md) | Request path |
 | [DESIGN.md](../DESIGN.md) | Schema extension, finalizers, migration edge cases |

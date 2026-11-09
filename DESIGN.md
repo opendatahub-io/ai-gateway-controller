@@ -2,8 +2,7 @@
 
 Implementer-oriented design notes (rationale, package layout, edge cases).
 For user-facing maps with tables and diagrams, start at
-[docs/architecture.md](./docs/architecture.md),
-[docs/dataplane-selection.md](./docs/dataplane-selection.md), and
+[docs/architecture.md](./docs/architecture.md) and
 [docs/external-models.md](./docs/external-models.md).
 
 Architecture decisions are maintained in the Open Data Hub ADR repository.

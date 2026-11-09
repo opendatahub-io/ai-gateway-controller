@@ -1,107 +1,81 @@
-# AI Gateway control-plane architecture
+# What ai-gateway-controller deploys
 
-Who deploys what, and which component owns which concern. This is a
-deployment and ownership map — not an implementer ADR. For package layout,
-handshake edge cases, and deferred work, see [DESIGN.md](../DESIGN.md).
-For the inference request path (Envoy filters, IPP → Praxis), see
-[Praxis dataplane evolution](./praxis-dataplane-evolution.md).
+`ai-gateway-controller` installs the **Praxis** ExtProc dataplane for each
+ready tenant and reconciles **ExternalModel** / **ExternalProvider** into
+Gateway routes and ExtProc routing config.
 
-## At a glance
+This page lists the objects this controller creates by default. Auth, API
+keys, rate limits, and tenant bootstrap belong to MaaS — see
+[External models](./external-models.md) for the serving path, and
+[DESIGN.md](../DESIGN.md) for implementer detail (including legacy
+migration).
 
-| Component | Role |
-| --- | --- |
-| **ODH / RHOAI operator** | Reconciles `DataScienceCluster`; enables AI Gateway via `aigateway.modelsAsAService` |
-| **AI Gateway Operator** | Deploys sibling controllers when MaaS is `Managed` |
-| **ai-gateway-controller** | External-model control plane; installs per-tenant **Praxis** ExtProc |
-| **maas-controller** | MaaS platform (maas-api, policies, subscriptions, tenant bootstrap); legacy **IPP** ExtProc when selected |
-| **praxis-extproc** | ExtProc dataplane only (payload filters) |
-| **payload-processing (IPP)** | Legacy ExtProc dataplane (and, before the split, also external-model control plane) |
-
-## Pre-3.6 (MaaS + IPP only)
-
-`ai-gateway-controller` is not deployed. IPP owns both external-model
-control plane and ExtProc dataplane.
+## Two jobs
 
 ```mermaid
-flowchart TD
-    DSC["DataScienceCluster<br/>aigateway.modelsAsAService: Managed"]
-    ODH["ODH / RHOAI Operator"]
-    AIGO["AI Gateway Operator"]
-    MAAS["MaaS Controller"]
-    IPP["payload-processing (IPP)"]
-    API["maas-api, policies, subscriptions, ..."]
+flowchart LR
+    AGC["ai-gateway-controller"]
+    TENANT["Per-tenant Praxis ExtProc"]
+    EM["ExternalModel / ExternalProvider"]
+    ROUTE["HTTPRoute · transport · credentials"]
+    OVERLAY["Routing overlay ConfigMap"]
 
-    DSC --> ODH
-    ODH --> AIGO
-    AIGO --> MAAS
-    MAAS --> IPP
-    MAAS --> API
+    AGC --> TENANT
+    AGC --> EM
+    EM --> ROUTE
+    EM --> OVERLAY
+    OVERLAY --> TENANT
 ```
+
+| Job | Trigger | Result |
+| --- | --- | --- |
+| **Dataplane install** | Tenant `MaasTenantConfig` is ready for Praxis | Per-tenant `praxis-extproc` workloads and Gateway filters |
+| **External-model control plane** | `ExternalModel` / `ExternalProvider` | Routes, provider transport, credential projections, ExtProc overlay |
+
+## Per-tenant Praxis dataplane
+
+For each tenant whose Gateway is ready, the controller applies a renamed copy
+of the vendored Praxis ExtProc manifests into the **Gateway namespace**
+(default tenant keeps unsuffixed names; other tenants use `{base}-{tenantID}`).
+
+| Kind | Typical names (default tenant) | Role |
+| --- | --- | --- |
+| Deployment / Service / ServiceAccount | `payload-pre-processing`, `payload-processing`, `payload-processing-external-model` | ExtProc sidecalls from Envoy (pre-auth, post-auth, ExternalModel header phase) |
+| ConfigMap | `payload-processing-plugins` (and related) | ExtProc plugin / filter config |
+| EnvoyFilter | `payload-pre-processing`, `payload-processing`, … | Wire ExtProc into the tenant Gateway |
+| DestinationRule / NetworkPolicy / RBAC | as rendered from the overlay | ExtProc ↔ Envoy / peer access |
+
+Exact names come from the pinned `praxis-extproc` overlay under
+`config/manifests/`. Additional tenants get the same set with a
+`-{tenantID}` suffix.
+
+## External-model objects
+
+When an `ExternalModel` is ready to serve, the controller also publishes:
+
+| Kind | Where | Role |
+| --- | --- | --- |
+| HTTPRoute | Model / Gateway path | Client → Gateway route for the model |
+| Service (ExternalName) / ServiceEntry / DestinationRule | Gateway namespace | Provider upstream hop |
+| EnvoyFilter | Gateway namespace | Model-scoped ExtProc hooks |
+| Secret copies (`agc-cred-*`) | Tenant ExtProc namespace | Credentials the ExtProc can mount |
+| Routing overlay ConfigMap | Tenant ExtProc namespace | Content-addressed route / provider selection for Praxis |
+
+Details of when a model becomes Ready, `gatewayRefs`, and provider weights
+are in [External models](./external-models.md).
+
+## What this controller does not own
 
 | Concern | Owner |
 | --- | --- |
-| ExtProc dataplane | IPP via maas-controller tenant reconcile |
-| ExternalModel / ExternalProvider reconcile | IPP |
-| Auth, API keys, rate limits, subscriptions | maas-controller → maas-api / Kuadrant |
-| Tenant namespaces, Gateway claim | maas-controller (`AITenant` / `MaasTenantConfig`) |
-
-## 3.6 (sibling controllers + Praxis)
-
-AI Gateway Operator deploys **both** `ai-gateway-controller` and
-`maas-controller`. External-model control plane and Praxis ExtProc move to
-this repository; IPP remains available per tenant during migration.
-
-```mermaid
-flowchart TD
-    DSC["DataScienceCluster<br/>aigateway.modelsAsAService: Managed"]
-    ODH["ODH / RHOAI Operator"]
-    AIGO["AI Gateway Operator"]
-    AIGC["AI Gateway Controller"]
-    MAAS["MaaS Controller"]
-    PRAXIS["praxis-extproc (Praxis dataplane)"]
-    IPP["payload-processing (IPP, legacy)"]
-    API["maas-api, policies, subscriptions, ..."]
-
-    DSC --> ODH
-    ODH --> AIGO
-    AIGO --> AIGC
-    AIGO --> MAAS
-    AIGC --> PRAXIS
-    AIGC --> EM["ExternalModel / ExternalProvider"]
-    MAAS --> IPP
-    MAAS --> API
-```
-
-### Responsibility split
-
-| Concern | ai-gateway-controller | maas-controller |
-| --- | --- | --- |
-| Install ExtProc when Praxis is selected | Yes (`praxis-extproc`) | No |
-| Install ExtProc when IPP is selected | No | Yes (IPP) |
-| Reconcile `ExternalModel` / `ExternalProvider` (routes, transport, overlay) | Yes | No (after the split) |
-| Auth / API keys / rate limits / subscriptions | No | Yes |
-| Own `AITenant` status and tenant bootstrap | No (reads only) | Yes |
-| Select dataplane backend per tenant | Reads selector; claims Praxis | Reads same selector; claims IPP |
-
-Dataplane selection and the Praxis ↔ IPP handoff are covered in
-[Dataplane selection](./dataplane-selection.md).
-
-## Lifecycle (shared with MaaS)
-
-There is **no** separate enablement flag for `ai-gateway-controller`.
-
-| `AIGateway` / MaaS `managementState` | Result |
-| --- | --- |
-| `Managed` | Operator deploys **both** siblings |
-| `Removed` | Both tear down (same grace window as MaaS; ExtProc may still be serving) |
-
-`ModelsAsAServiceReady` reflects readiness of both Deployments.
+| API keys, subscriptions, AuthPolicy / rate limits | MaaS (`maas-controller` / maas-api / Kuadrant) |
+| `AITenant` lifecycle and Gateway claim | MaaS |
+| Inference request filter order on the wire | See [Praxis dataplane evolution](./praxis-dataplane-evolution.md) |
 
 ## Related docs
 
-| Doc | Audience |
+| Doc | Contents |
 | --- | --- |
-| [Dataplane selection](./dataplane-selection.md) | Choosing Praxis vs IPP; handoff states |
-| [External models](./external-models.md) | When and how models are served |
+| [External models](./external-models.md) | Serving flow, attachments, credentials |
 | [Praxis dataplane evolution](./praxis-dataplane-evolution.md) | Request-path filter map |
-| [DESIGN.md](../DESIGN.md) | Implementer detail |
+| [DESIGN.md](../DESIGN.md) | Implementer detail and migration notes |
