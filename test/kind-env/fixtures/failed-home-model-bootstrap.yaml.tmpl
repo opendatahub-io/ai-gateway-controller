@@ -1,0 +1,39 @@
+# Purpose: Seeds a deliberately unusable home provider/model before the
+# default AITenant is created, so the tenant reconciler sees the failure on its
+# first handoff while no routing overlay or shared ExtProc exists yet.
+#
+# Scope: Opt-in Kind qualification only. The referenced Secret is intentionally
+# absent; no credential value is created or stored.
+
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: failed-bootstrap-provider
+  namespace: ${EXTERNAL_MODEL_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/run-id: ${EXTERNAL_MODEL_RUN_ID}
+spec:
+  provider: openai
+  endpoint: missing-credential.invalid
+  auth:
+    type: apikey
+    secretRef:
+      name: intentionally-missing-bootstrap-credential
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: failed-bootstrap-model
+  namespace: ${EXTERNAL_MODEL_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/run-id: ${EXTERNAL_MODEL_RUN_ID}
+spec:
+  modelName: failed-bootstrap-model
+  externalProviderRefs:
+    - ref:
+        name: failed-bootstrap-provider
+      targetModel: unavailable-test-model
+      apiFormat: openai-chat
+      path: /v1/chat/completions
