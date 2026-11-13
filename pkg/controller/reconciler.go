@@ -1185,6 +1185,16 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		}
 		return modelTenantContext{}, false, nil
 	}
+	// DeployReady passes a terminating AITenant: maas-controller re-stamps its
+	// Ready condition while cleanup runs. livePraxisBeforeWrite refuses the
+	// write later, but only as a requeue with a misleading status. Serving
+	// state is retained, as when the MaasTenantConfig is missing.
+	if !live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() {
+		if err := report(false, reasonTenantNotReady, "MaasTenantConfig or its owning AITenant is being deleted; retaining serving state", nil); err != nil {
+			return modelTenantContext{}, false, err
+		}
+		return modelTenantContext{}, false, nil
+	}
 	if live.status != tenant.PayloadProcessingStatusSteady {
 		if err := report(false, reasonTenantNotReady, "MaasTenantConfig selects Praxis but payload-processing-status is not steady", nil); err != nil {
 			return modelTenantContext{}, false, err

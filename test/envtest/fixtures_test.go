@@ -280,6 +280,27 @@ func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.E
 	}, eventuallyTimeout, pollInterval, "deleting the last model must remove its routing and workload")
 }
 
+// awaitModelTenantNotReady waits until model reports TenantNotReady while its
+// routing overlay and routeName, its last published route, remain.
+func awaitModelTenantNotReady(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, routeName string) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		var actual inferencev1alpha1.ExternalModel
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
+		ready := apimeta.FindStatusCondition(actual.Status.Conditions, "Ready")
+		require.NotNil(collect, ready)
+		require.Equal(collect, metav1.ConditionFalse, ready.Status)
+		require.Equal(collect, "TenantNotReady", ready.Reason, ready.Message)
+		key := client.ObjectKey{Namespace: model.Namespace, Name: publisher.DefaultName}
+		require.NoError(collect, c.Get(t.Context(), key, &corev1.ConfigMap{}), "routing overlay removed")
+		route := &unstructured.Unstructured{}
+		route.SetAPIVersion("gateway.networking.k8s.io/v1")
+		route.SetKind("HTTPRoute")
+		key.Name = routeName
+		require.NoError(collect, c.Get(t.Context(), key, route), "model route removed")
+	}, eventuallyTimeout, pollInterval, "the model must report its tenant not ready and keep its routing")
+}
+
 // markAvailable sets the Deployment's Available condition.
 func markAvailable(ctx context.Context, c client.Client, deployment *appsv1.Deployment) error {
 	for _, condition := range deployment.Status.Conditions {

@@ -1502,6 +1502,90 @@ func TestReconcileStaleAITenantStatusDoesNotPublish(t *testing.T) {
 	}
 }
 
+func TestReconcileTerminatingTenantReportsNotReadyAndRetainsRoutes(t *testing.T) {
+	owners := []struct {
+		name string
+		key  client.ObjectKey
+		new  func() *unstructured.Unstructured
+		// terminate writes the status the owner reports while its cleanup runs.
+		terminate func(t *testing.T, obj *unstructured.Unstructured)
+	}{
+		{
+			name: "AITenant", key: client.ObjectKey{Namespace: "models-as-a-service", Name: "tenant"}, new: tenant.NewAITenant,
+			// maas-controller re-stamps Ready for the generation the deletion
+			// bumped, so DeployReady still holds during its cleanup.
+			terminate: func(t *testing.T, ait *unstructured.Unstructured) {
+				t.Helper()
+				if err := unstructured.SetNestedField(ait.Object, "Terminating", "status", "phase"); err != nil {
+					t.Fatal(err)
+				}
+				conditions := []any{map[string]any{
+					"type": tenant.AITenantConditionReady, "status": string(metav1.ConditionFalse),
+					"reason": "DeletionInProgress", "observedGeneration": ait.GetGeneration(),
+				}}
+				if err := unstructured.SetNestedSlice(ait.Object, conditions, "status", "conditions"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "MaasTenantConfig", key: client.ObjectKey{Namespace: "tenant-a", Name: tenant.MaasTenantConfigInstanceName}, new: tenant.NewMaasTenantConfig,
+			terminate: func(*testing.T, *unstructured.Unstructured) {},
+		},
+	}
+	for _, owner := range owners {
+		t.Run(owner.name, func(t *testing.T) {
+			// Given a model published through a healthy tenant.
+			r, model := reconcilerFixture(t)
+			req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+			if _, err := r.Reconcile(t.Context(), req); err != nil {
+				t.Fatal(err)
+			}
+
+			// When the tenant owner starts terminating.
+			obj := owner.new()
+			if err := r.Get(t.Context(), owner.key, obj); err != nil {
+				t.Fatal(err)
+			}
+			// The fake client deletes outright unless a finalizer holds the
+			// object, and keeps its generation, so the cleanup status can be
+			// written first.
+			obj.SetFinalizers(append(obj.GetFinalizers(), "test.opendatahub.io/hold"))
+			owner.terminate(t, obj)
+			if err := r.Update(t.Context(), obj); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Delete(t.Context(), obj); err != nil {
+				t.Fatal(err)
+			}
+			result, err := r.Reconcile(t.Context(), req)
+
+			// Then the model reports its tenant not ready, keeps serving, and
+			// waits for the next tenant event instead of requeuing.
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsZero() {
+				t.Fatalf("result = %+v, want none: AITenant and MaasTenantConfig events requeue the model", result)
+			}
+			var got v1alpha1.ExternalModel
+			if err := r.Get(t.Context(), req.NamespacedName, &got); err != nil {
+				t.Fatal(err)
+			}
+			ready := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+			if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonTenantNotReady {
+				t.Fatalf("Ready condition = %#v, want False/%s", ready, reasonTenantNotReady)
+			}
+			if err := r.Get(t.Context(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, newHTTPRoute()); err != nil {
+				t.Fatalf("HTTPRoute must be retained while the tenant terminates: %v", err)
+			}
+			if err := r.Get(t.Context(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &corev1.ConfigMap{}); err != nil {
+				t.Fatalf("routing overlay must be retained while the tenant terminates: %v", err)
+			}
+		})
+	}
+}
+
 func TestReconcileWithoutGatewayRefDoesNotPublish(t *testing.T) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},

@@ -37,6 +37,8 @@ API server, including on failure. The current kubeconfig is never used.
   configures its ExtProc workload. Deleting that model removes its route,
   overlay and workload, then releases its finalizer.
   Both paths require the shipped permission to patch model finalizers.
+- When that tenant's AITenant starts terminating, the published model reports
+  `TenantNotReady` and keeps its route and overlay.
 - The shipped controller identity may create, patch and delete Secrets in a
   tenant namespace for its credential copies, and read ReferenceGrants in a
   provider namespace and across all namespaces. It can read Gateways in the
