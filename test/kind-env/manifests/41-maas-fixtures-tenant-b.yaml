@@ -4,11 +4,12 @@
 # Scope: Kind E2E fixture only. This is not a production deployment manifest.
 #
 # Dependencies: Requires 21-fixtures-tenant-b.yaml's demo-model, the tenant-B
-# namespace, the MaaS API/controller, and its generated HTTPRoute. The route
-# policy in 51-route-policies-tenant-b.yaml authenticates the resulting route.
+# namespace, the MaaS API/controller, and its generated HTTPRoute. The
+# MaaSAuthPolicy below is the sole model authorization policy; the harness must
+# not add a route AuthPolicy that conflicts with MaaS policy generation.
 #
-# Qualification role: Proves tenant-B subscription and authentication remain
-# isolated from tenant A while both use the shared Kind MaaS control plane.
+# Qualification role: Supplies the tenant-B subscription and model-scoped
+# MaaSAuthPolicy while both tenants use the shared Kind MaaS control plane.
 # `kind-user` is a test-only identity.
 
 apiVersion: maas.opendatahub.io/v1alpha1

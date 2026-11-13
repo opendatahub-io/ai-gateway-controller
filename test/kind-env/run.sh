@@ -56,6 +56,27 @@ KCTL=(kubectl --context "kind-$CLUSTER")
 failures=0
 fail() { echo "FAIL: $*" | tee -a "$EVIDENCE/failures.txt"; failures=$((failures + 1)); }
 check_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
+cleanup_owned_translation_diagnostic_authpolicies() {
+  local route name existing
+  for route in api-translation-messages api-translation-openai; do
+    name="${route}-auth"
+    existing=$("${KCTL[@]}" -n models-as-a-service get authpolicy "$name" --ignore-not-found -o json) || return 1
+    [[ -n "$existing" ]] || continue
+    if jq -e --arg name "$name" --arg route "$route" '
+      .metadata.name == $name and
+      .metadata.namespace == "models-as-a-service" and
+      .metadata.labels["app.kubernetes.io/managed-by"] == "api-translation-kind-e2e-diagnostic" and
+      .spec.targetRef.group == "gateway.networking.k8s.io" and
+      .spec.targetRef.kind == "HTTPRoute" and
+      .spec.targetRef.name == $route
+    ' <<<"$existing" >/dev/null; then
+      "${KCTL[@]}" -n models-as-a-service delete authpolicy "$name" --wait=true --timeout=60s >/dev/null || return 1
+      printf 'removed owned diagnostic AuthPolicy %s\n' "$name" >>"$EVIDENCE/diagnostic-authpolicy-cleanup.txt"
+    else
+      printf 'preserved non-owned diagnostic AuthPolicy name %s\n' "$name" >>"$EVIDENCE/diagnostic-authpolicy-cleanup.txt"
+    fi
+  done
+}
 create_run_registry() {
   local network_owner container_owner node network_names expected_id runtime_id runtime_info expected_repo_digest node_repo_digest node_tag_present repository hosts_dir config_before config_after
 
@@ -1169,11 +1190,15 @@ EOF
   done
   printf 'configmap=maas-system/external-model-e2e-provider-ca ca_file=/etc/external-model-e2e/provider-ca/ca.crt\n' \
     >"$EVIDENCE/istio-provider-ca-mount.txt"
+  # A reused Kind cluster can retain an interrupted, opt-in route AuthPolicy.
+  # Remove only the exact policies owned by this harness before provisioning
+  # skips their manifest; preserve any same-named policy with other ownership.
+  cleanup_owned_translation_diagnostic_authpolicies
   # Apply the remaining fixtures after the writer handoff. In particular, do
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml|shared-translation-backend.yaml|shared-translation-routes.yaml|api-translation-provider-aware-backend.yaml) continue ;;
+      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml|shared-translation-backend.yaml|shared-translation-routes.yaml|shared-translation-auth-diagnostic.yaml|api-translation-provider-aware-backend.yaml) continue ;;
       45-real-openai-policies.yaml|60-client-kind-patch.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
