@@ -520,17 +520,19 @@ func setClusterUpstreamAddress(value map[string]any, fqdn string) error {
 	if !found || len(sans) == 0 {
 		return errors.New("match_typed_subject_alt_names is required (fail-closed TLS SAN verification)")
 	}
-	san0, ok := sans[0].(map[string]any)
-	if !ok {
-		return errors.New("match_typed_subject_alt_names[0] is not an object")
+	for i, raw := range sans {
+		san, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("match_typed_subject_alt_names[%d] is not an object", i)
+		}
+		matcher, ok := san["matcher"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("san[%d] matcher is not an object", i)
+		}
+		matcher["exact"] = fqdn
+		san["matcher"] = matcher
+		sans[i] = san
 	}
-	matcher, ok := san0["matcher"].(map[string]any)
-	if !ok {
-		return errors.New("san matcher is not an object")
-	}
-	matcher["exact"] = fqdn
-	san0["matcher"] = matcher
-	sans[0] = san0
 	if err := unstructured.SetNestedSlice(value, sans,
 		"transport_socket", "typed_config", "common_tls_context", "validation_context",
 		"match_typed_subject_alt_names"); err != nil {

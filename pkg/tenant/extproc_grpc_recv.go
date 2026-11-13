@@ -40,7 +40,7 @@ func configureExtProcGrpcRecvMsgSize(resources []unstructured.Unstructured, maxB
 		if dep.GetKind() != "Deployment" || !isExtProcDeployment(dep.GetName()) {
 			continue
 		}
-		if err := setContainerEnvValue(dep, grpcMaxRecvMsgSizeEnv, value); err != nil {
+		if err := setContainerEnvValue(dep, extProcContainerName(dep.GetName()), grpcMaxRecvMsgSizeEnv, value); err != nil {
 			return fmt.Errorf("deployment %s/%s: %w", dep.GetNamespace(), dep.GetName(), err)
 		}
 		patched++
@@ -59,7 +59,18 @@ func isExtProcDeployment(name string) bool {
 		strings.HasPrefix(name, PayloadProcessingExternalModelName)
 }
 
-func setContainerEnvValue(dep *unstructured.Unstructured, envName, value string) error {
+// extProcContainerName returns the base container name for an ExtProc
+// deployment. Containers keep the base template name even when the
+// deployment itself is tenant-suffixed (e.g. payload-processing-redteam
+// still has a container named payload-processing).
+func extProcContainerName(deploymentName string) string {
+	if deploymentName == PayloadPreProcessingName || strings.HasPrefix(deploymentName, PayloadPreProcessingName+"-") {
+		return PayloadPreProcessingName
+	}
+	return PayloadProcessingName
+}
+
+func setContainerEnvValue(dep *unstructured.Unstructured, containerName, envName, value string) error {
 	containers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
 	if err != nil {
 		return fmt.Errorf("read containers: %w", err)
@@ -67,33 +78,33 @@ func setContainerEnvValue(dep *unstructured.Unstructured, envName, value string)
 	if !found || len(containers) == 0 {
 		return errors.New("containers not found")
 	}
-	container, ok := containers[0].(map[string]any)
-	if !ok {
-		return errors.New("container[0] is not an object")
-	}
-	env, _, err := unstructured.NestedSlice(container, "env")
-	if err != nil {
-		return fmt.Errorf("read env: %w", err)
-	}
-	updated := false
-	for i, raw := range env {
-		entry, ok := raw.(map[string]any)
-		if !ok || entry["name"] != envName {
+	for i, raw := range containers {
+		container, ok := raw.(map[string]any)
+		if !ok || container["name"] != containerName {
 			continue
 		}
-		entry["value"] = value
-		delete(entry, "valueFrom")
-		env[i] = entry
-		updated = true
-		break
+		env, _, err := unstructured.NestedSlice(container, "env")
+		if err != nil {
+			return fmt.Errorf("read env: %w", err)
+		}
+		updated := false
+		for j, rawEntry := range env {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok || entry["name"] != envName {
+				continue
+			}
+			entry["value"] = value
+			delete(entry, "valueFrom")
+			env[j] = entry
+			updated = true
+			break
+		}
+		if !updated {
+			env = append(env, map[string]any{"name": envName, "value": value})
+		}
+		container["env"] = env
+		containers[i] = container
+		return unstructured.SetNestedSlice(dep.Object, containers, "spec", "template", "spec", "containers")
 	}
-	if !updated {
-		env = append(env, map[string]any{"name": envName, "value": value})
-	}
-	container["env"] = env
-	containers[0] = container
-	if err := unstructured.SetNestedSlice(dep.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-		return fmt.Errorf("write containers: %w", err)
-	}
-	return nil
+	return fmt.Errorf("container %q not found", containerName)
 }
