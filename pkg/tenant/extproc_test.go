@@ -60,7 +60,6 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 		"provider_hop_clusters: [\"provider-provider-a\", \"provider-provider-b\"]",
 		"  max_body_bytes: 10551296\n",
 		"filter: stream_usage_inject\n        max_body_bytes: 10485760\n",
-		"api_translation_enabled: true",
 		"max_request_body_bytes: 10485760",
 		"max_response_body_bytes: 1048576",
 		"strategy: bearer_token",
@@ -607,7 +606,7 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 			t.Fatalf("shared translation filters stale for enabled=%t:\n%s", enabled, sharedConfig)
 		}
 		assertExternalModelEarlyBodyDelivery(t, resources[5], false)
-		if strings.Contains(externalConfig, "api_translation_enabled: true") != enabled ||
+		if strings.Contains(externalConfig, "api_translation_enabled:") ||
 			strings.Contains(externalConfig, "openai_chat_completions_to_anthropic_stream") != enabled ||
 			strings.Contains(externalConfig, "openai_chat_completions_to_anthropic\n") != enabled {
 			t.Fatalf("ExternalModel translation filters stale for enabled=%t:\n%s", enabled, externalConfig)
