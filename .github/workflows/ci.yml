@@ -19,6 +19,8 @@ on:
       - 'Dockerfile.dockerignore'
       - '.golangci.yml'
       - '.golangci.yaml'
+      - '.golangci.toml'
+      - '.golangci.json'
       - '_typos.toml'
       - '.github/workflows/ci.yml'
       - '!**/*.md'
