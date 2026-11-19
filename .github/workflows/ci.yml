@@ -21,8 +21,7 @@ on:
       - '.golangci.yaml'
       - '_typos.toml'
       - '.github/workflows/ci.yml'
-    paths-ignore:
-      - '**/*.md'
+      - '!**/*.md'
 
 permissions:
   contents: read
