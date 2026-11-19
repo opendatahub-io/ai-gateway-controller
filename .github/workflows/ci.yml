@@ -2,6 +2,21 @@ name: CI
 
 on:
   pull_request:
+    paths:
+      - 'api/**'
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'config/**'
+      - 'hack/**'
+      - 'test/**'
+      - 'Makefile'
+      - 'tools.mk'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - 'Dockerfile.konflux'
+      - '_typos.toml'
+      - '.github/workflows/ci.yml'
 
 permissions:
   contents: read
