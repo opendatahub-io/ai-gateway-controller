@@ -81,6 +81,20 @@ reserved for real MaaS IPP cutover/rollback qualification.
 
 ### Shared External Model resources
 
+To isolate startup configuration/credential consistency with a specific runtime
+image, run:
+
+```sh
+python3 test/kind-env/e2e-credential-config-snapshot.py \
+  --context "kind-${CLUSTER_NAME}" --image "${PRAXIS_EXTPROC_IMAGE}"
+```
+
+This creates a temporary namespace with synthetic credentials and four processor
+pods. It verifies both ConfigMap/Deployment ordering mismatches fail startup,
+both pod-bound configuration snapshots become Ready with the expected bytes,
+and projected Secret values can still rotate. It deletes its namespace on exit.
+This is a focused runtime check; it does not exercise the full Gateway/MaaS chain.
+
 The reusable Provider A/B identities, optional `gpt-4o-mini` OpenAI CR chain,
 persistent in-cluster client base, and credential-safe request helper live in
 `test/external-model/`. The Kind harness renders these resources with explicit
