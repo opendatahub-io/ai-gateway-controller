@@ -209,6 +209,10 @@ Across Gateway → standard mode, preserve at least:
 For control-plane deployment topology (operators, tenant fan-out, IPP vs
 Praxis selection), see [DESIGN.md](../DESIGN.md).
 
+For the coordinated compatibility procedure when upgrading the
+OpenAI-to-Anthropic translation filter configuration and ExtProc image, see
+[Anthropic translation runtime upgrade](anthropic-translation-runtime-upgrade.md).
+
 ## IPP → Praxis plugins ConfigMap migration gate (3.6)
 
 Upgrades that flip `maas.opendatahub.io/payload-processing-type=praxis` must

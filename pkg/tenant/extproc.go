@@ -580,7 +580,6 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic_stream\n")
 		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
 		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
-		b.WriteString("        api_translation_enabled: true\n")
 		fmt.Fprintf(&b, "        max_request_body_bytes: %d\n", maxBodyBytes)
 		fmt.Fprintf(&b, "        max_response_body_bytes: %d\n", anthropicTranslationResponseMaxBytes)
 	}
