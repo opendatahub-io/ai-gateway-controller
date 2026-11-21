@@ -6,8 +6,6 @@ name: GitHub Actions Security Analysis (zizmor)
 # correctness checks for security coverage.
 
 on:
-  push:
-    branches: ["main"]
   pull_request:
     branches: ["**"]
 
