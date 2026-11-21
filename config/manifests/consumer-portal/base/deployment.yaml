@@ -29,6 +29,7 @@ spec:
       containers:
         - name: kube-auth-proxy
           image: CONSUMER_PORTAL_AUTH_PROXY_IMAGE
+          terminationMessagePolicy: FallbackToLogsOnError
           args:
             - --https-address=0.0.0.0:4180
             # Plain HTTP stays on loopback; only TLS is reachable in-cluster.

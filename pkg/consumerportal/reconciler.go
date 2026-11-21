@@ -37,9 +37,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
@@ -80,8 +82,9 @@ var (
 	gvkDestinationRule    = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 	gvkEnvoyFilter        = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
 	gvkDSCI               = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
+	gvkDeployment         = schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
 	authProxyObjects      = []schema.GroupVersionKind{
-		{Group: "apps", Version: "v1", Kind: "Deployment"},
+		gvkDeployment,
 		{Version: "v1", Kind: "Service"},
 		{Version: "v1", Kind: "ServiceAccount"},
 		{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
@@ -122,6 +125,8 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	dsci.SetGroupVersionKind(gvkDSCI)
 	httpRoute := &unstructured.Unstructured{}
 	httpRoute.SetGroupVersionKind(gvkHTTPRoute)
+	deployment := &unstructured.Unstructured{}
+	deployment.SetGroupVersionKind(gvkDeployment)
 	builder := ctrl.NewControllerManagedBy(mgr).
 		Named("consumer-portal").
 		For(tenant.NewMaasTenantConfig()).
@@ -134,7 +139,22 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// event, not something to poll for.
 		WatchesMetadata(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForPortalService)).
 		// Portal route status (Accepted/ResolvedRefs) drives readiness.
-		Watches(httpRoute, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForPortalRoute))
+		Watches(httpRoute, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForPortalRoute)).
+		// Auth proxy health (crash loops, rollout failures, recovery) drives
+		// the ConsumerPortalProxyReady condition on the AITenant. The name predicate
+		// keeps every other Deployment in the cluster out of the mapper.
+		Watches(deployment, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForProxyDeployment),
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetName() == AuthProxyName
+			}))).
+		// A stalled rollout goes quiet at the Deployment level (its status
+		// stops changing while the new pod keeps crash-looping), so the pods
+		// are watched directly for restart and back-off transitions. Metadata
+		// only keeps it cheap; the label predicate keeps it quiet.
+		WatchesMetadata(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForProxyPod),
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetLabels()["app.kubernetes.io/name"] == AuthProxyName
+			})))
 	// The DSCI watch only works when its CRD is installed: without it the
 	// informer cannot sync and manager startup fails. Clusters without a DSCI
 	// keep the default dashboard namespace (the reconciler's APIReader read
@@ -199,22 +219,7 @@ func (r *Reconciler) maasTenantConfigForCABundle(ctx context.Context, obj client
 	if obj.GetName() != TrustedCABundleConfigMap {
 		return nil
 	}
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
-	if err := r.Client.List(ctx, list); err != nil {
-		return nil
-	}
-	requests := []reconcile.Request{}
-	for i := range list.Items {
-		mtc := &list.Items[i]
-		if InfraNamespace(mtc) == obj.GetNamespace() {
-			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
-				Namespace: mtc.GetNamespace(),
-				Name:      mtc.GetName(),
-			}})
-		}
-	}
-	return requests
+	return r.maasTenantConfigsForInfraNamespace(ctx, obj.GetNamespace())
 }
 
 // maasTenantConfigForPortalService maps the dashboard's maas-portal Service
@@ -242,22 +247,7 @@ func (r *Reconciler) maasTenantConfigForPortalRoute(ctx context.Context, obj cli
 	if obj.GetName() != PortalRouteName && obj.GetName() != OAuthRouteName {
 		return nil
 	}
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
-	if err := r.Client.List(ctx, list); err != nil {
-		return nil
-	}
-	requests := []reconcile.Request{}
-	for i := range list.Items {
-		mtc := &list.Items[i]
-		if InfraNamespace(mtc) == obj.GetNamespace() {
-			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
-				Namespace: mtc.GetNamespace(),
-				Name:      mtc.GetName(),
-			}})
-		}
-	}
-	return requests
+	return r.maasTenantConfigsForInfraNamespace(ctx, obj.GetNamespace())
 }
 
 // redisConfig reads the optional customer-provided Redis Secret. A missing
@@ -321,10 +311,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	infraNamespace := InfraNamespace(mtc)
 
 	if !mtc.GetDeletionTimestamp().IsZero() {
-		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace, nil)
 	}
 	if !IsDefaultTenant(mtc) {
-		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace, nil)
 	}
 
 	aitenant, err := r.resolveOwnedAITenant(ctx, mtc)
@@ -337,13 +327,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	if !PortalEnabled(aitenant) {
 		log.Info("consumer portal is disabled on the default AITenant; removing the auth proxy")
-		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace, aitenant)
 	}
 	issuerURL := OIDCIssuerURL(aitenant)
 	if issuerURL == "" {
 		// OpenShift OAuth mode is not implemented yet; only OIDC mode is.
 		log.Info("default AITenant has no OIDC issuer; OpenShift OAuth mode is not supported yet, removing the auth proxy")
-		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+		return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace, aitenant)
 	}
 	// The direct-JWT path binds tokens to spec.oidc.clientId (azp); without
 	// it the client-bound rule would compare against an empty string and
@@ -385,7 +375,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			if controllerutil.ContainsFinalizer(mtc, CleanupFinalizer) {
 				log.Info("consumer portal Service is gone; removing the portal",
 					"namespace", dashboardNamespace, "name", PortalServiceName)
-				return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace)
+				return ctrl.Result{}, r.disable(ctx, mtc, infraNamespace, aitenant)
 			}
 			log.Info("consumer portal Service does not exist yet; will retry",
 				"namespace", dashboardNamespace, "name", PortalServiceName)
@@ -456,6 +446,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	// Report the proxy's own health next to the issuer health the
+	// maas-controller reports (OIDCReady): a broken proxy crashes or fails to
+	// roll while the issuer itself is fine.
+	if err := r.reconcileProxyCondition(ctx, aitenant, infraNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	ready, err = r.routesReady(ctx, infraNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -471,7 +468,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 // disable removes the auth proxy and releases the finalizer. It is a no-op
 // when this reconciler never deployed the proxy for the MaasTenantConfig.
-func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured, infraNamespace string) error {
+// aitenant is the already-resolved owning AITenant when the caller has it;
+// the early paths (deletion, non-default tenant) resolve it lazily so a
+// stale ConsumerPortalProxyReady report is still carried away.
+func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured, infraNamespace string, aitenant *unstructured.Unstructured) error {
 	if !controllerutil.ContainsFinalizer(mtc, CleanupFinalizer) {
 		return nil
 	}
@@ -479,6 +479,29 @@ func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured
 		if err := r.cleanup(ctx, mtc.GetNamespace(), infraNamespace); err != nil {
 			return err
 		}
+	}
+	// Drop the proxy health report after the proxy itself is gone, so a
+	// transient failure of this cosmetic status patch cannot hold the
+	// finalizer with the resources already deleted. The removal is
+	// best-effort: an AITenant this config does not own (e.g. it moved to
+	// another tenant namespace) has no condition of ours to remove, and
+	// failing finalizer release on it would hang the MaasTenantConfig in
+	// deletion forever.
+	if aitenant == nil {
+		resolved, err := r.resolveOwnedAITenant(ctx, mtc)
+		if err != nil {
+			r.Log.Info("skipping consumer portal condition removal: cannot resolve the owning AITenant",
+				"maastenantconfig", mtc.GetNamespace()+"/"+mtc.GetName(), "detail", err)
+		} else {
+			aitenant = resolved
+		}
+	}
+	if err := r.removeProxyCondition(ctx, aitenant); err != nil {
+		// Best-effort: a persistent status-patch failure must not block the
+		// finalizer; the condition goes stale at worst, and the next
+		// reconcile of a still-existing AITenant cleans it up.
+		r.Log.Info("failed to remove the consumer portal condition",
+			"maastenantconfig", mtc.GetNamespace()+"/"+mtc.GetName(), "detail", err)
 	}
 	// The optimistic lock keeps this merge patch, which replaces the whole
 	// finalizers array, from dropping another controller's finalizer.

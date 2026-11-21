@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -320,7 +321,14 @@ func (r *recorder) funcs() interceptor.Funcs {
 func newReconciler(t *testing.T, objects ...client.Object) (*Reconciler, *recorder) {
 	t.Helper()
 	rec := &recorder{}
-	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(objects...).WithInterceptorFuncs(rec.funcs()).Build()
+	aitenantStatus := &unstructured.Unstructured{}
+	aitenantStatus.SetGroupVersionKind(tenant.AITenantGVK)
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(objects...).
+		WithInterceptorFuncs(rec.funcs()).
+		WithStatusSubresource(aitenantStatus).
+		Build()
 	return &Reconciler{
 		Client:         c,
 		APIReader:      c,
@@ -1403,5 +1411,388 @@ func TestCleanupDeletesOnlyManagedCredentials(t *testing.T) {
 	}
 	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: CredentialsSecretName}, &corev1.Secret{}); err != nil {
 		t.Errorf("administrator credentials Secret was deleted: %v", err)
+	}
+}
+
+// availableProxyDeployment returns the auth proxy Deployment with an
+// Available status condition, as the kube controller manager reports once
+// the proxy rolls out.
+func availableProxyDeployment() *appsv1.Deployment {
+	d := managedProxyDeployment()
+	d.Status.Conditions = []appsv1.DeploymentCondition{{
+		Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue,
+		Reason: "MinimumReplicasAvailable", Message: "Deployment has minimum availability.",
+	}}
+	d.Status.ReadyReplicas = 1
+	return d
+}
+
+// crashLoopingProxyPod returns a proxy pod whose container keeps dying with
+// the given termination message (what FallbackToLogsOnError copies from the
+// container's last log line) and is back in CrashLoopBackOff.
+func crashLoopingProxyPod(terminationMessage string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      AuthProxyName + "-abc123",
+			Namespace: testInfraNamespace,
+			Labels:    map[string]string{"app.kubernetes.io/name": AuthProxyName},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "kube-auth-proxy"}}},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "kube-auth-proxy",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason:  "CrashLoopBackOff",
+						Message: "back-off 5m0s restarting failed container",
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1, Message: terminationMessage,
+					},
+				},
+			}},
+		},
+	}
+}
+
+// getConsumerPortalProxyReady reads the ConsumerPortalProxyReady condition from the default
+// AITenant; returns nil when absent.
+func getConsumerPortalProxyReady(t *testing.T, c client.Client) map[string]any {
+	t.Helper()
+	aitenant := tenant.NewAITenant()
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testAITenantNS, Name: tenant.DefaultAITenantName,
+	}, aitenant); err != nil {
+		t.Fatalf("get AITenant: %v", err)
+	}
+	conditions, _, _ := unstructured.NestedSlice(aitenant.Object, "status", "conditions")
+	for _, condition := range conditions {
+		if cm, ok := condition.(map[string]any); ok && cm["type"] == ConsumerPortalProxyReadyCondition {
+			return cm
+		}
+	}
+	return nil
+}
+
+// readyProxyPod returns a proxy pod that passes its readiness probe: the
+// normal steady state once the proxy rolls out.
+func readyProxyPod() *corev1.Pod {
+	pod := recoveredProxyPod()
+	pod.Name = AuthProxyName + "-ready"
+	return pod
+}
+
+func TestReconcileSetsConsumerPortalProxyReadyWhenProxyAvailable(t *testing.T) {
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		availableProxyDeployment(),
+		readyProxyPod(),
+	)
+
+	reconcileMTC(t, r)
+
+	condition := getConsumerPortalProxyReady(t, r.Client)
+	if condition == nil {
+		t.Fatal("ConsumerPortalProxyReady condition was not set on the AITenant")
+	}
+	if condition["status"] != "True" || condition["reason"] != "Available" {
+		t.Errorf("ConsumerPortalProxyReady = %v, want True/Available", condition)
+	}
+}
+
+func TestReconcileReportsCrashLoopDetailInConsumerPortalProxyReady(t *testing.T) {
+	// The termination message carries the proxy's log timestamp: it repeats
+	// on every restart and must be stripped so the condition message is
+	// stable across reconciles.
+	terminationMessage := "[2026-11-15T10:00:00Z] [oidc] unable to initialise provider: " +
+		"Get \"https://keycloak.example.com/realms/t/.well-known/openid-configuration\": " +
+		"x509: certificate signed by unknown authority"
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		managedProxyDeployment(),
+		crashLoopingProxyPod(terminationMessage),
+	)
+
+	reconcileMTC(t, r)
+
+	condition := getConsumerPortalProxyReady(t, r.Client)
+	if condition == nil {
+		t.Fatal("ConsumerPortalProxyReady condition was not set on the AITenant")
+	}
+	if condition["status"] != "False" || condition["reason"] != "CrashLoopBackOff" {
+		t.Errorf("ConsumerPortalProxyReady = %v, want False/CrashLoopBackOff", condition)
+	}
+	message, _ := condition["message"].(string)
+	if !strings.Contains(message, "certificate signed by unknown authority") {
+		t.Errorf("ConsumerPortalProxyReady message should carry the pod failure detail, got %q", message)
+	}
+	if strings.Contains(message, "2026-11-15") {
+		t.Errorf("ConsumerPortalProxyReady message must strip timestamps, got %q", message)
+	}
+}
+
+func TestConsumerPortalProxyReadyConditionIsStableAcrossReconciles(t *testing.T) {
+	terminationMessage := "[2026-11-15T10:00:00Z] provider init failed: x509: certificate signed by unknown authority"
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		managedProxyDeployment(),
+		crashLoopingProxyPod(terminationMessage),
+	)
+
+	reconcileMTC(t, r)
+	first := getConsumerPortalProxyReady(t, r.Client)
+	if first == nil {
+		t.Fatal("ConsumerPortalProxyReady condition was not set on the AITenant")
+	}
+	aitenant := tenant.NewAITenant()
+	if err := r.Client.Get(context.Background(), types.NamespacedName{
+		Namespace: testAITenantNS, Name: tenant.DefaultAITenantName,
+	}, aitenant); err != nil {
+		t.Fatalf("get AITenant: %v", err)
+	}
+	firstVersion := aitenant.GetResourceVersion()
+
+	// A second reconcile of the same steady state must not rewrite the
+	// condition at all (a volatile message would wake AITenant watchers on
+	// every resync): the resource version proves no status write happened.
+	reconcileMTC(t, r)
+	second := getConsumerPortalProxyReady(t, r.Client)
+	if second["lastTransitionTime"] != first["lastTransitionTime"] {
+		t.Errorf("lastTransitionTime changed on a steady state: %v -> %v",
+			first["lastTransitionTime"], second["lastTransitionTime"])
+	}
+	aitenant = tenant.NewAITenant()
+	if err := r.Client.Get(context.Background(), types.NamespacedName{
+		Namespace: testAITenantNS, Name: tenant.DefaultAITenantName,
+	}, aitenant); err != nil {
+		t.Fatalf("get AITenant: %v", err)
+	}
+	if aitenant.GetResourceVersion() != firstVersion {
+		t.Errorf("AITenant resource version changed on a steady state: %q -> %q (condition was rewritten)",
+			firstVersion, aitenant.GetResourceVersion())
+	}
+}
+
+func TestDisableRemovesConsumerPortalProxyReadyCondition(t *testing.T) {
+	mtc := newMTC(tenant.DefaultAITenantName, testInfraNamespace)
+	controllerutil.AddFinalizer(mtc, CleanupFinalizer)
+	aitenant := newAITenant(aitenantOpts{issuer: testIssuer, portalDisabled: true})
+	status, ok := aitenant.Object["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("newAITenant status is not a map: %T", aitenant.Object["status"])
+	}
+	conditions, _ := status["conditions"].([]any)
+	status["conditions"] = append(conditions, map[string]any{
+		"type": ConsumerPortalProxyReadyCondition, "status": "False",
+		"reason": "CrashLoopBackOff", "message": "stale",
+	})
+	r, _ := newReconciler(t, mtc, aitenant, newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(), managedProxyDeployment())
+
+	reconcileMTC(t, r)
+
+	if condition := getConsumerPortalProxyReady(t, r.Client); condition != nil {
+		t.Errorf("ConsumerPortalProxyReady condition was not removed with the proxy, got %v", condition)
+	}
+}
+
+// TestReconcileReportsCrashLoopDuringStalledRollout covers the stalled
+// rolling update: the old replica keeps the Deployment Available while the
+// new pod (newest) crash-loops. The pod failure must be reported even though
+// Available is True.
+func TestReconcileReportsCrashLoopDuringStalledRollout(t *testing.T) {
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		availableProxyDeployment(),
+		crashLoopingProxyPod("[2026-11-19T18:34:57Z] error initialising provider: 404 from discovery"),
+	)
+
+	reconcileMTC(t, r)
+
+	condition := getConsumerPortalProxyReady(t, r.Client)
+	if condition == nil {
+		t.Fatal("ConsumerPortalProxyReady condition was not set on the AITenant")
+	}
+	if condition["status"] != "False" || condition["reason"] != "CrashLoopBackOff" {
+		t.Errorf("ConsumerPortalProxyReady = %v, want False/CrashLoopBackOff despite Available=True (stalled rollout)", condition)
+	}
+}
+
+// recoveredProxyPod returns a proxy pod whose container crashed earlier but
+// is running again: its lingering lastTerminationState must not be reported
+// as a current failure.
+func recoveredProxyPod() *corev1.Pod {
+	pod := crashLoopingProxyPod("[2026-11-19T18:34:57Z] error initialising provider")
+	pod.Name = AuthProxyName + "-recovered"
+	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()},
+	}
+	// Recovery is judged by pod readiness: the readiness probe passing is
+	// what distinguishes a recovered container from a crash-looping one
+	// briefly running during a restart attempt.
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue,
+	}}
+	return pod
+}
+
+func TestRecoveredProxyPodIsNotReportedAsFailed(t *testing.T) {
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		availableProxyDeployment(),
+		recoveredProxyPod(),
+	)
+
+	reconcileMTC(t, r)
+
+	condition := getConsumerPortalProxyReady(t, r.Client)
+	if condition == nil {
+		t.Fatal("ConsumerPortalProxyReady condition was not set on the AITenant")
+	}
+	if condition["status"] != "True" || condition["reason"] != "Available" {
+		t.Errorf("ConsumerPortalProxyReady = %v, want True/Available for a recovered pod", condition)
+	}
+}
+
+// TestReconcileUpdatesExistingConsumerPortalProxyReady covers the update path: the
+// condition already exists with an older reason and must be rewritten. This
+// guards against merge-patch bases built from a mutated backing array, which
+// turn updates into silent no-ops.
+func TestReconcileUpdatesExistingConsumerPortalProxyReady(t *testing.T) {
+	aitenant := newAITenant(aitenantOpts{issuer: testIssuer})
+	status, _ := aitenant.Object["status"].(map[string]any)
+	conditions, _ := status["conditions"].([]any)
+	status["conditions"] = append(conditions, map[string]any{
+		"type": ConsumerPortalProxyReadyCondition, "status": "False",
+		"reason": "ReplicaSetUpdated", "message": "old",
+	})
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		aitenant,
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		managedProxyDeployment(),
+		crashLoopingProxyPod("[2026-11-19T21:03:30Z] error initialising provider: x509 failure"),
+	)
+
+	reconcileMTC(t, r)
+
+	condition := getConsumerPortalProxyReady(t, r.Client)
+	if condition == nil {
+		t.Fatal("ConsumerPortalProxyReady condition was lost")
+	}
+	if condition["reason"] != "CrashLoopBackOff" {
+		t.Errorf("ConsumerPortalProxyReady reason = %v, want CrashLoopBackOff (update from ReplicaSetUpdated)", condition["reason"])
+	}
+	if message, _ := condition["message"].(string); !strings.Contains(message, "error initialising provider") {
+		t.Errorf("ConsumerPortalProxyReady message should carry the new detail, got %q", message)
+	}
+}
+
+// TestSetProxyConditionPreservesConcurrentForeignCondition verifies the
+// optimistic-lock contract: a foreign condition write (maas-controller's
+// OIDCReady) landing between this controller's read and its patch must
+// survive — the conflict triggers a retry with a fresh read instead of
+// silently reverting it.
+func TestSetProxyConditionPreservesConcurrentForeignCondition(t *testing.T) {
+	aitenant := newAITenant(aitenantOpts{issuer: testIssuer})
+	r, _ := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		aitenant,
+	)
+	aitenantStatus := &unstructured.Unstructured{}
+	aitenantStatus.SetGroupVersionKind(tenant.AITenantGVK)
+
+	// Inject a foreign write after the controller's read and before its
+	// patch: bump the resourceVersion (making the controller's patch base
+	// stale) and add an OIDCReady condition, as maas-controller would.
+	injected := false
+	r.Client = fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(aitenant).
+		WithStatusSubresource(aitenantStatus).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if subResourceName == "status" && !injected {
+					injected = true
+					foreign := tenant.NewAITenant()
+					if err := c.Get(ctx, client.ObjectKeyFromObject(obj), foreign); err != nil {
+						return err
+					}
+					conditions, _, _ := unstructured.NestedSlice(foreign.Object, "status", "conditions")
+					conditions = append(conditions, map[string]any{
+						"type": "OIDCReady", "status": "True",
+						"reason": "Available", "message": "foreign write",
+					})
+					if err := unstructured.SetNestedSlice(foreign.Object, conditions, "status", "conditions"); err != nil {
+						return err
+					}
+					if err := c.Status().Update(ctx, foreign); err != nil {
+						return err
+					}
+					// The foreign update bumped the resourceVersion: this
+					// patch is based on a stale object, exactly as a real
+					// concurrent write would make it. Surface the conflict so
+					// the optimistic-lock retry re-reads and re-patches.
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: "maas.opendatahub.io", Resource: "aitenants"},
+						obj.GetName(), errors.New("the object has been modified"))
+				}
+				return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+	// The retry must publish the ConsumerPortalProxyReady condition without
+	// losing the injected OIDCReady.
+	generation, _, _ := unstructured.NestedInt64(aitenant.Object, "metadata", "generation")
+	if err := r.setProxyCondition(context.Background(), aitenant, "False", "CrashLoopBackOff",
+		proxyUnavailableMessage+": x509 failure", generation); err != nil {
+		t.Fatalf("setProxyCondition: %v", err)
+	}
+
+	updated := tenant.NewAITenant()
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(aitenant), updated); err != nil {
+		t.Fatalf("get AITenant: %v", err)
+	}
+	conditions, _, _ := unstructured.NestedSlice(updated.Object, "status", "conditions")
+	var hasForeign, hasOurs bool
+	for _, condition := range conditions {
+		cm, _ := condition.(map[string]any)
+		if cm["type"] == "OIDCReady" {
+			hasForeign = true
+		}
+		if cm["type"] == ConsumerPortalProxyReadyCondition {
+			hasOurs = true
+		}
+	}
+	if !hasForeign {
+		t.Error("the concurrent foreign OIDCReady condition was lost")
+	}
+	if !hasOurs {
+		t.Error("the ConsumerPortalProxyReady condition was not written")
 	}
 }
