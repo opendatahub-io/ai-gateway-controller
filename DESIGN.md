@@ -1,5 +1,10 @@
 # ai-gateway-controller — Design
 
+Implementer-oriented design notes (rationale, package layout, edge cases).
+For user-facing maps with tables and diagrams, start at
+[docs/architecture.md](./docs/architecture.md) and
+[docs/external-models.md](./docs/external-models.md).
+
 Architecture decisions are maintained in the Open Data Hub ADR repository.
 The External Model/Praxis two-plane decision is tracked as
 [ODH-ADR-MS-0005](https://github.com/opendatahub-io/architecture-decision-records/pull/165),
