@@ -896,6 +896,7 @@ func TestInvalidModelNameExcludesOnlyThatModel(t *testing.T) {
 	ctx := context.Background()
 	long := model.DeepCopy()
 	long.Name, long.UID, long.ResourceVersion = strings.Repeat("m", 64), "long-uid", ""
+	long.Spec.ExternalProviderRefs[0].TargetModel = long.Name
 	if err := r.Create(ctx, long); err != nil {
 		t.Fatal(err)
 	}
@@ -1387,7 +1388,7 @@ func TestReconcilePendingPraxisTenantWithGatewayRefPublishes(t *testing.T) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ModelName: "client-model", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "client-model", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
@@ -1817,7 +1818,7 @@ func TestReconcileStandaloneProviderThenModelRoutes(t *testing.T) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ModelName: "client-model", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "client-model", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("must-not-be-published")}}
@@ -1979,7 +1980,7 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "model", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
@@ -2367,6 +2368,7 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	r.KnownClusters = append(r.KnownClusters, "provider-provider-b", "provider-provider-c")
 	model.Spec.ModelName = "shared-model"
+	model.Spec.ExternalProviderRefs[0].TargetModel = "shared-model"
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
@@ -2396,8 +2398,8 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	sibling := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid", Finalizers: []string{externalModelFinalizer}},
 		Spec: v1alpha1.ExternalModelSpec{ModelName: "shared-model", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
-			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
-			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-c"}, TargetModel: "gpt-c", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "shared-model", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-c"}, TargetModel: "shared-model", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
 		}},
 	}
 	if err := r.Create(context.Background(), sibling); err != nil {
@@ -2541,7 +2543,7 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 		t.Fatal(err)
 	}
 	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: resolver.ClientModelName(model), APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	})
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
@@ -2659,9 +2661,9 @@ func TestReconcileAcceptsUnequalWeightsAndPublishesWeightedRandom(t *testing.T) 
 	}
 	weightEighty, weightTwenty := 80, 20
 	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
-		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt", APIFormat: "openai-chat",
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: resolver.ClientModelName(model), APIFormat: "openai-chat",
 			Path: "/v1/chat/completions", Weight: &weightEighty},
-		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat",
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: resolver.ClientModelName(model), APIFormat: "openai-chat",
 			Path: "/v1/chat/completions", Weight: &weightTwenty},
 	}
 	if err := r.Update(context.Background(), model); err != nil {
@@ -2843,7 +2845,7 @@ func reconcilerWithSiblingProvider(t *testing.T) (*Reconciler, *v1alpha1.Externa
 	sibling.Name, sibling.UID, sibling.ResourceVersion = "sibling", "sibling-uid", ""
 	sibling.Status = v1alpha1.ExternalModelStatus{}
 	sibling.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
-		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "gpt-sibling",
+		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: resolver.ClientModelName(sibling),
 		APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	}}
 	if err := r.Create(context.Background(), sibling); err != nil {
@@ -2999,8 +3001,8 @@ func TestUnequalWeightModelStaysReadyBesideHealthySibling(t *testing.T) {
 	weighted.Name, weighted.UID, weighted.ResourceVersion = "weighted", "weighted-uid", ""
 	weighted.Status = v1alpha1.ExternalModelStatus{}
 	weighted.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
-		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
-		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightTwo},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: resolver.ClientModelName(weighted), APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: resolver.ClientModelName(weighted), APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightTwo},
 	}
 	if err := r.Create(ctx, weighted); err != nil {
 		t.Fatal(err)
@@ -3072,7 +3074,7 @@ func TestCrossModelDuplicateProviderDoesNotBlockUnrelatedModel(t *testing.T) {
 	}
 	newAlias := func(name string, refs []v1alpha1.ExternalProviderRef) *v1alpha1.ExternalModel {
 		for i := range refs {
-			refs[i].TargetModel, refs[i].APIFormat, refs[i].Path = "gpt", "openai-chat", "/v1/chat/completions"
+			refs[i].TargetModel, refs[i].APIFormat, refs[i].Path = "shared", "openai-chat", "/v1/chat/completions"
 		}
 		return &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: healthy.Namespace, UID: types.UID(name + "-uid")},
 			Spec: v1alpha1.ExternalModelSpec{ModelName: "shared", ExternalProviderRefs: refs}}
@@ -3420,7 +3422,7 @@ func reconcilerFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "model",
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
@@ -3951,7 +3953,7 @@ func TestTranslationOffCleansDisabledRouteWhenSiblingProviderIsMissing(t *testin
 	secondModel := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "a.b", Namespace: messagesModel.Namespace, UID: "second-model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ModelName: "second-client", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: missingProvider.Name}, TargetModel: "second-target",
+			Ref: v1alpha1.ExternalProviderReference{Name: missingProvider.Name}, TargetModel: "second-client",
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
@@ -4044,6 +4046,17 @@ func TestAllRoutesExcludedByPolicyOnlyAcceptsTranslationOff(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "translation disabled with a weight-0 standby",
+			set: &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{
+				{Reason: resolver.SkipTranslationDisabled}, {Reason: resolver.SkipWeightDisabled}}}}},
+			want: true,
+		},
+		{
+			name: "only disabled by weight is not translation policy",
+			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{{Reason: resolver.SkipWeightDisabled}}}}},
+			want: false,
+		},
+		{
 			name: "unsupported format is not policy",
 			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{{Reason: resolver.SkipAPIFormatUnsupported}}}}},
 			want: false,
@@ -4069,8 +4082,8 @@ func TestAllRoutesExcludedByPolicyOnlyAcceptsTranslationOff(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := allRoutesExcludedByPolicy(tc.set); got != tc.want {
-				t.Fatalf("allRoutesExcludedByPolicy() = %t, want %t", got, tc.want)
+			if got := tc.set.ExcludedByPolicy(); got != tc.want {
+				t.Fatalf("ExcludedByPolicy() = %t, want %t", got, tc.want)
 			}
 		})
 	}
@@ -4149,7 +4162,7 @@ func TestModelRoutesRequireCurrentProviderGeneration(t *testing.T) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "model",
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
@@ -4346,7 +4359,7 @@ func TestReconcileDeletingModelHonorsIPPSwitchWithSurvivingSibling(t *testing.T)
 	sibling := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "surviving-model", Namespace: "tenant-a", UID: "sibling-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt",
+			Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "surviving-model",
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
@@ -4420,7 +4433,7 @@ func TestDeletingModelDoesNotRebuildSiblingRoutesBeforeSteadyHandoff(t *testing.
 			sibling := &v1alpha1.ExternalModel{
 				ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: "tenant-a", UID: "sibling-uid"},
 				Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-					Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt",
+					Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "sibling",
 					APIFormat: "openai-chat", Path: "/v1/chat/completions",
 				}}},
 			}
@@ -4490,7 +4503,7 @@ func TestActiveProviderGatewayMoveRemovesOnlyPriorTenantCopies(t *testing.T) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt",
+			Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "model",
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
@@ -4587,6 +4600,27 @@ func TestAmbiguousPrePRDestinationRuleIsPreserved(t *testing.T) {
 	}
 }
 
+func TestProviderTransportCleanupSkipsNameThatCannotBeALabelValue(t *testing.T) {
+	r := controllerTestClient(t)
+	base, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatalf("test client %T does not support watches", r.Client)
+	}
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			// The API server refuses a label selector with an invalid value.
+			return apierrors.NewBadRequest("unable to parse requirement: invalid label value")
+		},
+	})
+	long := strings.Repeat("p", validation.LabelValueMaxLength+1)
+	if err := r.cleanupProviderTransport(context.Background(), "tenant-a", long); err != nil {
+		t.Fatalf("cleanup of a provider whose name cannot be a label value = %v, want nil", err)
+	}
+	if err := r.cleanupProviderTransport(context.Background(), "tenant-a", "provider-a"); err == nil {
+		t.Fatal("cleanup of a valid provider name must still surface list errors")
+	}
+}
+
 func TestBlockedHomeTenantMigrationLeavesModelAndProviderStatusToIPP(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	ctx := context.Background()
@@ -4628,7 +4662,7 @@ func TestHomeModelWithoutResolvedProviderIsNotReadyWhileSiblingsServe(t *testing
 	orphan := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "orphan", Namespace: "tenant-a", UID: "orphan-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: "ghost"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: "ghost"}, TargetModel: "orphan", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}
 	if err := r.Create(ctx, orphan); err != nil {
@@ -4860,9 +4894,10 @@ func TestAllZeroScopedModelWithdrawalPreservesSameAliasSiblingLastKnownGood(t *t
 	model.Spec.ModelName = "shared-client-alias"
 	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
 		Ref:         v1alpha1.ExternalProviderReference{Name: shared.Name, Namespace: shared.Namespace},
-		TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		TargetModel: "shared-client-alias", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	}}
 	sibling.Spec.ModelName = model.Spec.ModelName
+	sibling.Spec.ExternalProviderRefs[0].TargetModel = model.Spec.ModelName
 	for _, m := range []*v1alpha1.ExternalModel{model, sibling} {
 		if err := r.Update(ctx, m); err != nil {
 			t.Fatal(err)
@@ -4972,5 +5007,187 @@ func TestHomeModelPublicationReportsOneStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// homeSibling copies the fixture model under another name that targets its own
+// client name.
+func homeSibling(model *v1alpha1.ExternalModel, name string) *v1alpha1.ExternalModel {
+	sibling := model.DeepCopy()
+	sibling.Name, sibling.UID, sibling.ResourceVersion = name, types.UID(name+"-uid"), ""
+	sibling.Finalizers, sibling.Status = nil, v1alpha1.ExternalModelStatus{}
+	sibling.Spec.ExternalProviderRefs[0].TargetModel = name
+	return sibling
+}
+
+// A Ready model edited to reject its own provider references stops serving.
+// Alone in its namespace, its route and candidate are withdrawn at once, as
+// for disabled translation; beside a sibling, the overlay is republished
+// without it and its route is withdrawn once the ExtProc has drained, while
+// the sibling stays published, and deleting the sibling does not wait for the
+// rejected model (RHOAIENG-103278).
+func TestRejectedHomeModelWithdrawsItsServingState(t *testing.T) {
+	for _, withSibling := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sibling=%t", withSibling), func(t *testing.T) {
+			ctx := context.Background()
+			r, model := reconcilerFixture(t)
+			request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+			sibling := homeSibling(model, "sibling")
+			if withSibling {
+				if err := r.Create(ctx, sibling); err != nil {
+					t.Fatal(err)
+				}
+				reconcileModel(t, r, sibling)
+			}
+			reconcileModel(t, r, model)
+			if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+				t.Fatalf("model before the edit = %#v, want Ready", got.Status)
+			}
+			edited := getModel(t, r, model)
+			edited.Spec.ExternalProviderRefs = append(edited.Spec.ExternalProviderRefs, edited.Spec.ExternalProviderRefs[0])
+			if err := r.Update(ctx, edited); err != nil {
+				t.Fatal(err)
+			}
+
+			if withSibling {
+				result, err := r.Reconcile(ctx, request)
+				if err != nil || result.RequeueAfter <= 0 {
+					t.Fatalf("stage the rejected model's withdrawal: result=%#v err=%v", result, err)
+				}
+				if got := overlayEnvelope(t, r, model.Namespace).Overlay.Candidates; len(got) != 1 || got[0].StableID != envelope.CandidateStableID(sibling.Name, "provider") {
+					t.Fatalf("overlay candidates = %#v, want the sibling only", got)
+				}
+				seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{getModel(t, r, sibling)})
+				if result, err := r.Reconcile(ctx, request); err != nil || result.RequeueAfter != withdrawalDrainDuration {
+					t.Fatalf("start the request drain: result=%#v err=%v", result, err)
+				}
+				markWithdrawalDrainElapsed(t, r, model.Namespace)
+				if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrInvalidProviderRef) {
+					t.Fatalf("finish the withdrawal = %v, want %v", err, resolver.ErrInvalidProviderRef)
+				}
+				if got := getModel(t, r, sibling); got.Status.Phase != resolver.PhaseReady {
+					t.Fatalf("sibling = %#v, want Ready", got.Status)
+				}
+				if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
+					t.Fatalf("sibling HTTPRoute: %v", err)
+				}
+				if err := r.Delete(ctx, getModel(t, r, sibling)); err != nil {
+					t.Fatal(err)
+				}
+				reconcileModel(t, r, sibling)
+				if err := r.Get(ctx, client.ObjectKeyFromObject(sibling), &v1alpha1.ExternalModel{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("deleting the sibling beside only a rejected model did not complete: %v", err)
+				}
+			} else {
+				if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrNoRoutes) {
+					t.Fatalf("reconcile of the lone rejected model = %v, want %v", err, resolver.ErrNoRoutes)
+				}
+				if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("routing overlay of the lone rejected model = %v, want NotFound", err)
+				}
+			}
+			if got := getModel(t, r, model); got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonInvalidProviderRef {
+				t.Fatalf("rejected model = %#v, want Failed with %s", got.Status, reasonInvalidProviderRef)
+			}
+			if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+				t.Fatalf("rejected model HTTPRoute = %v, want NotFound", err)
+			}
+		})
+	}
+}
+
+// A provider name that no namespace can use fails the provider before anything
+// is applied. A name too long only for provider-<name> leaves the provider
+// Ready, without transport here, and rejects the models of its own namespace
+// that reference it. Either way the rest of the namespace is served
+// (RHOAIENG-103284).
+func TestUnrenderableProviderNameFailsOnlyItsModels(t *testing.T) {
+	long := strings.Repeat("p", resolver.MaxLocalProviderNameLength+1)
+	// The hashed Service name of other namespaces truncates this dot away.
+	dottedLate := strings.Repeat("p", 45) + ".prod"
+	for _, tc := range []struct {
+		provider                      string
+		providerPhase, providerReason string
+		providerMessage               string
+		modelReason, modelMessage     string
+	}{
+		{provider: "openai.prod", providerPhase: providerPhaseFailed, providerReason: reasonInvalidName,
+			providerMessage: "cannot name its transport Service",
+			modelReason:     reasonProviderNotReady, modelMessage: "cannot name its transport Service"},
+		{provider: long, providerPhase: resolver.PhaseReady, providerReason: reasonReconciled,
+			providerMessage: `cannot name its transport Service "provider-` + long + `" in its own namespace (must be no more than 63 characters)`,
+			modelReason:     reasonInvalidProviderRef, modelMessage: "only models in other namespaces can use it"},
+		{provider: dottedLate, providerPhase: resolver.PhaseReady, providerReason: reasonReconciled,
+			providerMessage: `cannot name its transport Service "provider-` + dottedLate + `" in its own namespace (a DNS-1035 label must consist of`,
+			modelReason:     reasonInvalidProviderRef, modelMessage: "only models in other namespaces can use it"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			ctx := context.Background()
+			r, model := reconcilerFixture(t)
+			r.ApplyResource = apiServerApply
+			bad := &v1alpha1.ExternalProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: tc.provider, Namespace: model.Namespace, UID: "bad-provider-uid"},
+				Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "bad.example.com",
+					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}}},
+			}
+			user := homeSibling(model, "user")
+			user.Spec.ExternalProviderRefs[0].Ref.Name = tc.provider
+			for _, obj := range []client.Object{bad, user} {
+				if err := r.Create(ctx, obj); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if result, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bad)}); err != nil || result.RequeueAfter != 0 {
+				t.Fatalf("reconcile provider = (%+v, %v), want settled", result, err)
+			}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(bad), bad); err != nil {
+				t.Fatal(err)
+			}
+			if ready := apiMeta.FindStatusCondition(bad.Status.Conditions, conditionReady); bad.Status.Phase != tc.providerPhase || ready == nil ||
+				ready.Reason != tc.providerReason || !strings.Contains(ready.Message, tc.providerMessage) {
+				t.Fatalf("provider status = %#v, want %s with %s saying %q", bad.Status, tc.providerPhase, tc.providerReason, tc.providerMessage)
+			}
+			if _, err := getUnstructured(r, serviceGVK, model.Namespace, "provider-"+tc.provider); !apierrors.IsNotFound(err) {
+				t.Fatalf("transport of the unrenderable provider: %v", err)
+			}
+			if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(user)}); err != nil && !errors.Is(err, resolver.ErrInvalidProviderRef) {
+				t.Fatalf("reconcile of the provider's model: %v", err)
+			}
+			reconcileModel(t, r, model)
+			if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+				t.Fatalf("model of a valid provider = %#v, want Ready", got.Status)
+			}
+			got := getModel(t, r, user)
+			if got.Status.Phase != modelPhaseFailed || readyReason(got) != tc.modelReason || !strings.Contains(readyMessage(got), tc.modelMessage) {
+				t.Fatalf("model of the unrenderable provider = %#v, want %s saying %q", got.Status, tc.modelReason, tc.modelMessage)
+			}
+		})
+	}
+}
+
+// Without API translation, a model that only works through it reports
+// APITranslationDisabled instead of Ready while every request fails
+// (RHOAIENG-103276); enabling translation serves it.
+func TestTranslationRequiredModelIsNotReadyWithoutAPITranslation(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	model.Spec.ExternalProviderRefs[0].TargetModel = "gpt-4o"
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile = %v, want %v", err, resolver.ErrNoRoutes)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonTranslationDisabled ||
+		!strings.Contains(readyMessage(got), `MaasTenantConfig.spec.apiTranslation.enabled must be true: targetModel "gpt-4o"`) {
+		t.Fatalf("status = %#v, want APITranslationDisabled", got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("HTTPRoute without translation: %v", err)
+	}
+	setControllerTranslationEnabled(t, r, model.Namespace, true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("status with translation = %#v, want Ready", got.Status)
 	}
 }

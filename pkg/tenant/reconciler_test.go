@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -101,9 +102,9 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: namespace},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
-			{Ref: v1alpha1.ExternalProviderReference{Name: "live"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
-			{Ref: v1alpha1.ExternalProviderReference{Name: "deleted"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
-			{Ref: v1alpha1.ExternalProviderReference{Name: "later"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "live"}, TargetModel: "model", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "deleted"}, TargetModel: "model", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "later"}, TargetModel: "model", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
 		}},
 	}
 	provider := func(name string) *v1alpha1.ExternalProvider {
@@ -273,12 +274,12 @@ func TestExternalModelRuntimeExcludesDeletingModels(t *testing.T) {
 	}
 	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "active", Namespace: namespace},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "active", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}}}
 	deleting := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "deleting", Namespace: namespace,
 		DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{"test-cleanup"}},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "deleting", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}}}
 	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, deleting, provider).Build()
 	r := &Reconciler{Client: fakeClient}
@@ -300,15 +301,39 @@ func TestMissingHomeProviderKeepsRuntimeConfiguration(t *testing.T) {
 	set, err := resolver.ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{{
 		ObjectMeta: metav1.ObjectMeta{Name: "home", Namespace: "tenant-ns"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-			Ref: v1alpha1.ExternalProviderReference{Name: "missing"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: "missing"}, TargetModel: "home", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}}, nil, false)
-	if !errors.Is(err, resolver.ErrNoRoutes) || allRuntimeRoutesExcludedByPolicy(set) {
-		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, allRuntimeRoutesExcludedByPolicy(set))
+	if !errors.Is(err, resolver.ErrNoRoutes) || set.ExcludedByPolicy() {
+		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, set.ExcludedByPolicy())
 	}
 	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
-	if _, err := combineRuntimeCandidates(nil, attachment, err, allRuntimeRoutesExcludedByPolicy(set)); !errors.Is(err, resolver.ErrNoRoutes) {
+	if _, err := combineRuntimeCandidates(nil, attachment, err, set.ExcludedByPolicy()); !errors.Is(err, resolver.ErrNoRoutes) {
 		t.Fatalf("missing home provider with attachment error = %v, want ErrNoRoutes to retain last config", err)
+	}
+}
+
+func TestRejectedHomeModelKeepsAttachedRuntimeCandidates(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-ns"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	ref := v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider.Name},
+		TargetModel: "home", APIFormat: "openai-chat", Path: "/v1/chat/completions"}
+	// Two active references to one provider reject the model.
+	set, err := resolver.ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{{
+		ObjectMeta: metav1.ObjectMeta{Name: "home", Namespace: "tenant-ns"},
+		Spec:       v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{ref, ref}},
+	}}, []*v1alpha1.ExternalProvider{provider}, false)
+	if !errors.Is(err, resolver.ErrNoRoutes) || set.Models[0].Rejected == nil || !set.ExcludedByPolicy() {
+		t.Fatalf("rejected model: error = %v, policyExcludedOnly = %t", err, set.ExcludedByPolicy())
+	}
+	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
+	candidates, err := combineRuntimeCandidates(nil, attachment, err, set.ExcludedByPolicy())
+	if err != nil || len(candidates) != 1 || candidates[0].StableID != attachment[0].StableID {
+		t.Fatalf("rejected home model with attachment = %#v, err=%v; want the attachment only", candidates, err)
 	}
 }
 
@@ -1625,4 +1650,139 @@ func TestEnqueueMaasTenantConfigForAITenant(t *testing.T) {
 			t.Fatalf("len(reqs) = %d, want 0", len(reqs))
 		}
 	})
+}
+
+// providersForTenant requires exactly the providers whose routes the model
+// controller publishes: none for a ref that needs disabled API translation
+// (RHOAIENG-103276), for a model the resolver rejects (RHOAIENG-103278) or for
+// a provider whose name cannot be rendered (RHOAIENG-103284). Otherwise
+// routingOverlayReady would wait for a provider the overlay never contains.
+func TestRequiredProvidersAgreeWithPublishedOverlay(t *testing.T) {
+	const namespace = "tenant-ns"
+	long := strings.Repeat("p", resolver.MaxLocalProviderNameLength+1)
+	var providers []*v1alpha1.ExternalProvider
+	var models []*v1alpha1.ExternalModel
+	var objects []client.Object
+	for _, p := range [][2]string{{"plain", "openai"}, {"renamed", "openai"}, {"azure", "azure"}, {"anthropic", "anthropic"},
+		{"duplicated", "openai"}, {"openai.prod", "openai"}, {long, "openai"}} {
+		provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: p[0], Namespace: namespace},
+			Spec:   v1alpha1.ExternalProviderSpec{Provider: p[1], Endpoint: "provider.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "key"}}},
+			Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
+		if p[0] == "openai.prod" {
+			// ReconcileProvider reports a name no namespace can use Failed.
+			provider.Status.Phase = "Failed"
+		}
+		providers, objects = append(providers, provider), append(objects, provider)
+	}
+	ref := func(provider, target, apiFormat string) v1alpha1.ExternalProviderRef {
+		return v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider}, TargetModel: target, APIFormat: apiFormat, Path: "/v1/chat/completions"}
+	}
+	for name, refs := range map[string][]v1alpha1.ExternalProviderRef{
+		"plain": {ref("plain", "plain", "openai-chat")}, "renamed": {ref("renamed", "gpt-4o", "openai-chat")},
+		"azure": {ref("azure", "azure", "openai-chat")}, "claude": {ref("anthropic", "claude", "messages")},
+		"bad":    {ref("duplicated", "bad", "openai-chat"), ref("duplicated", "bad", "openai-chat")},
+		"dotted": {ref("openai.prod", "dotted", "openai-chat")}, "long": {ref(long, "long", "openai-chat")},
+	} {
+		model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: refs}}
+		models, objects = append(models, model), append(objects, model)
+	}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(objects...).Build()}
+	for translation, want := range map[bool][]string{false: {"plain"}, true: {"anthropic", "azure", "plain", "renamed"}} {
+		set, _ := resolver.ResolveWithAPITranslation(models, providers, translation)
+		published := map[string]bool{}
+		for _, route := range set.Routes() {
+			published[route.Provider] = true
+		}
+		_, required, err := r.providersForTenant(context.Background(), namespace, "gateway", "gateway-system", translation)
+		if got := slices.Sorted(maps.Keys(required)); err != nil || !slices.Equal(got, want) || !maps.Equal(required, published) {
+			t.Fatalf("translation=%t: required providers = %v (%v), published %v, want %v", translation, got, err, published, want)
+		}
+	}
+}
+
+// A model rejected for its references to a provider of another namespace,
+// which only the model controller resolves, has its local provider required
+// only until it reports InvalidProviderRef for its current generation, at the
+// tenant's Gateway when it names it (RHOAIENG-103278). Otherwise the tenant
+// would wait for an overlay that never contains that provider.
+func TestRequiredProvidersSkipModelRejectedForForeignProvider(t *testing.T) {
+	const namespace = "tenant-ns"
+	gateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "gateway-system"}
+	local := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: namespace},
+		Spec:   v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
+	ref := func(provider, providerNamespace string) v1alpha1.ExternalProviderRef {
+		return v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider, Namespace: providerNamespace},
+			TargetModel: "chat", APIFormat: "openai-chat", Path: "/v1/chat/completions"}
+	}
+	ready := func(reason string) []metav1.Condition {
+		return []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: reason, Message: "reported", LastTransitionTime: metav1.Now()}}
+	}
+	for _, tc := range []struct {
+		name     string
+		status   v1alpha1.ExternalModelStatus
+		gateways []v1alpha1.NamespacedObjectReference
+		want     []string
+	}{
+		{name: "rejected at the current generation", status: v1alpha1.ExternalModelStatus{ObservedGeneration: 2, Conditions: ready("InvalidProviderRef")}},
+		{name: "rejected at an earlier generation", status: v1alpha1.ExternalModelStatus{ObservedGeneration: 1, Conditions: ready("InvalidProviderRef")}, want: []string{"local"}},
+		{name: "not Ready for another reason", status: v1alpha1.ExternalModelStatus{ObservedGeneration: 2, Conditions: ready("ProviderNotReady")}, want: []string{"local"}},
+		{name: "rejected at the tenant's Gateway", gateways: []v1alpha1.NamespacedObjectReference{{Name: "other", Namespace: "other-system"}, gateway},
+			status: v1alpha1.ExternalModelStatus{ObservedGeneration: 2, Conditions: ready("TenantNotSteady"), Gateways: []v1alpha1.ExternalModelGatewayStatus{
+				{NamespacedObjectReference: gateway, Conditions: ready("InvalidProviderRef")}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: namespace, Generation: 2},
+				Spec: v1alpha1.ExternalModelSpec{GatewayRefs: tc.gateways,
+					ExternalProviderRefs: []v1alpha1.ExternalProviderRef{ref("local", ""), ref("shared", "providers"), ref("shared", "providers")}},
+				Status: tc.status}
+			r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(local, model).Build()}
+			_, required, err := r.providersForTenant(context.Background(), namespace, gateway.Name, gateway.Namespace, false)
+			if got := slices.Sorted(maps.Keys(required)); err != nil || !slices.Equal(got, tc.want) {
+				t.Fatalf("required providers = %v (%v), want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// When the model controller rejected every model of the tenant, it withdraws
+// the overlay, so the tenant must not wait for one (RHOAIENG-103278).
+func TestLoneRejectedModelDoesNotWaitForOverlay(t *testing.T) {
+	const namespace = "tenant-ns"
+	local := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: namespace},
+		Spec:   v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
+	ref := func(provider, providerNamespace string) v1alpha1.ExternalProviderRef {
+		return v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider, Namespace: providerNamespace},
+			TargetModel: "chat", APIFormat: "openai-chat", Path: "/v1/chat/completions"}
+	}
+	rejected := v1alpha1.ExternalModelStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{{
+		Type: "Ready", Status: metav1.ConditionFalse, Reason: "InvalidProviderRef", Message: "reported", LastTransitionTime: metav1.Now()}}}
+	model := func(name string, status v1alpha1.ExternalModelStatus, refs ...v1alpha1.ExternalProviderRef) client.Object {
+		return &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Generation: 1},
+			Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: refs}, Status: status}
+	}
+	shared := ref("shared", "providers")
+	for _, tc := range []struct {
+		name   string
+		models []client.Object
+		wait   bool
+	}{
+		{name: "rejected with a local provider", models: []client.Object{model("chat", rejected, ref("local", ""), shared, shared)}},
+		{name: "rejected on another namespace's provider alone", models: []client.Object{model("chat", rejected, shared, shared)}},
+		{name: "rejection not reported yet", models: []client.Object{model("chat", v1alpha1.ExternalModelStatus{}, ref("local", ""), shared, shared)}, wait: true},
+		{name: "another model on another namespace's provider", wait: true, models: []client.Object{
+			model("chat", rejected, ref("local", ""), shared, shared), model("other", v1alpha1.ExternalModelStatus{}, shared)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(append(tc.models, local)...).Build()}
+			candidates, serving, overlayReady, reason, err := r.resolvePraxisRuntimeCandidates(context.Background(), namespace, "gateway", "gateway-system", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if overlayReady == tc.wait || (!tc.wait && (serving || len(candidates) != 0)) {
+				t.Fatalf("serving=%t overlayReady=%t reason=%q candidates=%d, want wait=%t", serving, overlayReady, reason, len(candidates), tc.wait)
+			}
+		})
+	}
 }

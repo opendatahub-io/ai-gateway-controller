@@ -245,9 +245,19 @@ func notControllerOwnedSecret(obj client.Object) bool {
 // dropping the candidate (and its Secret mount) from the rendered stack.
 // Dropping it would leave the ExtProc mounting a deleted Secret — blocking
 // new pods — until the resync interval.
+//
+// Creates of copies are admitted for the same reason in reverse: when the
+// delete above removed an attachment-only tenant's ExtProc, re-attaching the
+// model republishes a byte-identical overlay (its inert entry was never
+// dropped), so no ConfigMap event fires and the copy create is the only event
+// that renders the ExtProc again (RHOAIENG-103279). Only the ExternalModel
+// reconciler creates copies, so this never self-triggers; their updates stay
+// filtered, as they cannot change the rendered stack.
 func tenantSecretPredicate() predicate.Funcs {
 	return predicate.Funcs{
-		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwnedSecret(e.Object) },
+		CreateFunc: func(e event.CreateEvent) bool {
+			return notControllerOwnedSecret(e.Object) || e.Object.GetLabels()[LabelCredentialCopy] == "true"
+		},
 		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwnedSecret(e.ObjectNew) },
 		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwnedSecret(e.Object) },
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
@@ -956,28 +966,50 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
 	}
 	providerTypes := make(map[string]string, len(providers.Items))
+	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
 		providerTypes[providers.Items[i].Name] = providers.Items[i].Spec.Provider
+		if providers.Items[i].DeletionTimestamp.IsZero() {
+			providerPtrs = append(providerPtrs, &providers.Items[i])
+		}
 	}
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
 		return nil, nil, err
 	}
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	for i := range models {
+		if models[i].DeletionTimestamp.IsZero() {
+			modelPtrs = append(modelPtrs, &models[i])
+		}
+	}
+	// The model controller publishes neither a model the resolver rejects for
+	// its own provider references, nor a ref that needs disabled translation,
+	// nor a provider whose name cannot name its transport, so the overlay never
+	// contains their providers.
+	rejected := map[string]bool{}
+	if set, _ := resolver.ResolveWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled); set != nil {
+		for _, model := range set.Models {
+			rejected[model.ModelRef] = model.Rejected != nil
+		}
+	}
 	referenced := map[string]bool{}
 	required := map[string]bool{}
-	for i := range models {
-		if !models[i].DeletionTimestamp.IsZero() {
-			continue
-		}
-		for _, ref := range models[i].Spec.ExternalProviderRefs {
+	for _, model := range modelPtrs {
+		// The model controller also resolves the providers of other namespaces,
+		// which this resolve does not: a rejection one of them causes is read
+		// from the model's status.
+		modelRejected := rejected[model.Namespace+"/"+model.Name] || reportedInvalidProviderRef(model, gatewayName, gatewayNamespace)
+		for _, ref := range model.Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
 			if name == "" || ref.Ref.Namespace != "" && ref.Ref.Namespace != namespace {
 				continue
 			}
 			referenced[name] = true
-			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && providerTypes[name] == "anthropic"
-			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
+			translationDisabled := !apiTranslationEnabled && resolver.APITranslationRequirement(model, ref, providerTypes[name]) != ""
+			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled && !modelRejected &&
+				resolver.ValidateLocalProviderName(name) == nil {
 				required[name] = true
 			}
 		}
@@ -997,6 +1029,24 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	return result, availableRequired, nil
 }
 
+// reportedInvalidProviderRef reports a model whose current generation the
+// model controller rejected for its own provider references at the tenant's
+// Gateway: its result for that Gateway, otherwise its Ready condition.
+func reportedInvalidProviderRef(model *v1alpha1.ExternalModel, gatewayName, gatewayNamespace string) bool {
+	if model.Status.ObservedGeneration != model.Generation {
+		return false
+	}
+	conditions := model.Status.Conditions
+	gateway := v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}
+	if i := slices.IndexFunc(model.Status.Gateways, func(g v1alpha1.ExternalModelGatewayStatus) bool {
+		return g.NamespacedObjectReference == gateway
+	}); i >= 0 {
+		conditions = model.Status.Gateways[i].Conditions
+	}
+	ready := meta.FindStatusCondition(conditions, "Ready")
+	return ready != nil && ready.Status == metav1.ConditionFalse && ready.Reason == resolver.ReasonInvalidProviderRef
+}
+
 func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, bool, error) {
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
@@ -1007,8 +1057,15 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		return nil, false, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	rejected, foreignOnly := false, false
 	for i := range models {
 		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		// The model controller publishes nothing for a model it rejected,
+		// also for providers of other namespaces, which only its status shows.
+		if reportedInvalidProviderRef(&models[i], gatewayName, gatewayNamespace) {
+			rejected = true
 			continue
 		}
 		// Providers in other namespaces are loaded from the published overlay
@@ -1018,6 +1075,8 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 			return ref.Ref.Namespace == "" || ref.Ref.Namespace == namespace
 		}) {
 			modelPtrs = append(modelPtrs, &models[i])
+		} else {
+			foreignOnly = true
 		}
 	}
 
@@ -1028,7 +1087,9 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		}
 	}
 	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
-	policyExcludedOnly := allRuntimeRoutesExcludedByPolicy(runtimeSet)
+	// With every model rejected, the model controller withdraws the overlay;
+	// a model on other namespaces' providers alone may still be published.
+	policyExcludedOnly := runtimeSet.ExcludedByPolicy() || (rejected && len(modelPtrs) == 0 && !foreignOnly)
 	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
@@ -1044,28 +1105,6 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
 	return candidates, policyExcludedOnly, nil
-}
-
-// allRuntimeRoutesExcludedByPolicy distinguishes an intentional translation
-// exclusion from a missing or unready provider. The latter must retain the
-// last applied runtime configuration until the provider recovers.
-func allRuntimeRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
-	if set == nil || len(set.Models) == 0 {
-		return false
-	}
-	sawExclusion := false
-	for _, model := range set.Models {
-		if len(model.Routes) > 0 || len(model.Skips) == 0 {
-			return false
-		}
-		for _, skip := range model.Skips {
-			if skip.Reason != resolver.SkipTranslationDisabled {
-				return false
-			}
-			sawExclusion = true
-		}
-	}
-	return sawExclusion
 }
 
 // combineRuntimeCandidates allows an intentional policy exclusion to leave
