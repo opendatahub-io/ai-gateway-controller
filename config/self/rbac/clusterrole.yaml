@@ -25,12 +25,19 @@ rules:
   verbs: ["get", "list", "watch", "update", "patch"]
 # Secondary watch: resolve status.{phase,gatewayRef} for a MaasTenantConfig's
 # owning AITenant (neither field lives on MaasTenantConfig itself), and react
-# to AITenant changes that might affect readiness. This controller never
-# writes AITenant (status or otherwise) — maas-controller's own AITenant
-# reconciler owns it — hence get/list/watch only, no update/patch/finalizers.
+# to AITenant changes that might affect readiness.
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["aitenants"]
   verbs: ["get", "list", "watch"]
+# Narrow exception to "ai-gateway-controller never writes AITenant": the
+# consumer-portal reconciler owns the auth proxy Deployment and reports its
+# health as the ConsumerPortalProxyReady condition on the AITenant status subresource.
+# It must not write any other AITenant field, and maas-controller must not
+# write this condition type; per-condition ownership keeps the two writers
+# from clobbering each other.
+- apiGroups: ["maas.opendatahub.io"]
+  resources: ["aitenants/status"]
+  verbs: ["get", "update", "patch"]
 # Read and watch subscriptions and model refs so a guardrail list change
 # updates the tenant. This controller does not write them.
 - apiGroups: ["maas.opendatahub.io"]
@@ -53,9 +60,12 @@ rules:
 - apiGroups: ["apps"]
   resources: ["replicasets"]
   verbs: ["get", "list"]
+# watch is additionally required by the consumer-portal reconciler's proxy
+# pod watch, which drives the ConsumerPortalProxyReady condition (crash loops,
+# recovery). get/list remain scoped to the same controllers as before.
 - apiGroups: [""]
   resources: ["pods"]
-  verbs: ["get", "list"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get"]

@@ -33,14 +33,23 @@ func testShippedPermissions(t *testing.T, c client.Client) {
 		{group: "", name: "pods"},
 		{group: "discovery.k8s.io", name: "endpointslices"},
 	} {
-		for _, verb := range []string{"get", "list"} {
+		// pods are additionally watched by the consumer-portal reconciler's
+		// proxy pod watch, which drives the ConsumerPortalProxyReady
+		// condition; the rest stay read-only.
+		verbs := []string{"get", "list"}
+		if resource.name == "pods" {
+			verbs = append(verbs, "watch")
+		}
+		for _, verb := range verbs {
 			assertAccess(t, c, true, authv1.ResourceAttributes{
 				Namespace: tenantNamespace, Group: resource.group, Resource: resource.name, Verb: verb,
 			})
 		}
-		assertAccess(t, c, false, authv1.ResourceAttributes{
-			Namespace: tenantNamespace, Group: resource.group, Resource: resource.name, Verb: "watch",
-		})
+		if resource.name != "pods" {
+			assertAccess(t, c, false, authv1.ResourceAttributes{
+				Namespace: tenantNamespace, Group: resource.group, Resource: resource.name, Verb: "watch",
+			})
+		}
 	}
 	assertAccess(t, c, true, authv1.ResourceAttributes{
 		Namespace: tenantNamespace, Resource: "pods/log", Verb: "get",
