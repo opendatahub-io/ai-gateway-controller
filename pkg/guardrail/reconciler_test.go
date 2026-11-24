@@ -878,6 +878,35 @@ func TestReconcileKeepsTheVerdictWhenTheTenantReadFails(t *testing.T) {
 	}
 }
 
+// TestReconcileFencesAnAcceptedBindingOnceTheTenantReadStaysBroken is the
+// Output-check dependency's share of the staleness budget. A MaasTenantConfig
+// read that keeps failing is as unverifiable as a provider read that does, so
+// past the budget the binding fails closed rather than standing on a tenant
+// capability nobody can confirm.
+func TestReconcileFencesAnAcceptedBindingOnceTheTenantReadStaysBroken(t *testing.T) {
+	guardrail := newGuardrail(consumerNS, nemoName, providerNS)
+	guardrail.Spec.Checks[0].Phases = []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseOutput}
+	f := newStandardFixture(guardrail, newNemo(providerNS, nemoName, map[string]any{"from": "All"}))
+	failRead := false
+	f.reconciler.OutputChecksUnsupported = func(context.Context, string) (string, error) {
+		if failRead {
+			return "", errors.New("etcd is unavailable")
+		}
+		return "", nil
+	}
+
+	f.reconcile(t, consumerNS)
+	requireCondition(t, f.reload(t, consumerNS), ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	backdateVerified(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
+
+	failRead = true
+	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
+	if err != nil {
+		t.Fatalf("Reconcile: %v, want the binding fenced rather than retried forever", err)
+	}
+	requireDenied(t, f, res, consumerNS, reasonProviderUnverified)
+}
+
 func TestGuardrailsBesideTenantConfigEnqueuesItsNamespace(t *testing.T) {
 	here := newGuardrail(consumerNS, nemoName, "")
 	elsewhere := newGuardrail(providerNS, nemoName, "")
@@ -1243,14 +1272,14 @@ func TestReconcileFencesAnAcceptedBindingOnceTheProviderReadStaysBroken(t *testi
 
 	f.reconcile(t, consumerNS)
 	accepted := f.reload(t, consumerNS)
-	if accepted.Status.LastProviderReadTime == nil {
-		t.Fatal("lastProviderReadTime is unset after an accepted reconcile; the budget has nothing to measure from")
+	if accepted.Status.LastVerifiedTime == nil {
+		t.Fatal("lastVerifiedTime is unset after an accepted reconcile; the budget has nothing to measure from")
 	}
 
 	// The budget has run out. Backdating the recorded read is what a provider
 	// that has been unreadable for longer than the budget looks like, without
 	// the test having to wait for one.
-	backdateProviderRead(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
+	backdateVerified(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
 
 	failRead = true
 	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
@@ -1263,8 +1292,8 @@ func TestReconcileFencesAnAcceptedBindingOnceTheProviderReadStaysBroken(t *testi
 		t.Errorf("bindingRevision = %q, providerEndpoint = %q, want both cleared on a fenced binding",
 			got.Status.BindingRevision, got.Status.ProviderEndpoint)
 	}
-	if got.Status.LastProviderReadTime == nil {
-		t.Error("lastProviderReadTime was cleared; it records when the provider was observed, not what was decided")
+	if got.Status.LastVerifiedTime == nil {
+		t.Error("lastVerifiedTime was cleared; it records when the binding was verified, not what was decided")
 	}
 }
 
@@ -1290,7 +1319,7 @@ func TestReconcileRestoresAFencedBindingOnceTheProviderReadsAgain(t *testing.T) 
 
 	f.reconcile(t, consumerNS)
 	accepted := f.reload(t, consumerNS)
-	backdateProviderRead(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
+	backdateVerified(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
 
 	failRead = true
 	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
@@ -1308,9 +1337,9 @@ func TestReconcileRestoresAFencedBindingOnceTheProviderReadsAgain(t *testing.T) 
 		t.Errorf("bindingRevision = %q, want the binding restored to %q",
 			got.Status.BindingRevision, accepted.Status.BindingRevision)
 	}
-	if !got.Status.LastProviderReadTime.After(fenced.Status.LastProviderReadTime.Time) {
-		t.Errorf("lastProviderReadTime = %v, want a stamp newer than the backdated %v",
-			got.Status.LastProviderReadTime, fenced.Status.LastProviderReadTime)
+	if !got.Status.LastVerifiedTime.After(fenced.Status.LastVerifiedTime.Time) {
+		t.Errorf("lastVerifiedTime = %v, want a stamp newer than the backdated %v",
+			got.Status.LastVerifiedTime, fenced.Status.LastVerifiedTime)
 	}
 }
 
@@ -1339,7 +1368,7 @@ func TestReconcileFencesALegacyAcceptedBindingWithNoRecordedRead(t *testing.T) {
 	// An accepted binding carrying no read time is what the upgrade leaves
 	// behind, and the only way to produce one through the current code.
 	f.reconcile(t, consumerNS)
-	clearProviderRead(t, f, consumerNS)
+	clearVerified(t, f, consumerNS)
 	backdateStart(f, f.reconciler.providerReadStaleAfter()+time.Minute)
 
 	failRead = true
@@ -1406,25 +1435,25 @@ func TestRetryCeilingStaysWithinTheBudgetAndNeverCollapses(t *testing.T) {
 	}
 }
 
-// backdateProviderRead moves status.lastProviderReadTime into the past, so a
+// backdateVerified moves status.lastVerifiedTime into the past, so a
 // test can reach the staleness budget without sleeping through it.
-func backdateProviderRead(t *testing.T, f *fixture, namespace string, age time.Duration) {
+func backdateVerified(t *testing.T, f *fixture, namespace string, age time.Duration) {
 	t.Helper()
 	guardrail := f.reload(t, namespace)
-	guardrail.Status.LastProviderReadTime = ptr.To(metav1.NewTime(time.Now().Add(-age)))
+	guardrail.Status.LastVerifiedTime = ptr.To(metav1.NewTime(time.Now().Add(-age)))
 	if err := f.cache.Status().Update(context.Background(), guardrail); err != nil {
-		t.Fatalf("backdating lastProviderReadTime: %v", err)
+		t.Fatalf("backdating lastVerifiedTime: %v", err)
 	}
 }
 
-// clearProviderRead drops status.lastProviderReadTime, leaving the status a
+// clearVerified drops status.lastVerifiedTime, leaving the status a
 // controller that never recorded one would have written.
-func clearProviderRead(t *testing.T, f *fixture, namespace string) {
+func clearVerified(t *testing.T, f *fixture, namespace string) {
 	t.Helper()
 	guardrail := f.reload(t, namespace)
-	guardrail.Status.LastProviderReadTime = nil
+	guardrail.Status.LastVerifiedTime = nil
 	if err := f.cache.Status().Update(context.Background(), guardrail); err != nil {
-		t.Fatalf("clearing lastProviderReadTime: %v", err)
+		t.Fatalf("clearing lastVerifiedTime: %v", err)
 	}
 }
 
@@ -1475,6 +1504,42 @@ func TestReconcileKeepsAnAcceptedBindingWhenTheNamespaceReadFails(t *testing.T) 
 		t.Errorf("bindingRevision = %q, want the accepted one %q left standing",
 			got.Status.BindingRevision, accepted.Status.BindingRevision)
 	}
+}
+
+// TestReconcileFencesAnAcceptedBindingOnceTheNamespaceReadStaysBroken is the
+// Selector Namespace dependency's share of the budget. Labels that cannot be
+// read past the budget are as unverifiable as a provider that cannot be read,
+// so the binding fails closed rather than standing on an authorization input
+// nobody can confirm.
+func TestReconcileFencesAnAcceptedBindingOnceTheNamespaceReadStaysBroken(t *testing.T) {
+	selector := map[string]any{"from": "Selector", "selector": map[string]any{"matchLabels": map[string]any{"guardrails": "shared"}}}
+	failRead := false
+	f := newFixture(fixtureOptions{
+		cacheObjects: []client.Object{newGuardrail(consumerNS, nemoName, providerNS)},
+		liveObjects: []client.Object{
+			newNemo(providerNS, nemoName, selector),
+			newNamespace(consumerNS, map[string]string{"guardrails": "shared"}),
+		},
+		liveFuncs: interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isNamespace := obj.(*corev1.Namespace); failRead && isNamespace {
+					return apierrors.NewInternalError(errors.New("etcd unavailable"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	})
+
+	f.reconcile(t, consumerNS)
+	requireCondition(t, f.reload(t, consumerNS), ConditionAccepted, metav1.ConditionTrue, reasonPolicyAccepted)
+	backdateVerified(t, f, consumerNS, f.reconciler.providerReadStaleAfter()+time.Minute)
+
+	failRead = true
+	res, err := f.reconciler.Reconcile(context.Background(), guardrailRequest(consumerNS))
+	if err != nil {
+		t.Fatalf("Reconcile: %v, want the binding fenced rather than retried forever", err)
+	}
+	requireDenied(t, f, res, consumerNS, reasonProviderUnverified)
 }
 
 // TestReconcileReadsTheProviderLive proves authorization does not come from

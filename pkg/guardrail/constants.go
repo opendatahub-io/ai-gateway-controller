@@ -75,10 +75,12 @@ const (
 	// on every reconcile, so a policy is accepted once TrustyAI is installed
 	// without this controller being restarted; see providerCRDInstalled.
 	reasonProviderCRDNotInstalled = "ProviderCRDNotInstalled"
-	// reasonProviderUnverified refuses a binding whose provider read has kept
-	// failing past the staleness budget. Distinct from reasonProviderNotFound:
-	// the provider was never observed to be absent, it stopped being readable,
-	// which is what a revoked RBAC rule looks like from here.
+	// reasonProviderUnverified refuses a binding whose verification has kept
+	// failing past the staleness budget: a dependency read -- the provider, its
+	// allowedConsumers Namespace, or the tenant's Output-check support -- that
+	// stopped completing. Distinct from reasonProviderNotFound: nothing was
+	// observed to be absent, it stopped being readable, which is what a revoked
+	// RBAC rule looks like from here.
 	reasonProviderUnverified = "ProviderUnverified"
 )
 
