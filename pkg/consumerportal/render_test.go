@@ -37,15 +37,16 @@ func renderTestResources(t *testing.T) []unstructured.Unstructured {
 		t.Fatalf("render.Build: %v", err)
 	}
 	return Render(built, Params{
-		Namespace:          testInfraNamespace,
-		DashboardNamespace: DefaultDashboardNamespace,
-		Image:              "quay.io/example/kube-auth-proxy:test",
-		OIDCIssuerURL:      testIssuer,
-		Hostname:           testHostname,
-		OIDCClientID:       "test-client",
-		GatewayName:        testGatewayName,
-		GatewayNamespace:   testGatewayNamespace,
-		AuthorinoNamespace: DefaultAuthorinoNamespace,
+		Namespace:           testInfraNamespace,
+		DashboardNamespace:  DefaultDashboardNamespace,
+		Image:               "quay.io/example/kube-auth-proxy:test",
+		OIDCIssuerURL:       testIssuer,
+		Hostname:            testHostname,
+		OIDCClientID:        "test-client",
+		GatewayName:         testGatewayName,
+		GatewayNamespace:    testGatewayNamespace,
+		GatewayListenerName: "web-secure",
+		AuthorinoNamespace:  DefaultAuthorinoNamespace,
 	})
 }
 
@@ -141,7 +142,7 @@ func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 		t.Fatalf("portal parentRefs = %v, want one", parents)
 	}
 	parent, ok := parents[0].(map[string]any)
-	if !ok || parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace || parent["sectionName"] != "https" {
+	if !ok || parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace || parent["sectionName"] != "web-secure" {
 		t.Errorf("portal parentRef = %#v", parent)
 	}
 

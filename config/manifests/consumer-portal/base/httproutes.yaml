@@ -11,7 +11,7 @@ spec:
   parentRefs:
     - name: CONSUMER_PORTAL_GATEWAY_NAME
       namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
-      sectionName: https
+      sectionName: CONSUMER_PORTAL_GATEWAY_LISTENER_NAME
   rules:
     - matches:
         - path:
@@ -80,7 +80,7 @@ spec:
   parentRefs:
     - name: CONSUMER_PORTAL_GATEWAY_NAME
       namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
-      sectionName: https
+      sectionName: CONSUMER_PORTAL_GATEWAY_LISTENER_NAME
   rules:
     - matches:
         - path:
