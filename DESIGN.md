@@ -642,6 +642,14 @@ host, and every positive-weight backend selecting the EndpointSlice-resolved
 Service endpoint port for the portal listener. The conventional
 `maas-gateway-route` name only
 breaks ties when several Routes front the same Gateway.
+The portal HTTPRoutes intentionally omit `spec.hostnames`. In the ClusterIP +
+Route pattern, `openshiftRoute` mode forbids listener hostnames and Istio must
+serve the Gateway's hostname-less listener as one path-based catch-all virtual
+host. Constraining only the portal routes to the discovered Route host would
+split Envoy's route table into an exact-host virtual host for the portal and a
+catch-all virtual host for API and model routes. The discovered host is still
+used for the OIDC redirect URL and cookie domain, but HTTPRoute matching stays
+path-only.
 
 The same reconciliation creates the `maas-consumer-portal` and
 `maas-consumer-portal-oauth2` HTTPRoutes on the default Gateway, a

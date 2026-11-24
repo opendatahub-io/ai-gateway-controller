@@ -863,9 +863,9 @@ func assertPortalAppliedWithHostname(t *testing.T, r *Reconciler, rec *recorder,
 	if route == nil {
 		t.Fatal("portal HTTPRoute was not applied")
 	}
-	hostnames, _, _ := unstructured.NestedStringSlice(route.Object, "spec", "hostnames")
-	if len(hostnames) != 1 || hostnames[0] != hostname {
-		t.Errorf("portal HTTPRoute hostnames = %v, want [%s]", hostnames, hostname)
+	hostnames, found, err := unstructured.NestedStringSlice(route.Object, "spec", "hostnames")
+	if found || err != nil || len(hostnames) != 0 {
+		t.Errorf("portal HTTPRoute hostnames = %v (found=%t, err=%v), want none", hostnames, found, err)
 	}
 
 	deployment := rec.objects["Deployment"]

@@ -133,9 +133,9 @@ func TestRenderSubstitutesTenantValues(t *testing.T) {
 func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 	resources := renderTestResources(t)
 	portal := findResource(t, resources, "HTTPRoute", PortalRouteName)
-	hostnames, _, _ := unstructured.NestedStringSlice(portal.Object, "spec", "hostnames")
-	if len(hostnames) != 1 || hostnames[0] != testHostname {
-		t.Errorf("portal HTTPRoute hostnames = %v, want [%s]", hostnames, testHostname)
+	portalHostnames, found, err := unstructured.NestedStringSlice(portal.Object, "spec", "hostnames")
+	if found || err != nil || len(portalHostnames) != 0 {
+		t.Errorf("portal HTTPRoute hostnames = %v (found=%t, err=%v), want none", portalHostnames, found, err)
 	}
 	parents, _, _ := unstructured.NestedSlice(portal.Object, "spec", "parentRefs")
 	if len(parents) != 1 {
@@ -173,6 +173,10 @@ func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 	}
 
 	oauth := findResource(t, resources, "HTTPRoute", OAuthRouteName)
+	oauthHostnames, found, err := unstructured.NestedStringSlice(oauth.Object, "spec", "hostnames")
+	if found || err != nil || len(oauthHostnames) != 0 {
+		t.Errorf("oauth HTTPRoute hostnames = %v (found=%t, err=%v), want none", oauthHostnames, found, err)
+	}
 	oauthRule := firstNestedMap(t, oauth.Object, "spec", "rules")
 	oauthPath, _, _ := unstructured.NestedString(firstNestedMap(t, oauthRule, "matches"), "path", "value")
 	oauthBackendRef := firstNestedMap(t, oauthRule, "backendRefs")

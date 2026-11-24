@@ -115,7 +115,6 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		"CONSUMER_PORTAL_CLIENT_ID", p.OIDCClientID,
 		"CONSUMER_PORTAL_REDIRECT_URL", "https://"+p.Hostname+"/oauth2/callback",
 		"CONSUMER_PORTAL_COOKIE_DOMAIN", p.Hostname,
-		"CONSUMER_PORTAL_HOSTNAME", p.Hostname,
 		"CONSUMER_PORTAL_GATEWAY_NAMESPACE", p.GatewayNamespace,
 		"CONSUMER_PORTAL_GATEWAY_NAME", p.GatewayName,
 		"CONSUMER_PORTAL_GATEWAY_LISTENER_NAME", p.GatewayListenerName,
