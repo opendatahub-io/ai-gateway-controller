@@ -99,8 +99,8 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(volumes) != 2 {
-		t.Fatalf("volumes = %d, want routing plus projected credentials", len(volumes))
+	if len(volumes) != 3 {
+		t.Fatalf("volumes = %d, want routing, config snapshot, and projected credentials", len(volumes))
 	}
 	annotations, _, err := unstructured.NestedStringMap(resources[1].Object, "spec", "template", "metadata", "annotations")
 	if err != nil || annotations["ai-gateway-controller.opendatahub.io/extproc-config-sha256"] == "" {
@@ -603,6 +603,7 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 			t.Fatal(err)
 		}
 		sharedConfig, externalConfig := sharedData["extproc.yaml"], externalData["extproc.yaml"]
+		assertSharedConfigHasLeadingHeadersGuard(t, sharedConfig)
 		if strings.Contains(sharedConfig, "anthropic_messages_to_chat_completions") != enabled {
 			t.Fatalf("shared translation filters stale for enabled=%t:\n%s", enabled, sharedConfig)
 		}
