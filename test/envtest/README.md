@@ -39,6 +39,16 @@ API server, including on failure. The current kubeconfig is never used.
   Both paths require the shipped permission to patch model finalizers.
 - When that tenant's AITenant starts terminating, the published model reports
   `TenantNotReady` and keeps its route and overlay.
+- Setting or removing `maas.opendatahub.io/experimental-extproc-max-requests`
+  on an existing Praxis tenant's MaasTenantConfig changes the ExtProc
+  circuit-breaker `max_requests` in its gateway EnvoyFilter within the wait
+  timeout, well before the one-minute resync.
+- A Praxis tenant waiting for the legacy IPP handoff installs Praxis within
+  five seconds of maas-controller writing `payload-processing-status:
+  cleanup-complete`, faster than any requeue.
+- A Praxis tenant blocked by a leftover IPP-shaped plugins ConfigMap stays
+  uninstalled, then installs within five seconds of that ConfigMap being
+  deleted.
 - The shipped controller identity may create, patch and delete Secrets in a
   tenant namespace for its credential copies, and read ReferenceGrants in a
   provider namespace and across all namespaces. It can read Gateways in the
