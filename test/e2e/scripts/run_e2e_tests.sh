@@ -104,6 +104,9 @@ e2e_test_files=(
     "$TEST_DIR/tests/test_tenant_rate_limit_isolation.py"
     "$TEST_DIR/tests/test_per_tenant_ipp_isolation.py"
     "$TEST_DIR/tests/test_embedding_inference.py"
+    # Gateway AuthPolicy api-keys-x-api-key via ExternalModel apiFormat=messages
+    # (MaaS #1506 / #1517). Skips when ExternalModel CRD is absent.
+    "$TEST_DIR/tests/test_x_api_key_auth.py"
 )
 
 resolved_extra_args=()
