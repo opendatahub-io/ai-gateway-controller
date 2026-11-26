@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -31,9 +32,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -55,6 +59,11 @@ type Reconciler struct {
 	// evaluated, so provider/permission drift is re-checked periodically even
 	// without a watch event. Must be positive.
 	ResyncInterval time.Duration
+	// ProviderReadStaleAfter bounds how long an accepted binding may stand on
+	// a verification dependency read that keeps failing -- the provider, its
+	// allowedConsumers Namespace, or the tenant's Output-check support. Zero
+	// means defaultProviderReadStaleAfter.
+	ProviderReadStaleAfter time.Duration
 	// Log receives one entry per reconcile plus any resolution error.
 	Log logr.Logger
 	// Recorder publishes a Warning Event whenever a policy stops being
@@ -63,7 +72,7 @@ type Reconciler struct {
 	// controller's logs.
 	Recorder events.EventRecorder
 
-	// RESTMapper answers whether TrustyAI's NemoGuardrails CRD is installed.
+	// RESTMapper answers whether TrustyAI's NemoGuardrails CRD is installed.in
 	// SetupWithManager fills it from the manager; it is re-read on every
 	// reconcile so a policy recovers once TrustyAI appears, rather than
 	// waiting for this controller to restart.
@@ -79,6 +88,20 @@ type Reconciler struct {
 	// SetupWithManager fills it from the manager.
 	Discovery serverResourceLister
 
+	// startedAt is when this controller began reconciling, the anchor for the
+	// staleness budget of a binding accepted before this controller recorded
+	// provider read times.
+	//
+	// It is taken on the first reconcile rather than in SetupWithManager
+	// because under leader election a replica is built long before it is
+	// allowed to reconcile anything. A standby that stood by for an hour would
+	// otherwise take leadership with the whole budget already spent, and
+	// retract a legacy binding on the first read that happened to fail.
+	startedAt time.Time
+	// anchorOnce takes startedAt, so the reconciles racing for it agree on one
+	// value and every later read of it is ordered after the write.
+	anchorOnce sync.Once
+
 	// OutputChecksUnsupported returns why the tenant in a policy's namespace
 	// cannot enforce Output-phase checks, or "" if it can, so such a policy is
 	// refused instead of accepted and silently skipped. Nil means every tenant
@@ -93,6 +116,94 @@ type Reconciler struct {
 // emits reports. The events API requires one, and there is a single kind of
 // event here: a provider binding being refused.
 const refuseAction = "RefuseBinding"
+
+// defaultProviderReadStaleAfter tolerates three consecutive resyncs at the
+// default cadence before an unverifiable binding is refused. Long enough that
+// an API server blip or a rolling restart never retracts a working binding,
+// short enough that a revoked RBAC rule does not keep a policy enforcing for
+// a day.
+const defaultProviderReadStaleAfter = 15 * time.Minute
+
+// baseRetryDelay is the first backoff step after a failed reconcile, matching
+// controller-runtime's own default. Only the ceiling is changed.
+const baseRetryDelay = 5 * time.Millisecond
+
+// providerReadStaleAfter is the budget in force, so the default lives in one
+// place and a caller that leaves the field zero still gets a declared bound.
+func (r *Reconciler) providerReadStaleAfter() time.Duration {
+	if r.ProviderReadStaleAfter > 0 {
+		return r.ProviderReadStaleAfter
+	}
+	return defaultProviderReadStaleAfter
+}
+
+// retryCeiling caps the backoff between failed reconciles. The staleness
+// budget is only a bound if the failing reconcile that enforces it runs again
+// within it, and controller-runtime's default backoff climbs to 1000s, past
+// both the resync cadence and the budget.
+//
+// ResyncInterval is the cadence this controller already re-checks at, so it is
+// the ceiling whenever it is shorter. A zero or negative one is not a missing
+// ceiling but an immediate requeue on every failure, and one longer than the
+// budget would not bound it, so both fall back to the budget itself.
+func (r *Reconciler) retryCeiling() time.Duration {
+	budget := r.providerReadStaleAfter()
+	if r.ResyncInterval > 0 && r.ResyncInterval < budget {
+		return r.ResyncInterval
+	}
+	return budget
+}
+
+// verificationStale reports how long the verdict standing on this policy has
+// gone without a fully successful verification behind it, and whether that is
+// past the budget. "Fully successful" means every dependency read reached the
+// stamp at the end of the pipeline: the provider, its allowedConsumers
+// Namespace in Selector mode, and the tenant's Output-check support. A failure
+// of any one of them stops short of the stamp, so a dependency that keeps
+// failing ages the same way a provider that keeps failing does.
+//
+// A policy with no successful verification and nothing accepted is not stale:
+// no verdict was ever reached, so there is nothing to fence.
+//
+// A policy accepted before this controller recorded a verification time has a
+// verdict standing but no timestamp to age. Its budget runs from the first
+// reconcile, the earliest point this controller could have read anything, so
+// an upgrade gets one budget's grace instead of an unbounded one.
+func (r *Reconciler) verificationStale(guardrail *aigatewayv1alpha1.AIGuardrail) (time.Duration, bool) {
+	since := r.startedAt
+	if last := guardrail.Status.LastVerifiedTime; last != nil && !last.IsZero() {
+		since = last.Time
+	} else if acceptedCondition(guardrail) == nil {
+		return 0, false
+	}
+	if since.IsZero() {
+		return 0, false
+	}
+	age := time.Since(since)
+	return age, age > r.providerReadStaleAfter()
+}
+
+// denyIfStale turns a failed read of a verification dependency into either a
+// bounded refusal or a backed-off retry. A read that keeps failing past the
+// budget is the shape of a revoked RBAC rule: the standing verdict is no
+// longer evidence the dependency still holds, so the binding fails closed.
+// Within the budget the verdict stands and the reconcile backs off, so an API
+// server blip or a rolling restart never retracts a working binding.
+func (r *Reconciler) denyIfStale(
+	ctx context.Context,
+	guardrail, original *aigatewayv1alpha1.AIGuardrail,
+	what string,
+	readErr error,
+) (ctrl.Result, error) {
+	if age, stale := r.verificationStale(guardrail); stale {
+		r.Log.Info("AIGuardrail binding unverifiable past the staleness budget",
+			"dependency", what, "age", age, "budget", r.providerReadStaleAfter())
+		return r.denyBinding(ctx, guardrail, original, reasonProviderUnverified,
+			fmt.Sprintf("%s has not succeeded for %s, past the %s budget",
+				what, age.Round(time.Second), r.providerReadStaleAfter()))
+	}
+	return ctrl.Result{}, fmt.Errorf("%s: %w", what, readErr)
+}
 
 // event records a Kubernetes Event on the AIGuardrail.
 //
@@ -177,7 +288,21 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	b := ctrl.NewControllerManagedBy(mgr).
-		For(&aigatewayv1alpha1.AIGuardrail{}).
+		// A successful reconcile stamps status.lastVerifiedTime, whose write would
+		// re-enqueue the same policy at once and reconcile every accepted binding
+		// in a loop rather than on the resync cadence. Spec, label and annotation
+		// edits still trigger; a status-only self update does not. The reconciler
+		// reads neither labels nor annotations today, but passing them keeps the
+		// watch honest if it ever does.
+		For(&aigatewayv1alpha1.AIGuardrail{}, builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.LabelChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+		))).
+		WithOptions(crcontroller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](
+				baseRetryDelay, r.retryCeiling()),
+		}).
 		// Selector mode matches labels on the consumer's Namespace, so a label
 		// edit grants or revokes access without touching the policy or the
 		// provider. Only label changes can do that, hence the predicate:
@@ -274,6 +399,7 @@ func guardrailRequests(guardrails []aigatewayv1alpha1.AIGuardrail) []reconcile.R
 // or permissions moved underneath it.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("aiguardrail", req.NamespacedName)
+	r.anchorOnce.Do(func() { r.startedAt = time.Now() })
 
 	var guardrail aigatewayv1alpha1.AIGuardrail
 	if err := r.Client.Get(ctx, req.NamespacedName, &guardrail); err != nil {
@@ -317,7 +443,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if r.OutputChecksUnsupported != nil && hasOutputCheck(&guardrail) {
 		why, err := r.OutputChecksUnsupported(ctx, guardrail.Namespace)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("checking whether %s can enforce Output checks: %w", guardrail.Namespace, err)
+			// A read that did not complete is not evidence the tenant cannot
+			// enforce Output checks, so this stands the verdict down the same
+			// way the provider and Namespace reads below do -- bounded by the
+			// budget so a read that keeps failing cannot keep a binding
+			// accepted forever.
+			return r.denyIfStale(ctx, &guardrail, original, "reading the tenant's Output-check support", err)
 		}
 		if why != "" {
 			log.Info("AIGuardrail has Output checks on a tenant that cannot enforce them", "reason", why)
@@ -343,7 +474,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// server blip — refuse clears BindingRevision and ProviderEndpoint
 			// — so this backs off and leaves the last verdict standing, the
 			// same choice the CRD check above makes.
-			return ctrl.Result{}, fmt.Errorf("reading NemoGuardrails %s: %w", provider, err)
+			//
+			// That tolerance is bounded. A read that keeps failing is the shape
+			// of a revoked RBAC rule, which lasts until someone fixes it, and
+			// past the budget the standing verdict is no longer evidence that
+			// the reference is authorized. An unverifiable binding fails
+			// closed.
+			return r.denyIfStale(ctx, &guardrail, original, "reading the NemoGuardrails provider", err)
 		}
 		// Absence, unlike a failed read, is an answer -- but not yet which of
 		// the two refusals it is. A provider that cannot be read is also what
@@ -391,9 +528,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Absence and failure are split as they are for the provider read above. A
 	// Namespace that does not exist carries no labels, so the selector cannot
 	// match and nil is left for policy.allows to deny on. A read that failed
-	// says nothing about the labels, and denying on it would retract a binding
-	// that was authorized moments ago — revocation never arrives as an error,
-	// it is a successful read of a Namespace that no longer carries the label.
+	// says nothing about the labels, so within the budget the verdict stands
+	// and this backs off rather than retracting a binding that was authorized
+	// moments ago — revocation never arrives as an error, it is a successful
+	// read of a Namespace that no longer carries the label. Past the budget,
+	// a label read that keeps failing is as unverifiable as a provider that
+	// keeps failing, so the binding fails closed the same way.
 	var consumerNS *corev1.Namespace
 	if policy.Mode == consumerModeSelector {
 		var ns corev1.Namespace
@@ -404,9 +544,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			log.Info("consumer Namespace does not exist for allowedConsumers selector matching",
 				"namespace", guardrail.Namespace)
 		default:
-			return ctrl.Result{}, fmt.Errorf("reading consumer namespace %s: %w", guardrail.Namespace, err)
+			return r.denyIfStale(ctx, &guardrail, original, "reading the consumer namespace", err)
 		}
 	}
+
+	// Every dependency read behind the verdict has now succeeded, so this is
+	// the moment the binding is current as of -- recorded before the verdicts
+	// below so a refusal carries it too, and the point the staleness budget is
+	// measured from. A read that failed above returned before reaching here, so
+	// the last stamp stays put and the budget ages against it.
+	guardrail.Status.LastVerifiedTime = ptr.To(metav1.Now())
 
 	// The consumer identity is the AIGuardrail's own namespace — not the
 	// tenant object, model, subscription, runtime Pod or inference caller.

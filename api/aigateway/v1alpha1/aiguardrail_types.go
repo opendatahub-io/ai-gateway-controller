@@ -185,6 +185,21 @@ type AIGuardrailStatus struct {
 	// +optional
 	BindingRevision string `json:"bindingRevision,omitempty"`
 
+	// LastVerifiedTime is when this policy's binding was last fully verified:
+	// the most recent reconcile in which every dependency read behind the
+	// verdict succeeded -- the provider, its allowedConsumers Namespace in
+	// Selector mode, and the tenant's Output-check support. A verdict is only
+	// as current as the reads behind it, and a read that fails leaves the
+	// previous verdict standing, so this is what lets a consumer tell a
+	// two-second-old Accepted from a two-day-old one without reading controller
+	// logs, and what bounds how long an accepted binding may stand on a
+	// dependency that has become unreadable.
+	//
+	// Unlike providerEndpoint and bindingRevision it is not cleared on
+	// refusal: it records when the binding was observed, not what was decided.
+	// +optional
+	LastVerifiedTime *metav1.Time `json:"lastVerifiedTime,omitempty"`
+
 	// Conditions report sanitized acceptance, reference, provider and
 	// compatibility state. Credentials and provider configuration are never
 	// exposed here.
